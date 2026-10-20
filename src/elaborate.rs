@@ -4962,12 +4962,17 @@ fn hoist_package_params(defs: &HashMap<String, Definition>, elab: &mut Elaborate
                     } else {
                         init
                     };
-                    let mut v = if is_string_data_type(data_type) {
+                    let array_packed =
+                        pkg_array_param_packed(elab, &p.name.name, assign, init, data_type);
+                    let is_array_packed = array_packed.is_some();
+                    let mut v = if let Some(pv) = array_packed {
+                        pv
+                    } else if is_string_data_type(data_type) {
                         string_param_value(init, &elab.parameters)
                     } else {
                         eval_init_for_width(init, &elab.parameters, width)
                     };
-                    if !v.is_real {
+                    if !v.is_real && !is_array_packed {
                         v.is_signed = pkg_param_is_signed(
                             data_type,
                             Some(init),
@@ -4975,7 +4980,7 @@ fn hoist_package_params(defs: &HashMap<String, Definition>, elab: &mut Elaborate
                             &elab.parameters,
                         );
                     }
-                    if is_type_real(data_type) {
+                    if is_type_real(data_type) && !is_array_packed {
                         v = Value::from_f64(v.to_f64());
                     }
                     pkg_overlay.push((
@@ -7228,6 +7233,15 @@ pub fn elaborate_module_with_defs(
                         data_type,
                         &params_snapshot,
                     ) {
+                        // A bare reference (`.R(R)`) carries the packed array.
+                        if let Some(pv) = array_param_packed(
+                            &elab,
+                            &assign.name.name,
+                            &assign.dimensions,
+                            &params_snapshot,
+                        ) {
+                            elab.parameters.insert(assign.name.name.clone(), pv);
+                        }
                         continue;
                     }
                 }
@@ -7691,12 +7705,22 @@ pub fn elaborate_module_with_defs(
                                 } else {
                                     init
                                 };
-                                let mut v = if is_string_data_type(data_type) {
+                                let array_packed = pkg_array_param_packed(
+                                    &mut elab,
+                                    &p.name.name,
+                                    assign,
+                                    init_eval,
+                                    data_type,
+                                );
+                                let is_array_packed = array_packed.is_some();
+                                let mut v = if let Some(pv) = array_packed {
+                                    pv
+                                } else if is_string_data_type(data_type) {
                                     string_param_value(init_eval, &elab.parameters)
                                 } else {
                                     eval_init_for_width(init_eval, &elab.parameters, eff_width)
                                 };
-                                if !v.is_real {
+                                if !v.is_real && !is_array_packed {
                                     v.is_signed = pkg_param_is_signed(
                                         data_type,
                                         Some(init_eval),
@@ -10512,6 +10536,14 @@ pub fn elaborate_module_with_defs(
                                 data_type,
                                 &params_snapshot,
                             ) {
+                                if let Some(pv) = array_param_packed(
+                                    &elab,
+                                    &assign.name.name,
+                                    &assign.dimensions,
+                                    &params_snapshot,
+                                ) {
+                                    elab.parameters.insert(assign.name.name.clone(), pv);
+                                }
                                 continue;
                             }
                         }
@@ -22424,6 +22456,75 @@ fn string_param_value(init: &Expression, params: &HashMap<String, Value>) -> Val
     Value::from_string(&eval_const_expr_val(init, params).to_sv_string())
 }
 
+/// §6.20.2: an UNPACKED-ARRAY package parameter
+/// (`parameter logic [33:0] A [N] = '{...}`). The scalar path evaluates the
+/// pattern at the ELEMENT width, so every `pkg::A[i]` read 0 and a module
+/// parameter defaulted from `pkg::A` lost its element layout. Register
+/// per-element values under `pkg::A[i]` and return the array as one packed
+/// value (element 0 leftmost), the convention a module parameter override
+/// already uses. `None` for a non-array parameter or an unresolved array.
+fn pkg_array_param_packed(
+    elab: &mut ElaboratedModule,
+    pkg: &str,
+    assign: &crate::ast::decl::ParamAssignment,
+    init: &Expression,
+    data_type: &DataType,
+) -> Option<Value> {
+    if assign.dimensions.is_empty() {
+        return None;
+    }
+    let key = format!("{}::{}", pkg, assign.name.name);
+    let snapshot = elab.parameters.clone();
+    if !register_array_param(
+        elab,
+        "",
+        &key,
+        &assign.dimensions,
+        Some(init),
+        None,
+        data_type,
+        &snapshot,
+    ) {
+        return None;
+    }
+    array_param_packed(elab, &key, &assign.dimensions, &snapshot)
+}
+
+/// An instance's local parameter env lacks names its module imported from a
+/// package (`import pkg::*; ... A [N]` with `N` bare), but the elaboration-wide
+/// map carries them. Return the local env laid over that map so an array
+/// dimension spelled with an imported name still resolves.
+fn params_with_imports(
+    elab: &ElaboratedModule,
+    params: &HashMap<String, Value>,
+) -> HashMap<String, Value> {
+    let mut merged = elab.parameters.clone();
+    for (k, v) in params {
+        merged.insert(k.clone(), v.clone());
+    }
+    merged
+}
+
+/// Pack the per-element values `register_array_param` stored under
+/// `<full>[i]` back into one value, element 0 leftmost: the form a bare
+/// reference to an unpacked-array parameter (`.R(R)`, `= pkg::A`) carries.
+fn array_param_packed(
+    elab: &ElaboratedModule,
+    full: &str,
+    dims: &[UnpackedDimension],
+    params: &HashMap<String, Value>,
+) -> Option<Value> {
+    let merged = params_with_imports(elab, params);
+    let params = &merged;
+    let dims = normalize_unpacked_dims(dims, params, &elab.typedef_types);
+    let idxs = const_dim_indices(&dims, params)?;
+    let elems: Option<Vec<Value>> = idxs
+        .iter()
+        .map(|i| elab.parameters.get(&format!("{}[{}]", full, i)).cloned())
+        .collect();
+    elems.filter(|e| !e.is_empty()).map(|e| Value::concat(&e))
+}
+
 /// Detect whether struct/union type `target` (body `dt`) transitively contains
 /// a by-value member of its own type — illegal per IEEE 1800-2017 §7.2.1 (it
 /// would have infinite size). Returns the offending member path, or None.
@@ -23125,6 +23226,18 @@ fn register_array_param(
     data_type: &DataType,
     params: &HashMap<String, Value>,
 ) -> bool {
+    let merged;
+    let params = if const_dim_indices(
+        &normalize_unpacked_dims(dims, params, &elab.typedef_types)[..1.min(dims.len())],
+        params,
+    )
+    .is_none()
+    {
+        merged = params_with_imports(elab, params);
+        &merged
+    } else {
+        params
+    };
     let dims = normalize_unpacked_dims(dims, params, &elab.typedef_types);
     // §6.20.2 MULTI-DIMENSIONAL unpacked parameter array
     // (`localparam int UA [0:1][0:1] = '{'{1,2},'{3,4}}`). Only the FIRST
@@ -23183,6 +23296,27 @@ fn register_array_param(
     let elem_w = resolve_type_width(data_type, Some(params), Some(&elab.typedefs)).max(1);
     let mut vals: Vec<Value> = Vec::new();
     if let Some(p) = override_val {
+        if (p.width as usize) < n * elem_w as usize {
+            return false;
+        }
+        for i in 0..n {
+            let off = (n - 1 - i) * elem_w as usize;
+            let mut v = Value::zero(elem_w);
+            for b in 0..elem_w as usize {
+                v.set_bit(b, p.get_bit(off + b));
+            }
+            vals.push(v);
+        }
+    } else if let Some(init) = init.filter(|e| {
+        !matches!(
+            e.kind,
+            ExprKind::Concatenation(_) | ExprKind::AssignmentPattern(_)
+        )
+    }) {
+        // §6.20.2: the initializer names ANOTHER unpacked-array parameter
+        // (`= pkg::A`), which evaluates to the packed element concatenation
+        // (element 0 leftmost). Slice it the way an override is sliced.
+        let p = eval_const_expr_val(init, params);
         if (p.width as usize) < n * elem_w as usize {
             return false;
         }
@@ -27445,6 +27579,11 @@ fn inline_instantiations_inner(
                                                     &elab.typedef_types,
                                                     &elab.parameters,
                                                 );
+                                            }
+                                            if let Some(pv) = pkg_array_param_packed(
+                                                elab, name, assign, init, data_type,
+                                            ) {
+                                                v = pv;
                                             }
                                             alias_pkg_param(elab, name, &assign.name.name, &v);
                                             params_insert_traced(
@@ -33475,6 +33614,14 @@ fn inline_module_items(
                                     data_type,
                                     &snapshot,
                                 ) {
+                                    if let Some(pv) = array_param_packed(
+                                        elab,
+                                        &format!("{}{}", inst_prefix, assign.name.name),
+                                        &assign.dimensions,
+                                        &snapshot,
+                                    ) {
+                                        sub_local_params.insert(assign.name.name.clone(), pv);
+                                    }
                                     continue;
                                 }
                             }
@@ -43674,6 +43821,11 @@ fn process_import(
                                                     &elab.parameters,
                                                 );
                                             }
+                                            if let Some(pv) = pkg_array_param_packed(
+                                                elab, &pkg_name, assign, init, data_type,
+                                            ) {
+                                                v = pv;
+                                            }
                                             if is_real {
                                                 v = Value::from_f64(v.to_f64());
                                             }
@@ -44081,6 +44233,11 @@ fn process_import(
                                                 &elab.typedef_types,
                                                 &elab.parameters,
                                             );
+                                        }
+                                        if let Some(pv) = pkg_array_param_packed(
+                                            elab, &pkg_name, assign, init, data_type,
+                                        ) {
+                                            v = pv;
                                         }
                                         if is_real {
                                             v = Value::from_f64(v.to_f64());
