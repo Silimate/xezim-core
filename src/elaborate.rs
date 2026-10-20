@@ -34010,6 +34010,57 @@ fn inline_module_items(
                 }
                 iprof_since("param_typedef_fixpoint", __tb);
 
+                // §6.20.2: an UNPACKED-ARRAY parameter/localparam declared in
+                // the instance BODY (`localparam logic [167:0] C [166] = '{..}`)
+                // got only the scalar evaluation above, so every `C[i]` read 0.
+                // Register per-element values under this instance and keep the
+                // packed array in the local env for `.R(C)` references.
+                if body_declares {
+                    let body_items =
+                        collect_effective_items_ref(sub_mod.items(), &sub_local_params);
+                    for it in body_items.iter().map(|c| &**c) {
+                        let (ModuleItem::ParameterDeclaration(pd)
+                        | ModuleItem::LocalparamDeclaration(pd)) = it
+                        else {
+                            continue;
+                        };
+                        let ParameterKind::Data {
+                            data_type,
+                            assignments,
+                        } = &pd.kind
+                        else {
+                            continue;
+                        };
+                        for assign in assignments {
+                            if assign.dimensions.is_empty()
+                                || frozen_params.contains(&assign.name.name)
+                            {
+                                continue;
+                            }
+                            let snapshot = sub_local_params.clone();
+                            if register_array_param(
+                                elab,
+                                &inst_prefix,
+                                &assign.name.name,
+                                &assign.dimensions,
+                                assign.init.as_ref(),
+                                None,
+                                data_type,
+                                &snapshot,
+                            ) {
+                                if let Some(pv) = array_param_packed(
+                                    elab,
+                                    &format!("{}{}", inst_prefix, assign.name.name),
+                                    &assign.dimensions,
+                                    &snapshot,
+                                ) {
+                                    sub_local_params.insert(assign.name.name.clone(), pv);
+                                }
+                            }
+                        }
+                    }
+                }
+
                 // §23.2.2.4: a port default is a constant expression of the
                 // CHILD's scope (`input logic i = F` reads the child's own
                 // parameter `F`, per instance). The port map holds PARENT-scope
