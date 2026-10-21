@@ -33451,11 +33451,44 @@ fn inline_module_items(
                                                     // in a generate-for body) — the plain const-eval
                                                     // above yields 0; pack it by the declared type
                                                     // like the parameter-default path does.
+                                                    // The instance's own body typedef
+                                                    // (`typedef struct packed {..} st_t;
+                                                    // localparam st_t R = '{..}`) is not
+                                                    // in `elab_ro` until the body items
+                                                    // are walked, which happens after
+                                                    // the first instance's parameters are
+                                                    // settled. Resolve it from the local
+                                                    // types, or the first instance reads 0
+                                                    // and only later instances pack.
+                                                    let local_typed;
+                                                    let tt: &HashMap<String, DataType> =
+                                                        match data_type {
+                                                            DataType::TypeReference {
+                                                                name, ..
+                                                            } if local_types
+                                                                .contains_key(&name.name.name) =>
+                                                            {
+                                                                local_typed = {
+                                                                    let mut m = elab_ro
+                                                                        .typedef_types
+                                                                        .clone();
+                                                                    for (k, v) in local_types {
+                                                                        m.insert(
+                                                                            k.clone(),
+                                                                            v.clone(),
+                                                                        );
+                                                                    }
+                                                                    m
+                                                                };
+                                                                &local_typed
+                                                            }
+                                                            _ => &elab_ro.typedef_types,
+                                                        };
                                                     if let Some(pv) = pack_packed_vector_pattern(
                                                         data_type,
                                                         init,
                                                         local_map,
-                                                        &elab_ro.typedef_types,
+                                                        tt,
                                                     )
                                                     .or_else(|| {
                                                         pack_struct_const_value(
@@ -33463,7 +33496,7 @@ fn inline_module_items(
                                                             init,
                                                             local_map,
                                                             &elab_ro.typedefs,
-                                                            &elab_ro.typedef_types,
+                                                            tt,
                                                         )
                                                     }) {
                                                         val = pv;
