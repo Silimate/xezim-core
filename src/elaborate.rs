@@ -40899,16 +40899,31 @@ pub fn whole_array_assign_parts_dir(
     let (ExprKind::Ident(lh), ExprKind::Ident(rh)) = (&lhs.kind, &rhs.kind) else {
         return None;
     };
-    if lh.path.len() != 1 || rh.path.len() != 1 {
+    // A hierarchical name (`rvfi.ext_mhpmcounters`, `dut.rvfi_ext_mhpmcounters`)
+    // is the same unpacked array, registered under the dotted name. Rejecting
+    // every multi-segment path left `assign ifc.arr = src;` as a scalar
+    // assign with no target, so the interface array stayed 0.
+    if lh.path.is_empty()
+        || rh.path.is_empty()
+        || lh.path.iter().any(|s| !s.selects.is_empty())
+        || rh.path.iter().any(|s| !s.selects.is_empty())
+    {
         return None;
     }
-    if !lh.path[0].selects.is_empty() || !rh.path[0].selects.is_empty() {
-        return None;
-    }
-    let ln = &lh.path[0].name.name;
-    let rn = &rh.path[0].name.name;
-    let &(llo, lhi, _) = arrays.get(ln)?;
-    let &(rlo, rhi, _) = arrays.get(rn)?;
+    let ln = lh
+        .path
+        .iter()
+        .map(|s| s.name.name.as_str())
+        .collect::<Vec<_>>()
+        .join(".");
+    let rn = rh
+        .path
+        .iter()
+        .map(|s| s.name.name.as_str())
+        .collect::<Vec<_>>()
+        .join(".");
+    let &(llo, lhi, _) = arrays.get(&ln)?;
+    let &(rlo, rhi, _) = arrays.get(&rn)?;
     // Same element COUNT is what matters; the index ranges may differ.
     if lhi < llo || rhi < rlo || (lhi - llo) != (rhi - rlo) {
         return None;
@@ -40919,19 +40934,56 @@ pub fn whole_array_assign_parts_dir(
     }
     // §7.6: elements pair up left to right, whatever each range's direction.
     let desc = |nm: &str| descending.is_some_and(|d| d.contains(nm));
-    let (ld, rd) = (desc(ln), desc(rn));
+    let (ld, rd) = (desc(&ln), desc(&rn));
+    let indexed = |h: &HierarchicalIdentifier, name: &str, idx: i64| {
+        if h.path.len() == 1 {
+            make_index_expr(name, idx)
+        } else {
+            make_hier_index_expr(h, idx)
+        }
+    };
     Some(
         (0..=n)
             .map(|k| ContinuousAssignment {
                 origin: None,
-                lhs: make_index_expr(ln, if ld { lhi - k } else { llo + k }),
-                rhs: make_index_expr(rn, if rd { rhi - k } else { rlo + k }),
+                lhs: indexed(lh, &ln, if ld { lhi - k } else { llo + k }),
+                rhs: indexed(rh, &rn, if rd { rhi - k } else { rlo + k }),
                 delay,
                 rhs_parent_scoped: false,
                 delay_fall: None,
                 delay_off: None,
             })
             .collect(),
+    )
+}
+
+/// `a.b.arr[idx]` — the select sits on the last hierarchical segment.
+/// `make_index_expr` builds `Index` of a single name, which does not resolve
+/// a dotted interface or instance path.
+fn make_hier_index_expr(h: &HierarchicalIdentifier, idx: i64) -> Expression {
+    let mut path: Vec<HierPathSegment> = h
+        .path
+        .iter()
+        .map(|s| HierPathSegment {
+            name: Identifier {
+                name: s.name.name.clone(),
+                span: Span::dummy(),
+            },
+            selects: Vec::new(),
+        })
+        .collect();
+    if let Some(last) = path.last_mut() {
+        last.selects.push(make_udp_int_expr(idx));
+    }
+    Expression::new(
+        ExprKind::Ident(HierarchicalIdentifier {
+            root: None,
+            path,
+            span: Span::dummy(),
+            cached_signal_id: std::cell::Cell::new(None),
+            cached_resolved_name: std::cell::OnceCell::new(),
+        }),
+        Span::dummy(),
     )
 }
 
