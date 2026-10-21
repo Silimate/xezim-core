@@ -5001,6 +5001,7 @@ fn hoist_package_params(defs: &HashMap<String, Definition>, elab: &mut Elaborate
                     // package's own params for its own typedefs get a bounded
                     // overlay in the hoist loop below.
                     alias_pkg_param(elab, &p.name.name, &assign.name.name, &v);
+                                        register_pkg_param_elem(elab, &p.name.name, &assign.name.name, data_type);
                 }
             }
             restore_overlay(elab, pkg_overlay);
@@ -7729,6 +7730,7 @@ pub fn elaborate_module_with_defs(
                                     );
                                 }
                                 alias_pkg_param(&mut elab, &p.name.name, &assign.name.name, &v);
+                                                                register_pkg_param_elem(&mut elab, &p.name.name, &assign.name.name, data_type);
                                 params_insert_traced(
                                     &mut elab.parameters,
                                     line!(),
@@ -22557,6 +22559,36 @@ fn array_param_packed(
 /// name collided — whichever elaborated last won, and `p1::step` then read
 /// p2's value (ivtest sv_package2). Typedefs already registered both
 /// spellings; parameters did not.
+/// §7.4.5: a package parameter of a packed multi-dimensional type (`parameter
+/// logic [15:0][3:0] SBOX`) gets the element registration a module parameter
+/// already gets, so `SBOX[i]` and `pkg::SBOX[i]` select an element instead of
+/// one bit of the flat vector.
+fn register_pkg_param_elem(
+    elab: &mut ElaboratedModule,
+    pkg: &str,
+    name: &str,
+    data_type: &DataType,
+) {
+    // The bare key serves the interpreter; the dotted `pkg.name` key is how
+    // the bytecode compiler spells a package-scoped reference.
+    let keys: Vec<String> = if pkg.is_empty() {
+        vec![name.to_string()]
+    } else {
+        vec![name.to_string(), format!("{}.{}", pkg, name)]
+    };
+    if let Some(ew) = packed_inner_elem_width(data_type, &elab.parameters, &elab.typedefs) {
+        for k in &keys {
+            elab.packed_signal_elem_widths.insert(k.clone(), ew);
+        }
+        tls_register_elem_w(name, ew);
+    }
+    if let Some(fdims) = packed_full_dims_of(data_type, &elab.parameters) {
+        for k in keys {
+            elab.packed_full_dims.insert(k, fdims.clone());
+        }
+    }
+}
+
 fn alias_pkg_param(elab: &mut ElaboratedModule, pkg: &str, name: &str, v: &Value) {
     if !pkg.is_empty() {
         params_insert_traced(
@@ -27607,6 +27639,7 @@ fn inline_instantiations_inner(
                                                 v = pv;
                                             }
                                             alias_pkg_param(elab, name, &assign.name.name, &v);
+                                                                                        register_pkg_param_elem(elab, name, &assign.name.name, data_type);
                                             params_insert_traced(
                                                 &mut elab.parameters,
                                                 line!(),
@@ -43916,6 +43949,7 @@ fn process_import(
                                             false,
                                         );
                                         alias_pkg_param(elab, pkg_name, &assign.name.name, &v);
+                                                                                register_pkg_param_elem(elab, pkg_name, &assign.name.name, data_type);
                                         params_insert_traced(
                                             &mut elab.parameters,
                                             line!(),
@@ -44325,6 +44359,7 @@ fn process_import(
                                             false,
                                         );
                                         alias_pkg_param(elab, pkg_name, &assign.name.name, &v);
+                                                                                register_pkg_param_elem(elab, pkg_name, &assign.name.name, data_type);
                                         params_insert_traced(
                                             &mut elab.parameters,
                                             line!(),
