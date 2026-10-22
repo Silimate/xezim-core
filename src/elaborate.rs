@@ -3846,14 +3846,7 @@ impl ElaboratedModule {
             // Same unpacked-array expansion the eager drain does; this is the
             // path the bytecode compiler takes, and a sub-module's
             // `assign dst = src;` between arrays reaches only one of the two.
-            match whole_array_assign_parts_dir(
-                &ca.lhs,
-                &ca.rhs,
-                ca.delay,
-                &self.arrays,
-                Some(&self.descending_arrays),
-                Some(&self.unpacked_decl_dims),
-            ) {
+            match unpacked_array_assign_parts(&ca.lhs, &ca.rhs, ca.delay, self) {
                 Some(parts) => {
                     for e in parts {
                         f(e);
@@ -40987,6 +40980,136 @@ fn make_hier_index_expr(h: &HierarchicalIdentifier, idx: i64) -> Expression {
     )
 }
 
+/// `assign dst = src[row]` where `src` is a 2-D unpacked array and `dst` is a
+/// 1-D unpacked array of the same inner count. The 1-D expander only accepts
+/// two identifiers, so this shape was left as one scalar assign with no
+/// target and `dst` stayed 0. Ibex RVFI publishes a performance-counter row
+/// this way (`assign rvfi_ext_mhpmcounters = rvfi_ext_stage_mhpmcounters[N-1]`).
+pub fn whole_array_row_assign_parts(
+    lhs: &Expression,
+    rhs: &Expression,
+    delay: u64,
+    arrays: &HashMap<String, (i64, i64, u32)>,
+    arrays_2d: &HashMap<String, ((i64, i64), (i64, i64), u32)>,
+    params: &HashMap<String, Value>,
+    descending: Option<&HashSet<String>>,
+    decl_dims: Option<&HashMap<String, Vec<(i64, i64)>>>,
+) -> Option<Vec<ContinuousAssignment>> {
+    let ExprKind::Ident(lh) = &lhs.kind else {
+        return None;
+    };
+    if lh.path.is_empty() || lh.path.iter().any(|s| !s.selects.is_empty()) {
+        return None;
+    }
+    let ExprKind::Index { expr, index } = &rhs.kind else {
+        return None;
+    };
+    let ExprKind::Ident(base) = &expr.kind else {
+        return None;
+    };
+    if base.path.is_empty() || base.path.iter().any(|s| !s.selects.is_empty()) {
+        return None;
+    }
+    let ln = lh
+        .path
+        .iter()
+        .map(|s| s.name.name.as_str())
+        .collect::<Vec<_>>()
+        .join(".");
+    let rn = base
+        .path
+        .iter()
+        .map(|s| s.name.name.as_str())
+        .collect::<Vec<_>>()
+        .join(".");
+    let &(llo, lhi, _) = arrays.get(&ln)?;
+    let &((olo, ohi), (ilo, ihi), _) = arrays_2d.get(&rn)?;
+    if lhi < llo || ihi < ilo || ohi < olo || (lhi - llo) != (ihi - ilo) {
+        return None;
+    }
+    let row = const_eval_i64_with_params(index, Some(params))?;
+    if row < olo || row > ohi {
+        return None;
+    }
+    let n = lhi - llo;
+    if n > 4096 {
+        return None;
+    }
+    let dim_desc = |nm: &str, dim: usize| -> bool {
+        if let Some(&(l, r)) = decl_dims.and_then(|d| d.get(nm)).and_then(|dims| dims.get(dim)) {
+            return l > r;
+        }
+        dim == 0 && descending.is_some_and(|d| d.contains(nm))
+    };
+    let ldesc = dim_desc(&ln, 0);
+    let idesc = dim_desc(&rn, 1);
+    Some(
+        (0..=n)
+            .map(|k| {
+                let lidx = if ldesc { lhi - k } else { llo + k };
+                let col = if idesc { ihi - k } else { ilo + k };
+                let lhs_e = if lh.path.len() == 1 {
+                    make_index_expr(&ln, lidx)
+                } else {
+                    make_hier_index_expr(lh, lidx)
+                };
+                ContinuousAssignment {
+                    origin: None,
+                    lhs: lhs_e,
+                    rhs: make_2d_elem_expr(base, row, col),
+                    delay,
+                    rhs_parent_scoped: false,
+                    delay_fall: None,
+                    delay_off: None,
+                }
+            })
+            .collect(),
+    )
+}
+
+/// `src[row][col]` as nested index selects, the shape the 2-D element read
+/// already resolves. A single-segment name may itself be dotted (`u.stage`).
+fn make_2d_elem_expr(h: &HierarchicalIdentifier, row: i64, col: i64) -> Expression {
+    if h.path.len() == 1 {
+        return make_multi_index_expr(&h.path[0].name.name, &[row, col]);
+    }
+    let path: Vec<HierPathSegment> = h
+        .path
+        .iter()
+        .map(|s| HierPathSegment {
+            name: Identifier {
+                name: s.name.name.clone(),
+                span: Span::dummy(),
+            },
+            selects: Vec::new(),
+        })
+        .collect();
+    let base = Expression::new(
+        ExprKind::Ident(HierarchicalIdentifier {
+            root: None,
+            path,
+            span: Span::dummy(),
+            cached_signal_id: std::cell::Cell::new(None),
+            cached_resolved_name: std::cell::OnceCell::new(),
+        }),
+        Span::dummy(),
+    );
+    let rowed = Expression::new(
+        ExprKind::Index {
+            expr: Box::new(base),
+            index: Box::new(make_udp_int_expr(row)),
+        },
+        Span::dummy(),
+    );
+    Expression::new(
+        ExprKind::Index {
+            expr: Box::new(rowed),
+            index: Box::new(make_udp_int_expr(col)),
+        },
+        Span::dummy(),
+    )
+}
+
 /// §10.3 / §10.9: `assign arr = '{...};` — a continuous assignment of an
 /// assignment pattern to a whole unpacked array drives each element with
 /// its item: positional (`'{3, 4}`, the first item at the LEFT bound),
@@ -41173,20 +41296,44 @@ fn expand_whole_array_assign(
     delay: u64,
     elab: &mut ElaboratedModule,
 ) -> bool {
-    match whole_array_assign_parts_dir(
-        lhs,
-        rhs,
-        delay,
-        &elab.arrays,
-        Some(&elab.descending_arrays),
-        Some(&elab.unpacked_decl_dims),
-    ) {
+    match unpacked_array_assign_parts(lhs, rhs, delay, elab) {
         Some(parts) => {
             elab.continuous_assigns.extend(parts);
             true
         }
         None => false,
     }
+}
+
+/// Whole-array continuous assigns the eager drain and the streaming drain
+/// both expand: `assign dst = src` between 1-D unpacked arrays, and
+/// `assign dst = src[row]` of one row of a 2-D unpacked array.
+fn unpacked_array_assign_parts(
+    lhs: &Expression,
+    rhs: &Expression,
+    delay: u64,
+    elab: &ElaboratedModule,
+) -> Option<Vec<ContinuousAssignment>> {
+    whole_array_assign_parts_dir(
+        lhs,
+        rhs,
+        delay,
+        &elab.arrays,
+        Some(&elab.descending_arrays),
+        Some(&elab.unpacked_decl_dims),
+    )
+    .or_else(|| {
+        whole_array_row_assign_parts(
+            lhs,
+            rhs,
+            delay,
+            &elab.arrays,
+            &elab.arrays_2d,
+            &elab.parameters,
+            Some(&elab.descending_arrays),
+            Some(&elab.unpacked_decl_dims),
+        )
+    })
 }
 
 fn make_ident_expr(name: &str) -> Expression {
