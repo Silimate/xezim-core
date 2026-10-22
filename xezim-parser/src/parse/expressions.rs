@@ -1878,7 +1878,12 @@ impl Parser {
                     self.span_from(start),
                 )
             }
-            TokenKind::KwS_always => {
+            // §16.12.6 `always property_expr` is the weak form of `s_always`.
+            // Same node: it fails the first clock the operand samples false,
+            // and a still-open attempt does not fail when the clock stops.
+            // `always` here is an expression primary. An always block is
+            // parsed at item level and never reaches this arm.
+            TokenKind::KwS_always | TokenKind::KwAlways => {
                 let start = self.current().span.start;
                 self.bump();
                 let operand = self.parse_expr_bp(3);
