@@ -41659,16 +41659,19 @@ fn rewrite_expr_impl(
                 // leave every other actual on the plain machinery
                 // (`whole_net_ident_name` is root-tolerant, so port_aliases
                 // and interface path collapsing still see these).
-                // Gate on the mapped LEAF differing from the key being
-                // substituted: a generate-scope RENAME map (`vec` →
-                // `gen_arbiter.vec`) flows through this same function, its
-                // values are not yet instance-prefixed, and rooting them
-                // freezes the un-prefixed name (every genfor CA write
-                // vanished). A rename always has leaf == key; a genuine
-                // port-actual collision (`v_node` → `out_val`) never does.
+                // Gate on the mapped LEAF differing from the KEY's leaf: a
+                // generate-scope RENAME (`vec` to `gen_arbiter.vec`, or the
+                // already-dotted `g.u` to `g.inner.u`) flows through this
+                // same function. Its values are not yet instance-prefixed,
+                // and rooting them freezes the name so a deeper generate
+                // scope cannot extend it (a relative `tag_bank.key_i` inside
+                // `if` under `for` under `if` kept the outer scopes only and
+                // read x). A rename keeps the same leaf. A genuine
+                // port-actual collision (`v_node` to `out_val`) changes it.
                 let collides = whole_net_ident_name(mapped).is_some_and(|an| {
                     let leaf = an.rsplit('.').next().unwrap_or(an.as_str());
-                    leaf != name.as_str()
+                    let key_leaf = name.rsplit('.').next().unwrap_or(name.as_str());
+                    leaf != key_leaf
                         && (local_names.contains(leaf) || port_map.contains_key(leaf))
                 });
                 if !has_tail {
