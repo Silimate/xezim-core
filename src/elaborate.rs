@@ -25624,6 +25624,20 @@ fn for_each_stmt_expr(stmt: &Statement, f: &mut dyn FnMut(&Expression)) {
             f(condition);
             for_each_stmt_expr(stmt, f);
         }
+        K::Assertion(a) => {
+            // A generate rename has to see instance heads inside the
+            // property (`tag_bank.key_i`), not only in initial and always
+            // bodies. Skipping the property left an outer prefix in place
+            // (`gen_rams.tag_bank.key_i`) and the inner scopes never
+            // extended it.
+            f(&a.expr);
+            if let Some(s) = &a.action {
+                for_each_stmt_expr(s, f);
+            }
+            if let Some(s) = &a.else_action {
+                for_each_stmt_expr(s, f);
+            }
+        }
         K::Return(Some(e)) => f(e),
         K::VarDecl { declarators, .. } => {
             for d in declarators {
@@ -28728,6 +28742,15 @@ fn collect_scoped_instance_heads(
         match item {
             ModuleItem::AlwaysConstruct(ac) => for_each_stmt_expr(&ac.stmt, &mut visit),
             ModuleItem::InitialConstruct(ic) => for_each_stmt_expr(&ic.stmt, &mut visit),
+            ModuleItem::AssertionItem(a) => {
+                visit(&a.expr);
+                if let Some(s) = &a.action {
+                    for_each_stmt_expr(s, &mut visit);
+                }
+                if let Some(s) = &a.else_action {
+                    for_each_stmt_expr(s, &mut visit);
+                }
+            }
             ModuleItem::FinalConstruct(fc) => for_each_stmt_expr(&fc.stmt, &mut visit),
             ModuleItem::ContinuousAssign(ca) => {
                 for (l, r) in &ca.assignments {
