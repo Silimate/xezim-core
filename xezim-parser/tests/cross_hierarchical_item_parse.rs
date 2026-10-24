@@ -1,6 +1,6 @@
 //! IEEE 1800-2017 §19.6: a cross item may be a variable. Taking a
-//! hierarchical reference (`u.a`) as the item is an extension Questa also
-//! accepts. The cross list stopped at the first `.`.
+//! hierarchical reference (`u.a`) as the item is an extension that a
+//! reference simulator also accepts. The cross list stopped at the first `.`.
 
 use sv_parser::parse;
 

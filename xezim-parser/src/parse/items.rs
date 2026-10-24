@@ -5564,8 +5564,8 @@ impl Parser {
                 let mut ids = Vec::new();
                 loop {
                     // IEEE 1800-2017 §19.6 cross item. A hierarchical
-                    // variable reference (`u.err`), an extension Questa also
-                    // accepts, keeps its dotted path as the name.
+                    // variable reference (`u.err`), an extension a reference
+                    // simulator also accepts, keeps its dotted path as the name.
                     let mut id = self.parse_identifier();
                     while self.at(TokenKind::Dot) && self.peek_kind() == TokenKind::Identifier {
                         self.bump();
