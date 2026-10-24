@@ -67,6 +67,18 @@ impl Parser {
         None
     }
 
+    /// The `edge_identifier` that may open a §14.4 `clocking_skew`.
+    fn parse_clocking_skew_edge(&mut self) -> Option<crate::ast::stmt::Edge> {
+        let edge = match self.current_kind() {
+            TokenKind::KwPosedge => crate::ast::stmt::Edge::Posedge,
+            TokenKind::KwNegedge => crate::ast::stmt::Edge::Negedge,
+            TokenKind::KwEdge => crate::ast::stmt::Edge::Edge,
+            _ => return None,
+        };
+        self.bump();
+        Some(edge)
+    }
+
     /// IEEE 1800-2023 §14.4 clocking skew value after the `#`: `1step`, a
     /// number or time literal, a parameter name, or a parenthesized
     /// expression.
@@ -2328,6 +2340,7 @@ impl Parser {
                 let mut signals: Vec<ClockingSignal> = Vec::new();
                 let mut default_input_skew: Option<crate::ast::expr::Expression> = None;
                 let mut default_output_skew: Option<crate::ast::expr::Expression> = None;
+                let mut default_output_edge: Option<crate::ast::stmt::Edge> = None;
                 while !self.at(TokenKind::KwEndclocking) && !self.at(TokenKind::Eof) {
                     // `default input #d output #d;` (§14.4) — capture the skew
                     // expressions; anything unrecognized is skipped to the `;`
@@ -2342,11 +2355,9 @@ impl Parser {
                             }
                             self.bump();
                             // `clocking_skew ::= edge_identifier [delay_control]`
-                            if matches!(
-                                self.current_kind(),
-                                TokenKind::KwNegedge | TokenKind::KwPosedge | TokenKind::KwEdge
-                            ) {
-                                self.bump();
+                            let edge = self.parse_clocking_skew_edge();
+                            if dir_out {
+                                default_output_edge = edge;
                             }
                             if self.at(TokenKind::Hash) {
                                 self.bump();
@@ -2379,12 +2390,7 @@ impl Parser {
                             // captured per-signal; `#1step`/opaque forms → None.
                             let mut sig_skew: Option<crate::ast::expr::Expression> = None;
                             // `clocking_skew ::= edge_identifier [delay_control]`
-                            if matches!(
-                                self.current_kind(),
-                                TokenKind::KwNegedge | TokenKind::KwPosedge | TokenKind::KwEdge
-                            ) {
-                                self.bump();
-                            }
+                            let sig_edge = self.parse_clocking_skew_edge();
                             if self.at(TokenKind::Hash) {
                                 self.bump();
                                 sig_skew = self.parse_clocking_skew_value();
@@ -2408,6 +2414,7 @@ impl Parser {
                                         direction,
                                         name: id,
                                         skew: sig_skew.clone(),
+                                        skew_edge: sig_edge,
                                         bound_to,
                                         span: self.span_from(sstart),
                                     });
@@ -2445,6 +2452,7 @@ impl Parser {
                     clock_edge,
                     default_input_skew,
                     default_output_skew,
+                    default_output_edge,
                     is_default: false,
                     signals,
                     items,
@@ -2660,6 +2668,7 @@ impl Parser {
                             clock_edge: None,
                             default_input_skew: None,
                             default_output_skew: None,
+                            default_output_edge: None,
                             is_default: true,
                             signals: Vec::new(),
                             items: Vec::new(),
