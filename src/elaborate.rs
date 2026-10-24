@@ -21468,6 +21468,24 @@ fn bits_from_declared_types(
         }
         return None;
     }
+    // §11.4.12: a concatenation is as wide as its operands together.
+    if let ExprKind::Concatenation(items) = &arg.kind {
+        let mut total = 0u32;
+        for it in items {
+            total = total.checked_add(bits_from_declared_types(
+                it,
+                decls,
+                elem_decls,
+                params,
+                typedefs,
+                typedef_types,
+            )?)?;
+        }
+        return Some(total).filter(|w| *w > 0);
+    }
+    if let ExprKind::Number(NumberLiteral::Integer { size: Some(n), .. }) = &arg.kind {
+        return Some(*n);
+    }
     // `arr[i]` / `arr[i].member` on an unpacked array — size from the ELEMENT
     // type. A bit-select of a packed vector is handled by the signal-table
     // path, which knows the declaration is not an array.
