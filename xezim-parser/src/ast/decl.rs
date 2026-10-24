@@ -764,6 +764,11 @@ pub struct CoverBin {
     /// of its `=>` steps.
     #[cfg_attr(feature = "serde", serde(default))]
     pub transitions: Vec<Vec<TransStep>>,
+    /// LRM §19.5.1.1 `bins name = { ... } with (expr)`: only the values for
+    /// which `expr`, with `item` bound to the value, is true belong to the
+    /// bin.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub with_filter: Option<Expression>,
     pub span: Span,
 }
 
