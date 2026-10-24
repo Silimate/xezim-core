@@ -5263,17 +5263,12 @@ impl Parser {
         }
         if self.eat(TokenKind::KwBinsof).is_some() {
             self.expect(TokenKind::LParen);
-            // `cp`, `cp.bin`, or a dotted variable path; the cross resolves
-            // which (`resolve_binsof_paths`).
-            let mut cp = self.parse_identifier();
-            let mut bin: Option<crate::ast::Identifier> = None;
-            while self.eat(TokenKind::Dot).is_some() {
-                let seg = self.parse_identifier();
-                if let Some(prev) = bin.replace(seg) {
-                    cp.name = format!("{}.{}", cp.name, prev.name);
-                    cp.span.end = prev.span.end;
-                }
-            }
+            let cp = self.parse_identifier();
+            let bin = if self.eat(TokenKind::Dot).is_some() {
+                Some(self.parse_identifier())
+            } else {
+                None
+            };
             self.expect(TokenKind::RParen);
             let intersect = if self.eat(TokenKind::KwIntersect).is_some() {
                 self.expect(TokenKind::LBrace);
@@ -5300,36 +5295,6 @@ impl Parser {
             self.current().text
         ));
         CrossSelect::All
-    }
-
-    /// `binsof(a.b)` names the bin `b` of cross item `a`, or, when `a` is
-    /// not an item but `a.b` is, the item `a.b` (a hierarchical variable,
-    /// §19.6.1.1).
-    fn resolve_binsof_paths(
-        sel: &mut crate::ast::decl::CrossSelect,
-        items: &[crate::ast::Identifier],
-    ) {
-        use crate::ast::decl::CrossSelect;
-        match sel {
-            CrossSelect::Binsof { cp, bin, .. } => {
-                if let Some(b) = bin.as_ref() {
-                    let path = format!("{}.{}", cp.name, b.name);
-                    if !items.iter().any(|i| i.name == cp.name)
-                        && items.iter().any(|i| i.name == path)
-                    {
-                        cp.name = path;
-                        cp.span.end = b.span.end;
-                        *bin = None;
-                    }
-                }
-            }
-            CrossSelect::Not(a) | CrossSelect::With(a, _) => Self::resolve_binsof_paths(a, items),
-            CrossSelect::And(a, b) | CrossSelect::Or(a, b) => {
-                Self::resolve_binsof_paths(a, items);
-                Self::resolve_binsof_paths(b, items);
-            }
-            CrossSelect::All => {}
-        }
     }
 
     pub(super) fn parse_covergroup_declaration(&mut self) -> CovergroupDeclaration {
@@ -5598,8 +5563,9 @@ impl Parser {
                 self.bump();
                 let mut ids = Vec::new();
                 loop {
-                    // §19.6 cross item. A hierarchical variable reference
-                    // (`u.err`) keeps its dotted path as the name.
+                    // IEEE 1800-2017 §19.6 cross item. A hierarchical
+                    // variable reference (`u.err`), an extension Questa also
+                    // accepts, keeps its dotted path as the name.
                     let mut id = self.parse_identifier();
                     while self.at(TokenKind::Dot) && self.peek_kind() == TokenKind::Identifier {
                         self.bump();
@@ -5662,8 +5628,7 @@ impl Parser {
                             }
                             let bin_name = self.parse_identifier();
                             self.expect(TokenKind::Assign);
-                            let mut select = self.parse_cross_select_or();
-                            Self::resolve_binsof_paths(&mut select, &ids);
+                            let select = self.parse_cross_select_or();
                             let mut iff_guard = None;
                             if self.eat(TokenKind::KwIff).is_some() {
                                 self.expect(TokenKind::LParen);

@@ -1,6 +1,6 @@
-//! §19.6: a cross item may be a variable, and §19.6.1.1 `binsof` may name
-//! it. Simulators also take a hierarchical reference (`u.a`) as the item.
-//! The cross list stopped at the first `.`.
+//! IEEE 1800-2017 §19.6: a cross item may be a variable. Taking a
+//! hierarchical reference (`u.a`) as the item is an extension Questa also
+//! accepts. The cross list stopped at the first `.`.
 
 use sv_parser::parse;
 
@@ -12,7 +12,7 @@ interface fcov_if (input logic clk);
     cp_a: coverpoint u.a { bins lo = {0}; bins hi = {1}; }
     x1: cross u.a, u.b;
     x2: cross cp_a, s.q.m iff (u.b) {
-      ignore_bins i1 = binsof(cp_a.lo) && binsof(s.q.m) intersect {1};
+      ignore_bins i1 = binsof(cp_a.lo);
     }
   endgroup
 endinterface
@@ -23,7 +23,6 @@ endinterface
     for name in ["\"u.a\"", "\"u.b\"", "\"s.q.m\""] {
         assert!(ast.contains(&format!("name: {name}")), "missing item {name}");
     }
-    // `cp_a.lo` stays coverpoint `cp_a`, bin `lo`; `s.q.m` is one item.
+    // `cp_a.lo` is coverpoint `cp_a`, bin `lo`.
     assert!(ast.contains("bin: Some(Identifier { name: \"lo\""));
-    assert_eq!(ast.matches("bin: None").count(), 1);
 }
