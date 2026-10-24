@@ -34586,11 +34586,33 @@ fn inline_module_items(
                                                     // in a generate-for body) — the plain const-eval
                                                     // above yields 0; pack it by the declared type
                                                     // like the parameter-default path does.
+                                                    // A body typedef reaches `elab_ro` only
+                                                    // after the first instance is settled.
+                                                    let with_local: HashMap<String, DataType>;
+                                                    let typedef_types = match data_type {
+                                                        DataType::TypeReference {
+                                                            name, ..
+                                                        } if !name.has_scope()
+                                                            && local_types
+                                                                .contains_key(&name.name.name) =>
+                                                        {
+                                                            with_local = elab_ro
+                                                                .typedef_types
+                                                                .iter()
+                                                                .chain(local_types)
+                                                                .map(|(k, v)| {
+                                                                    (k.clone(), v.clone())
+                                                                })
+                                                                .collect();
+                                                            &with_local
+                                                        }
+                                                        _ => &elab_ro.typedef_types,
+                                                    };
                                                     if let Some(pv) = pack_packed_vector_pattern(
                                                         data_type,
                                                         init,
                                                         local_map,
-                                                        &elab_ro.typedef_types,
+                                                        typedef_types,
                                                     )
                                                     .or_else(|| {
                                                         pack_struct_const_value(
@@ -34598,7 +34620,7 @@ fn inline_module_items(
                                                             init,
                                                             local_map,
                                                             &elab_ro.typedefs,
-                                                            &elab_ro.typedef_types,
+                                                            typedef_types,
                                                         )
                                                     }) {
                                                         val = pv;
