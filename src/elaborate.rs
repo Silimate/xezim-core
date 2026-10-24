@@ -15110,6 +15110,7 @@ fn validate_stmt_idents(
         }
         StatementKind::TimingControl { control, stmt } => {
             match control {
+                TimingControl::Delay(e) if is_one_step(e) => {}
                 TimingControl::Delay(e) => validate_expr_idents(e, elab, locals)?,
                 TimingControl::Event(ev) => validate_event_idents(ev, elab, locals)?,
             }
@@ -19050,6 +19051,13 @@ fn lsdd_expr(e: &mut Expression, env: &HashMap<String, Value>) {
     });
 }
 
+/// The `#1step` delay value (§A.2.2.3), which the parser carries as the
+/// `CLOCKING_ONE_STEP` identifier.
+fn is_one_step(d: &Expression) -> bool {
+    matches!(&d.kind, ExprKind::Ident(h)
+        if h.path.len() == 1 && h.path[0].name.name == crate::ast::decl::CLOCKING_ONE_STEP)
+}
+
 /// Replace a single delay expression with its tick-count equivalent.
 fn rewrite_delay_expr(d: &mut Expression, unit_s: f64, prec_s: f64, tick_s: f64) {
     use crate::ast::expr::NumberLiteral;
@@ -19069,6 +19077,11 @@ fn rewrite_delay_expr(d: &mut Expression, unit_s: f64, prec_s: f64, tick_s: f64)
             ticks
         }
     };
+    if is_one_step(d) {
+        // §3.14.3: one step is the global time precision, which is one tick.
+        *d = Expression::new(ExprKind::Number(NumberLiteral::Real(1.0)), d.span);
+        return;
+    }
     match &d.kind {
         ExprKind::Number(NumberLiteral::Time(s)) => {
             // Absolute time literal → ticks, on the precision grid.
