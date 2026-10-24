@@ -810,6 +810,8 @@ pub enum CoverBinKind {
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Cross {
     pub name: Option<Identifier>,
+    /// Crossed coverpoints or variables; a hierarchical variable reference
+    /// is named by its dotted path (`u.err`).
     pub items: Vec<Identifier>,
     /// LRM §19.6 `cross x, y iff (guard)` — skip the cross sample when
     /// guard is false. Mirrors `Coverpoint.iff_guard`.
