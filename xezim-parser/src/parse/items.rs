@@ -67,7 +67,7 @@ impl Parser {
         None
     }
 
-    /// IEEE 1800-2023 §14.4 clocking skew value after the `#`: `1step`, a
+    /// IEEE 1800-2017 §14.4 clocking skew value after the `#`: `1step`, a
     /// number or time literal, a parameter name, or a parenthesized
     /// expression.
     fn parse_clocking_skew_value(&mut self) -> Option<crate::ast::expr::Expression> {

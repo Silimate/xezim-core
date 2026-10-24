@@ -595,7 +595,7 @@ pub struct ClockingDeclaration {
     pub span: Span,
 }
 
-/// IEEE 1800-2023 §14.4, §A.2.2.3: a `#1step` clocking skew or procedural
+/// IEEE 1800-2017 §14.4, §A.2.2.3: a `#1step` clocking skew or procedural
 /// delay is carried as an identifier expression with this name (no real
 /// identifier starts with a digit), so it stays distinct from an absent
 /// skew and from `#1`.
