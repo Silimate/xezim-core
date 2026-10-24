@@ -26606,6 +26606,15 @@ fn for_each_stmt_expr(stmt: &Statement, f: &mut dyn FnMut(&Expression)) {
             f(condition);
             for_each_stmt_expr(stmt, f);
         }
+        K::Assertion(a) => {
+            f(&a.expr);
+            if let Some(s) = &a.action {
+                for_each_stmt_expr(s, f);
+            }
+            if let Some(s) = &a.else_action {
+                for_each_stmt_expr(s, f);
+            }
+        }
         K::Return(Some(e)) => f(e),
         K::VarDecl { declarators, .. } => {
             for d in declarators {
@@ -43410,17 +43419,17 @@ fn rewrite_expr_impl(
                 // leave every other actual on the plain machinery
                 // (`whole_net_ident_name` is root-tolerant, so port_aliases
                 // and interface path collapsing still see these).
-                // Gate on the mapped LEAF differing from the key being
-                // substituted: a generate-scope RENAME map (`vec` →
-                // `gen_arbiter.vec`) flows through this same function, its
-                // values are not yet instance-prefixed, and rooting them
-                // freezes the un-prefixed name (every genfor CA write
-                // vanished). A rename always has leaf == key; a genuine
-                // port-actual collision (`v_node` → `out_val`) never does.
+                // Gate on the mapped LEAF differing from the key's leaf: a
+                // generate-scope RENAME map (`vec` → `gen_arbiter.vec`, and
+                // from a nested scope `g.u` → `g.inner.u`) flows through this
+                // same function, its values are not yet instance-prefixed,
+                // and rooting them freezes the un-prefixed name (every genfor
+                // CA write vanished). A rename keeps the leaf; a genuine
+                // port-actual collision (`v_node` → `out_val`) changes it.
                 let collides = whole_net_ident_name(mapped).is_some_and(|an| {
                     let leaf = an.rsplit('.').next().unwrap_or(an.as_str());
-                    leaf != name.as_str()
-                        && (local_names.contains(leaf) || port_map.contains_key(leaf))
+                    let key_leaf = name.rsplit('.').next().unwrap_or(name.as_str());
+                    leaf != key_leaf && (local_names.contains(leaf) || port_map.contains_key(leaf))
                 });
                 if !has_tail {
                     let mut m = mapped.clone();
