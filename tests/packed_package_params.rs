@@ -1,4 +1,4 @@
-//! Indexing a packed multi-dimensional package parameter selects an element (§7.4.5 / §26.3).
+//! Indexing a packed multi-dimensional package parameter selects an element (IEEE 1800-2017 §7.4.5 / §26.3).
 fn elaborate(source: &str) -> xezim_core::ElaboratedModule {
     xezim_core::parse_and_elaborate_multi(
         &[source.to_string()],

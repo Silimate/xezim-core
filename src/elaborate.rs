@@ -23555,10 +23555,10 @@ fn alias_pkg_param(elab: &mut ElaboratedModule, pkg: &str, name: &str, v: &Value
     }
 }
 
-/// §7.4.5: a package parameter of a packed multi-dimensional type
-/// (`parameter logic [15:0][3:0] P`) gets the element registration a module
-/// parameter gets, so `P[i]` and `pkg::P[i]` select an element instead of one
-/// bit of the flat vector.
+/// IEEE 1800-2017 §7.4.5: a package parameter of a packed multi-dimensional
+/// type (`parameter logic [15:0][3:0] P`) gets the element registration a
+/// module parameter gets, so `P[i]` and `pkg::P[i]` select an element instead
+/// of one bit of the flat vector.
 fn register_pkg_param_elem(
     elab: &mut ElaboratedModule,
     pkg: &str,
