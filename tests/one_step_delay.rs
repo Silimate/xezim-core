@@ -1,5 +1,5 @@
 //! `#1step` is a procedural delay value (§A.2.2.3), not `#1` followed by an
-//! identifier `step`.
+//! identifier `step`, and not the escaped user identifier `\1step `.
 
 #[test]
 fn one_step_procedural_delay_elaborates() {
@@ -16,12 +16,16 @@ module top;
   end
 endmodule
 "#;
-    let result = xezim_core::parse_and_elaborate_multi(
-        &[source.to_string()],
-        Some("top"),
-        &[],
-        &["top.sv".to_string()],
-        &[],
-    );
+    let run = |source: &str| {
+        xezim_core::parse_and_elaborate_multi(
+            &[source.to_string()],
+            Some("top"),
+            &[],
+            &["top.sv".to_string()],
+            &[],
+        )
+    };
+    let result = run(source);
     assert!(result.is_ok(), "{:?}", result.err());
+    assert!(run("module top; initial #\\1step ; endmodule").is_err());
 }

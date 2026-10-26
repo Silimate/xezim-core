@@ -19052,10 +19052,12 @@ fn lsdd_expr(e: &mut Expression, env: &HashMap<String, Value>) {
 }
 
 /// The `#1step` delay value (§A.2.2.3), which the parser carries as the
-/// `CLOCKING_ONE_STEP` identifier.
+/// `CLOCKING_ONE_STEP` identifier over exactly the text `1step`. An escaped
+/// user identifier `\1step ` has the same name, but its span holds the `\`.
 fn is_one_step(d: &Expression) -> bool {
     matches!(&d.kind, ExprKind::Ident(h)
-        if h.path.len() == 1 && h.path[0].name.name == crate::ast::decl::CLOCKING_ONE_STEP)
+        if h.path.len() == 1 && h.path[0].name.name == crate::ast::decl::CLOCKING_ONE_STEP
+            && h.span.end - h.span.start == crate::ast::decl::CLOCKING_ONE_STEP.len())
 }
 
 /// Replace a single delay expression with its tick-count equivalent.
