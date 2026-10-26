@@ -108,6 +108,7 @@ module top; localparam int L=8, R=9, V=91; import p::A; localparam int N=A[5]; l
     assert_eq!(design.signals["data"].width, 29);
 }
 
+/// §26.3: a name imported from a package sizes an instance's array parameter.
 #[test]
 fn instance_array_parameter_dimension_names_an_imported_parameter() {
     let design = elaborate(
