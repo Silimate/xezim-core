@@ -19,8 +19,10 @@ fn class_typedef_key_takes_the_class_parameter_width() {
 class mem #(int AW = 32);
   typedef logic [AW-1:0] addr_t;
   typedef logic [11:0] fixed_t;
+  typedef addr_t chain_t;
   logic [7:0] m[addr_t];
   logic [7:0] f[fixed_t];
+  logic [7:0] g[chain_t];
 endclass
 module top; mem h; endmodule
 "#,
@@ -28,7 +30,9 @@ module top; mem h; endmodule
     let c = &design.classes["mem"];
     assert_eq!(c.assoc_index_props.get("m"), Some(&(32, false)));
     assert_eq!(c.assoc_index_props.get("f"), Some(&(12, false)));
-    // Only the key that depends on a class parameter is re-sized per object.
+    assert_eq!(c.assoc_index_props.get("g"), Some(&(32, false)));
+    // Only the keys that depend on a class parameter are re-sized per object.
     assert!(c.assoc_key_decl_types.contains_key("m"));
+    assert!(c.assoc_key_decl_types.contains_key("g"));
     assert!(!c.assoc_key_decl_types.contains_key("f"));
 }

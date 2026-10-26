@@ -2000,16 +2000,17 @@ fn class_binds_values(c: &ClassDeclaration) -> bool {
         })
 }
 
-/// The target of a class-local typedef that `dt` names (`mem_addr_t` in
-/// `logic [7:0] m[mem_addr_t]`), so its width follows this class's
-/// parameters (§6.18, §8.25); `dt` itself for any other type.
-fn class_local_typedef_target<'a>(c: &'a ClassDeclaration, dt: &'a DataType) -> &'a DataType {
+/// The target of the class-local typedef chain `t` names (`mem_addr_t` in
+/// `logic [7:0] m[mem_addr_t]`), at most `n` aliases deep, so its width follows
+/// this class's parameters (§6.18, §8.25); `t` itself for any other type.
+fn class_local_typedef_target<'a>(c: &'a ClassDeclaration, t: &'a DataType, n: u8) -> &'a DataType {
     if let DataType::TypeReference {
         name,
         dimensions,
         type_args,
         ..
-    } = dt
+    } = t
+        && n > 0
         && dimensions.is_empty()
         && type_args.is_empty()
         && !name.has_scope()
@@ -2019,11 +2020,11 @@ fn class_local_typedef_target<'a>(c: &'a ClassDeclaration, dt: &'a DataType) -> 
                 && td.name.name == name.name.name
                 && td.dimensions.is_empty()
             {
-                return &td.data_type;
+                return class_local_typedef_target(c, &td.data_type, n - 1);
             }
         }
     }
-    dt
+    t
 }
 
 fn elaborate_class_in_scope(
@@ -2301,7 +2302,7 @@ fn elaborate_class_in_scope(
                                         // A typedef'd key (`k12_t`) resolves through the
                                         // installed typedef table; without it the
                                         // index width fell back to 32 bits.
-                                        let kt = class_local_typedef_target(c, kdt);
+                                        let kt = class_local_typedef_target(c, kdt, u8::MAX);
                                         let kw = typedefs_snapshot(|td| {
                                             resolve_type_width(kt, class_params, td)
                                         });
@@ -2453,7 +2454,7 @@ fn elaborate_class_in_scope(
                                     // A typedef'd key (`k12_t`) resolves through the
                                     // installed typedef table; without it the
                                     // index width fell back to 32 bits.
-                                    let kt = class_local_typedef_target(c, kdt);
+                                    let kt = class_local_typedef_target(c, kdt, u8::MAX);
                                     let kw = typedefs_snapshot(|td| {
                                         resolve_type_width(kt, class_params, td)
                                     });
