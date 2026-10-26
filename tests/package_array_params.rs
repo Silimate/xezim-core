@@ -108,6 +108,8 @@ module top; localparam int L=8, R=9, V=91; import p::A; localparam int N=A[5]; l
     assert_eq!(design.signals["data"].width, 29);
 }
 
+/// §23.10.2: an array parameter default or override that names another
+/// array parameter takes that parameter's elements.
 #[test]
 fn array_parameter_named_by_another_array_parameter() {
     let design = elaborate(
