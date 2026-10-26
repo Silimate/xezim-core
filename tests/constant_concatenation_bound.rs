@@ -15,7 +15,10 @@ module m #(
   parameter int A = {W{1'b1}},
   parameter int B = {2'b10, {2{1'b0}}, H},
   parameter int C = {(W){2'b01}},
-  parameter int D = {40{2'b11}}
+  parameter int D = {40{2'b11}},
+  parameter int E = {{0{1'b0}}, 2'b11},
+  parameter int F = {4'hffff_ffff_ffff_ffff},
+  parameter int G = {64'hffff_ffff_ffff_ffff}
 );
 endmodule
 "#,
@@ -37,6 +40,8 @@ endmodule
             _ => panic!("expected a value parameter"),
         })
         .collect();
-    // D is 80 bits wide and does not fit.
-    assert_eq!(values, [Some(0xf), Some(0b10_00_101), Some(0b01010101), None]);
+    // D is 80 bits wide and does not fit; G keeps its 64-bit pattern.
+    let (main, new) = values.split_at(4);
+    assert_eq!(main, [Some(0xf), Some(0b10_00_101), Some(0b01010101), None]);
+    assert_eq!(new, [Some(3), Some(0xf), Some(-1)]);
 }

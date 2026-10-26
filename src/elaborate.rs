@@ -21096,7 +21096,7 @@ pub fn const_eval_i64_with_params(
         // §11.4.12: a constant concatenation or replication, such as the
         // `{Width{1'b1}}` bound of a covergroup bin range.
         ExprKind::Concatenation(_) | ExprKind::Replication { .. } => {
-            const_concat_bits(expr, params).map(|(v, _)| v as i64)
+            const_concat_bits(expr, params).and_then(|(v, w)| (w > 0).then_some(v as i64))
         }
         // §13.4.3: a user sizing function called directly in a dimension.
         // Interpret its REAL body (FUNCS_TLS) — the name-based ceil-log2
@@ -21124,7 +21124,8 @@ pub fn const_eval_i64_with_params(
 
 /// Value and width of a constant concatenation operand (§11.4.12), when
 /// every operand is a sized literal, a parameter, or a nested concatenation
-/// or replication, and the whole fits in 64 bits.
+/// or replication, and the whole fits in 64 bits. A zero replication has
+/// width 0 (§11.4.12.1).
 fn const_concat_bits(
     e: &Expression,
     params: Option<&HashMap<String, Value>>,
@@ -21133,7 +21134,8 @@ fn const_concat_bits(
     let (v, w) = match &e.kind {
         ExprKind::Paren(x) => return const_concat_bits(x, params),
         ExprKind::Number(NumberLiteral::Integer { size: Some(s), .. }) => {
-            (const_eval_i64_with_params(e, params)? as u64, *s)
+            let lit = eval_const_expr_val(e, params.unwrap_or(&HashMap::default()));
+            (lit.to_u64()?, *s)
         }
         ExprKind::Ident(h) if h.path.len() == 1 && h.path[0].selects.is_empty() => {
             let p = params?.get(&h.path[0].name.name)?;
@@ -21168,7 +21170,7 @@ fn const_concat_bits(
         }
         _ => return None,
     };
-    (w > 0 && w <= 64).then(|| (mask(v, w), w))
+    (w <= 64).then(|| (mask(v, w), w))
 }
 
 // §13.4.3 — thread-local FUNCTION table consulted by
