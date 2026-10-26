@@ -666,6 +666,7 @@ impl CovergroupDeclaration {
                         if let Some(n) = &mut b.array_size {
                             f(n);
                         }
+                        b.with_filter.iter_mut().for_each(&mut *f);
                         for step in b.transitions.iter_mut().flatten() {
                             for r in &mut step.values {
                                 r.for_each_expr_mut(f);
