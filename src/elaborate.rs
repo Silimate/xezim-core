@@ -26606,15 +26606,7 @@ fn for_each_stmt_expr(stmt: &Statement, f: &mut dyn FnMut(&Expression)) {
             f(condition);
             for_each_stmt_expr(stmt, f);
         }
-        K::Assertion(a) => {
-            f(&a.expr);
-            if let Some(s) = &a.action {
-                for_each_stmt_expr(s, f);
-            }
-            if let Some(s) = &a.else_action {
-                for_each_stmt_expr(s, f);
-            }
-        }
+        K::Assertion(a) => f(&a.expr),
         K::Return(Some(e)) => f(e),
         K::VarDecl { declarators, .. } => {
             for d in declarators {
