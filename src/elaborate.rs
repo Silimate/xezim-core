@@ -21125,7 +21125,7 @@ pub fn const_eval_i64_with_params(
 /// Value and width of a constant concatenation operand (§11.4.12), when
 /// every operand is a sized literal, a parameter, or a nested concatenation
 /// or replication, and the whole fits in 64 bits. A zero replication has
-/// width 0 (§11.4.12.1).
+/// width 0 (§11.4.12.1); 65 copies of a nonzero width are already too wide.
 fn const_concat_bits(
     e: &Expression,
     params: Option<&HashMap<String, Value>>,
@@ -21135,7 +21135,7 @@ fn const_concat_bits(
         ExprKind::Paren(x) => return const_concat_bits(x, params),
         ExprKind::Number(NumberLiteral::Integer { size: Some(s), .. }) => {
             let lit = eval_const_expr_val(e, params.unwrap_or(&HashMap::default()));
-            (lit.to_u64()?, *s)
+            (lit.to_u64().filter(|_| !lit.has_xz())?, *s)
         }
         ExprKind::Ident(h) if h.path.len() == 1 && h.path[0].selects.is_empty() => {
             let p = params?.get(&h.path[0].name.name)?;
@@ -21160,7 +21160,7 @@ fn const_concat_bits(
                 inner.push(const_concat_bits(x, params)?);
             }
             let (mut v, mut w) = (0u64, 0u32);
-            for _ in 0..n {
+            for _ in 0..n.min(65) {
                 for &(pv, pw) in &inner {
                     w = w.checked_add(pw).filter(|&w| w <= 64)?;
                     v = v.checked_shl(pw).unwrap_or(0) | pv;
