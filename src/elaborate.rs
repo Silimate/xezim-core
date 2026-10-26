@@ -5442,7 +5442,8 @@ fn hoist_package_params(defs: &HashMap<String, Definition>, elab: &mut Elaborate
                     // package's own params for its own typedefs get a bounded
                     // overlay in the hoist loop below.
                     alias_pkg_param(elab, &p.name.name, &assign.name.name, &v);
-                    register_pkg_param_elem(elab, &p.name.name, &assign.name.name, data_type);
+                    let scoped = format!("{}.{}", p.name.name, assign.name.name);
+                    register_pkg_param_elem(elab, "", &scoped, data_type);
                 }
             }
             restore_overlay(elab, pkg_overlay);
@@ -8270,12 +8271,8 @@ pub fn elaborate_module_with_defs(
                                     );
                                 }
                                 alias_pkg_param(&mut elab, &p.name.name, &assign.name.name, &v);
-                                register_pkg_param_elem(
-                                    &mut elab,
-                                    &p.name.name,
-                                    &assign.name.name,
-                                    data_type,
-                                );
+                                let scoped = format!("{}.{}", p.name.name, assign.name.name);
+                                register_pkg_param_elem(&mut elab, "", &scoped, data_type);
                                 params_insert_traced(
                                     &mut elab.parameters,
                                     line!(),
@@ -28664,12 +28661,8 @@ fn inline_instantiations_inner(
                                                 );
                                             }
                                             alias_pkg_param(elab, name, &assign.name.name, &v);
-                                            register_pkg_param_elem(
-                                                elab,
-                                                name,
-                                                &assign.name.name,
-                                                data_type,
-                                            );
+                                            let scoped = format!("{name}.{}", assign.name.name);
+                                            register_pkg_param_elem(elab, "", &scoped, data_type);
                                             params_insert_traced(
                                                 &mut elab.parameters,
                                                 line!(),
