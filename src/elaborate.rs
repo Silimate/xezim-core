@@ -42833,6 +42833,9 @@ pub fn whole_array_row_assign_parts(
     if lhi < llo || ihi < ilo || (lhi - llo) != (ihi - ilo) {
         return None;
     }
+    if eval_const_expr_val(index, params).has_xz() {
+        return None;
+    }
     let row = const_eval_i64_with_params(index, Some(params))?;
     if row < olo.min(ohi) || row > olo.max(ohi) {
         return None;

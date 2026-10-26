@@ -35,25 +35,31 @@ module top;
   localparam int ST = 2;
   logic [7:0] src [ST][3];
   logic [7:0] dst [2:0];
+  logic [7:0] unk [3];
+  localparam logic R = 1'bx;
   assign dst = src[ST-1];
+  assign unk = src[R];
 endmodule
 "#,
     );
-    let [assign] = design.continuous_assigns.as_slice() else {
-        panic!("expected one continuous assign");
+    let [assign, unknown] = design.continuous_assigns.as_slice() else {
+        panic!("expected two continuous assigns");
     };
-    let parts = xezim_core::elaborate::whole_array_row_assign_parts(
-        &assign.lhs,
-        &assign.rhs,
-        assign.delay,
-        &design.arrays,
-        &design.arrays_2d,
-        &design.parameters,
-        Some(&design.descending_arrays),
-        Some(&design.unpacked_decl_dims),
-    )
-    .expect("expanded per element");
-    let pairs: Vec<_> = parts
+    let parts = |a: &xezim_core::elaborate::ContinuousAssignment| {
+        xezim_core::elaborate::whole_array_row_assign_parts(
+            &a.lhs,
+            &a.rhs,
+            a.delay,
+            &design.arrays,
+            &design.arrays_2d,
+            &design.parameters,
+            Some(&design.descending_arrays),
+            Some(&design.unpacked_decl_dims),
+        )
+    };
+    assert!(parts(unknown).is_none(), "an x row index selects no row");
+    let pairs: Vec<_> = parts(assign)
+        .expect("expanded per element")
         .iter()
         .map(|a| (element(&a.lhs).unwrap(), element(&a.rhs).unwrap()))
         .collect();
