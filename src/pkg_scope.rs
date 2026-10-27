@@ -2558,6 +2558,7 @@ impl Rw<'_> {
         self.ports(&mut cg.ports);
         self.ports(&mut cg.sample_ports);
         cg.for_each_expr_mut(&mut |e| self.expr(e));
+        cg.for_each_bin_filter_mut(&mut |e| self.expr(e));
     }
 
     fn class(&mut self, c: &mut ClassDeclaration) {

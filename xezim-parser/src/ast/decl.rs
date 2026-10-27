@@ -666,7 +666,6 @@ impl CovergroupDeclaration {
                         if let Some(n) = &mut b.array_size {
                             f(n);
                         }
-                        b.with_filter.iter_mut().for_each(&mut *f);
                         for step in b.transitions.iter_mut().flatten() {
                             for r in &mut step.values {
                                 r.for_each_expr_mut(f);
@@ -700,6 +699,20 @@ impl CovergroupDeclaration {
                 CovergroupItem::Option { val, .. } | CovergroupItem::TypeOption { val, .. } => {
                     f(val)
                 }
+            }
+        }
+    }
+
+    /// Every value bin's `with` filter (§19.5.1.1), apart from
+    /// `for_each_expr_mut` because the filter binds `item` to the candidate
+    /// value, which shadows a same-named design object.
+    pub fn for_each_bin_filter_mut(&mut self, f: &mut dyn FnMut(&mut Expression)) {
+        for it in &mut self.items {
+            if let CovergroupItem::Coverpoint(cp) = it {
+                cp.bins
+                    .iter_mut()
+                    .filter_map(|b| b.with_filter.as_mut())
+                    .for_each(&mut *f);
             }
         }
     }
