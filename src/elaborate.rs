@@ -34615,13 +34615,17 @@ fn inline_module_items(
                                                         typedef_types,
                                                     )
                                                     .or_else(|| {
-                                                        pack_struct_const_value(
-                                                            data_type,
-                                                            init,
-                                                            local_map,
-                                                            &elab_ro.typedefs,
-                                                            typedef_types,
-                                                        )
+                                                        typedefs_snapshot(|td| {
+                                                            pack_struct_const_value(
+                                                                data_type,
+                                                                init,
+                                                                local_map,
+                                                                td.unwrap_or_else(|| {
+                                                                    elab_ro.typedefs.as_map()
+                                                                }),
+                                                                typedef_types,
+                                                            )
+                                                        })
                                                     }) {
                                                         val = pv;
                                                     }

@@ -16,7 +16,8 @@ fn body_struct_localparam_is_packed_in_the_first_instance() {
     let design = elaborate(
         r#"
 module m;
-  typedef struct packed { logic a; logic b; logic [1:0] c; } s_t;
+  typedef logic [1:0] field_t;
+  typedef struct packed { logic a; logic b; field_t c; } s_t;
   localparam s_t R = '{a: 1'b0, b: 1'b1, c: 2'b10};
 endmodule
 module top; m u0(); m u1(); endmodule
