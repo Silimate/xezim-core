@@ -38361,6 +38361,11 @@ fn inline_module_items(
                                 &sub_interface_map,
                             );
                         });
+                        with_shadowed(&["item"], &cg_ports, &cg_locals, |pm, ln| {
+                            new_cg.for_each_bin_filter_mut(&mut |e| {
+                                *e = rewrite_expr(e, &inst_prefix, pm, ln, &sub_interface_map);
+                            });
+                        });
                         if let Some(EventControl::Identifier(id)) = &mut new_cg.event {
                             if cg_locals.contains(&id.name) {
                                 id.name = cat2(&inst_prefix, &id.name);
