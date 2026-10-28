@@ -176,7 +176,8 @@ pub use value::Value;
 /// \x2d = \x2c + the fall delay of a UDP instance (§28.16, §29.3).
 /// \x2e = \x2d + ElaboratedClass.assoc_key_decl_types (§8.25).
 /// \x2f = \x2e + CoverBin.with_filter (§19.5.1.1).
-pub const XEZIM_BYTECODE_MAGIC: &[u8; 8] = b"XEZIMBC\x2f";
+/// \x30 = \x2f + clocking skew edges (§14.3).
+pub const XEZIM_BYTECODE_MAGIC: &[u8; 8] = b"XEZIMBC\x30";
 
 /// Name of the synthetic root that instantiates every top of a multi-top
 /// design (§23.3.3), each instance named after its module. It is not part of
