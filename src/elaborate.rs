@@ -28956,6 +28956,26 @@ fn inline_instantiations_inner(
                                             assign.name.name.clone(),
                                             v,
                                         );
+                                        // §7.2.1: a struct parameter read through
+                                        // an import in a submodule needs its field
+                                        // layout, or `P.member` reads x. A top-scope
+                                        // name registered earlier keeps its own.
+                                        if let Some(fields) = flatten_struct_fields(
+                                            data_type,
+                                            &elab.parameters,
+                                            &elab.typedefs,
+                                            &elab.typedef_types,
+                                        ) {
+                                            if !fields.is_empty() {
+                                                tls_register_struct_layout(
+                                                    &assign.name.name,
+                                                    &fields,
+                                                );
+                                                elab.packed_struct_fields
+                                                    .entry(assign.name.name.clone())
+                                                    .or_insert(fields);
+                                            }
+                                        }
                                     }
                                 }
                             }
