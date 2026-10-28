@@ -7540,6 +7540,7 @@ pub fn elaborate_module_with_defs(
                 restore_overlay(&mut elab, ov);
             }
         }
+        register_scoped_pkg_struct_layouts(defs, &mut elab);
         for td in ordered_typedefs(defs) {
             check_enum_member_duplicates(td, &elab)?;
             process_typedef(td, &mut elab);
@@ -23696,6 +23697,63 @@ fn register_pkg_param_elem(
     if let Some(fdims) = packed_full_dims_of(data_type, &elab.parameters) {
         for k in keys {
             elab.packed_full_dims.insert(k, fdims.clone());
+        }
+    }
+}
+
+/// §26.3 / §7.2.1: the field layout of each struct package parameter under
+/// its qualified `pkg::name` key (the key `alias_pkg_param` gives its value),
+/// so `pkg::P.member` selects the package's own parameter even where a
+/// different `P` is visible by its bare name. Runs once the package typedefs
+/// are registered; a bare type name is the package's own typedef.
+fn register_scoped_pkg_struct_layouts(
+    defs: &HashMap<String, Definition>,
+    elab: &mut ElaboratedModule,
+) {
+    for def in defs.values() {
+        let Definition::Package(p) = def else {
+            continue;
+        };
+        let pkg = &p.name.name;
+        for item in &p.items {
+            let PackageItem::Parameter(pd) = item else {
+                continue;
+            };
+            let ParameterKind::Data {
+                data_type,
+                assignments,
+            } = &pd.kind
+            else {
+                continue;
+            };
+            let scoped_type = match data_type {
+                DataType::TypeReference { name, .. }
+                    if !name.has_scope()
+                        && elab
+                            .typedef_types
+                            .contains_key(&format!("{}::{}", pkg, name.name.name)) =>
+                {
+                    let own = std::collections::HashSet::from([name.name.name.clone()]);
+                    scope_local_typerefs(data_type, &own, &format!("{pkg}::"))
+                }
+                _ => data_type.clone(),
+            };
+            let Some(fields) = flatten_struct_fields(
+                &scoped_type,
+                &elab.parameters,
+                &elab.typedefs,
+                &elab.typedef_types,
+            ) else {
+                continue;
+            };
+            if fields.is_empty() {
+                continue;
+            }
+            for assign in assignments.iter().filter(|a| a.dimensions.is_empty()) {
+                let key = format!("{}::{}", pkg, assign.name.name);
+                tls_register_struct_layout(&key, &fields);
+                elab.packed_struct_fields.insert(key, fields.clone());
+            }
         }
     }
 }
