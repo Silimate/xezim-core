@@ -29,12 +29,12 @@ pub(crate) enum ConstraintPos {
 }
 
 impl Parser {
-    /// IEEE 1800-2023 §14.4 clocking skew value after the `#`: `1step`, a
-    /// number or time literal, a parameter name, or a parenthesized
-    /// expression. `1step` lexes as the integer `1` followed by the
-    /// identifier `step` with no space between; it used to be read as `#1`
-    /// and the rest of the `default` item (`output #2`) was skipped.
-    fn parse_clocking_skew_value(&mut self) -> Option<crate::ast::expr::Expression> {
+    /// `1step` after a `#` (§A.2.2.3 `delay_value`), as the
+    /// `CLOCKING_ONE_STEP` identifier expression. It lexes as the integer `1`
+    /// followed by the identifier `step` with no space between; read as `#1`,
+    /// a clocking `default` item lost its `output #2`, and a procedural
+    /// `#1step;` reported an undeclared `step`.
+    pub(super) fn parse_one_step(&mut self) -> Option<crate::ast::expr::Expression> {
         if self.at(TokenKind::IntegerLiteral)
             && self.current().text == "1"
             && self.peek_kind() == TokenKind::Identifier
@@ -63,6 +63,16 @@ impl Parser {
                 };
                 return Some(Expression::new(ExprKind::Ident(hier), sp));
             }
+        }
+        None
+    }
+
+    /// IEEE 1800-2017 §14.4 clocking skew value after the `#`: `1step`, a
+    /// number or time literal, a parameter name, or a parenthesized
+    /// expression.
+    fn parse_clocking_skew_value(&mut self) -> Option<crate::ast::expr::Expression> {
+        if let Some(e) = self.parse_one_step() {
+            return Some(e);
         }
         if self.at(TokenKind::LParen) {
             self.bump();
