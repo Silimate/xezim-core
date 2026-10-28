@@ -5524,6 +5524,7 @@ impl Parser {
                                 let mut transitions: Vec<Vec<crate::ast::decl::TransStep>> =
                                     Vec::new();
                                 let mut bin_kind = k;
+                                let mut with_filter = None;
                                 if self.at(TokenKind::LBrace) {
                                     self.bump();
                                     while !self.at(TokenKind::RBrace) && !self.at(TokenKind::Eof) {
@@ -5534,6 +5535,11 @@ impl Parser {
                                     }
                                     if self.at(TokenKind::RBrace) {
                                         self.bump();
+                                    }
+                                    if self.eat(TokenKind::KwWith).is_some() {
+                                        self.expect(TokenKind::LParen);
+                                        with_filter = Some(self.parse_expression());
+                                        self.expect(TokenKind::RParen);
                                     }
                                 } else if self.at(TokenKind::KwDefault) {
                                     // `bins other = default;` — LRM §19.5
@@ -5567,6 +5573,7 @@ impl Parser {
                                     array_size,
                                     is_wildcard,
                                     transitions,
+                                    with_filter,
                                     span: self.span_from(bin_start),
                                 });
                             } else {

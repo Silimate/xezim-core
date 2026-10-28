@@ -703,6 +703,20 @@ impl CovergroupDeclaration {
             }
         }
     }
+
+    /// Every value bin's `with` filter (§19.5.1.1), apart from
+    /// `for_each_expr_mut` because the filter binds `item` to the candidate
+    /// value, which shadows a same-named design object.
+    pub fn for_each_bin_filter_mut(&mut self, f: &mut dyn FnMut(&mut Expression)) {
+        for it in &mut self.items {
+            if let CovergroupItem::Coverpoint(cp) = it {
+                cp.bins
+                    .iter_mut()
+                    .filter_map(|b| b.with_filter.as_mut())
+                    .for_each(&mut *f);
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -765,6 +779,11 @@ pub struct CoverBin {
     /// of its `=>` steps.
     #[cfg_attr(feature = "serde", serde(default))]
     pub transitions: Vec<Vec<TransStep>>,
+    /// LRM §19.5.1.1 `bins name = { ... } with (expr)`: only the values for
+    /// which `expr`, with `item` bound to the value, is true belong to the
+    /// bin.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub with_filter: Option<Expression>,
     pub span: Span,
 }
 
