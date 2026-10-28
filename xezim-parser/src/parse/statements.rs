@@ -639,6 +639,8 @@ impl Parser {
                     };
                     self.expect(TokenKind::RParen);
                     chosen
+                } else if let Some(step) = self.parse_one_step() {
+                    step
                 } else {
                     // A bare delay is a delay_value primary (§9.4.1), not a full
                     // expression: `#5 -> ev;` must be a 5-tick delay followed by
