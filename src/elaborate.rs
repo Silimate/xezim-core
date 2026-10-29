@@ -43806,9 +43806,17 @@ fn rewrite_expr_impl(
                 // and rooting them freezes the un-prefixed name (every genfor
                 // CA write vanished). A rename keeps the leaf; a genuine
                 // port-actual collision (`v_node` → `out_val`) changes it.
+                // A dotted key is a nested rename only when the mapped name
+                // also keeps its first segment; an escaped port name such as
+                // `\foo.bar ` bound to the parent's `bar` keeps only the leaf.
                 let collides = whole_net_ident_name(mapped).is_some_and(|an| {
                     let leaf = an.rsplit('.').next().unwrap_or(an.as_str());
-                    let key_leaf = name.rsplit('.').next().unwrap_or(name.as_str());
+                    let key_leaf = match name.split_once('.') {
+                        Some((head, _)) if an.split('.').next() == Some(head) => {
+                            name.rsplit('.').next().unwrap_or(name.as_str())
+                        }
+                        _ => name.as_str(),
+                    };
                     leaf != key_leaf && (local_names.contains(leaf) || port_map.contains_key(leaf))
                 });
                 if !has_tail {
