@@ -29981,6 +29981,15 @@ fn collect_scoped_instance_heads(
         match item {
             ModuleItem::AlwaysConstruct(ac) => for_each_stmt_expr(&ac.stmt, &mut visit),
             ModuleItem::InitialConstruct(ic) => for_each_stmt_expr(&ic.stmt, &mut visit),
+            ModuleItem::AssertionItem(a) => {
+                visit(&a.expr);
+                if let Some(s) = &a.action {
+                    for_each_stmt_expr(s, &mut visit);
+                }
+                if let Some(s) = &a.else_action {
+                    for_each_stmt_expr(s, &mut visit);
+                }
+            }
             ModuleItem::FinalConstruct(fc) => for_each_stmt_expr(&fc.stmt, &mut visit),
             ModuleItem::ContinuousAssign(ca) => {
                 for (l, r) in &ca.assignments {
