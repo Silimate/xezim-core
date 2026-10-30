@@ -37,4 +37,6 @@ endmodule
 "#,
     );
     assert!(m.signals.contains_key("dut.clk"), "no implicit net dut.clk");
+    assert_eq!(m.port_aliases.get("dut.far.clk").map(|s| s.as_str()), Some("dut.clk"));
+    assert_eq!(m.port_aliases.get("dut.mon.clk").map(|s| s.as_str()), Some("dut.clk"));
 }
