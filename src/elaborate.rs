@@ -2027,12 +2027,32 @@ fn class_local_typedef_target<'a>(c: &'a ClassDeclaration, t: &'a DataType, n: u
     t
 }
 
+fn expr_names_any(e: &Expression, names: &HashSet<String>) -> bool {
+    let mut hit = false;
+    for_each_sub_expr(e, &mut |x| {
+        hit |= matches!(&x.kind, ExprKind::Ident(h)
+            if h.path.len() == 1 && names.contains(&h.path[0].name.name));
+    });
+    hit
+}
+
+/// Whether a range depends on a header parameter, also through a constant
+/// function (`$clog2(N)`) or a class-body localparam (§8.25, §6.20.1).
 fn range_refs_class_header_param(c: &ClassDeclaration, l: &Expression, r: &Expression) -> bool {
-    let (mut params, mut ids) = (HashSet::default(), HashSet::default());
+    let mut params = HashSet::default();
     c.params.iter().for_each(|p| decl_param_names(p, &mut params));
-    collect_expr_idents(l, &mut ids);
-    collect_expr_idents(r, &mut ids);
-    !params.is_disjoint(&ids)
+    for item in &c.items {
+        if let ClassItem::Parameter(pd) = item
+            && let ParameterKind::Data { assignments, .. } = &pd.kind
+        {
+            for a in assignments {
+                if a.init.as_ref().is_some_and(|e| expr_names_any(e, &params)) {
+                    params.insert(a.name.name.clone());
+                }
+            }
+        }
+    }
+    expr_names_any(l, &params) || expr_names_any(r, &params)
 }
 
 fn elaborate_class_in_scope(

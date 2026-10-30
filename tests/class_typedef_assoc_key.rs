@@ -25,6 +25,9 @@ class mem #(int AW = 32);
   logic [7:0] m[addr_t];
   logic [7:0] f[fixed_t];
   logic [7:0] g[chain_t];
+  localparam int DEPTH = AW;
+  typedef logic [$clog2(DEPTH):0] log_t;
+  logic [7:0] q[log_t];
 endclass
 mem h; endmodule
 "#,
@@ -36,5 +39,6 @@ mem h; endmodule
     // Only the keys that depend on a class parameter are re-sized per object.
     assert!(c.assoc_key_decl_types.contains_key("m"));
     assert!(c.assoc_key_decl_types.contains_key("g"));
+    assert!(c.assoc_key_decl_types.contains_key("q"));
     assert!(!c.assoc_key_decl_types.contains_key("f"));
 }
