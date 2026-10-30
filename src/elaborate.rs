@@ -2027,6 +2027,14 @@ fn class_local_typedef_target<'a>(c: &'a ClassDeclaration, t: &'a DataType, n: u
     t
 }
 
+fn range_refs_class_header_param(c: &ClassDeclaration, l: &Expression, r: &Expression) -> bool {
+    let (mut params, mut ids) = (HashSet::default(), HashSet::default());
+    c.params.iter().for_each(|p| decl_param_names(p, &mut params));
+    collect_expr_idents(l, &mut ids);
+    collect_expr_idents(r, &mut ids);
+    !params.is_disjoint(&ids)
+}
+
 fn elaborate_class_in_scope(
     c: &ClassDeclaration,
     scope_params: Option<&HashMap<String, Value>>,
@@ -2468,8 +2476,7 @@ fn elaborate_class_in_scope(
                                     | DataType::Implicit { dimensions, .. } = kt
                                         && dimensions.iter().any(|d| {
                                             matches!(d, PackedDimension::Range { left, right, .. }
-                                                if const_eval_i64_with_params(left, None).is_none()
-                                                    || const_eval_i64_with_params(right, None).is_none())
+                                                if range_refs_class_header_param(c, left, right))
                                         })
                                     {
                                         assoc_key_decl_types

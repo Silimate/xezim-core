@@ -16,6 +16,8 @@ fn elaborate(source: &str) -> xezim_core::ElaboratedModule {
 fn class_typedef_key_takes_the_class_parameter_width() {
     let design = elaborate(
         r#"
+module top #(int AW = 8); child c(); endmodule
+module child;
 class mem #(int AW = 32);
   typedef logic [AW-1:0] addr_t;
   typedef logic [11:0] fixed_t;
@@ -24,7 +26,7 @@ class mem #(int AW = 32);
   logic [7:0] f[fixed_t];
   logic [7:0] g[chain_t];
 endclass
-module top; mem h; endmodule
+mem h; endmodule
 "#,
     );
     let c = &design.classes["mem"];
