@@ -17,8 +17,8 @@ fn elaborate(source: &str) -> xezim_core::ElaboratedModule {
 fn hierarchical_whole_array_assign_expands_per_element() {
     let design = elaborate(
         r#"
-interface ifc; logic [7:0] arr [2]; endinterface
-module dut; logic [7:0] src [2]; endmodule
+interface ifc; logic [7:0] arr [0:1]; endinterface
+module dut; logic [7:0] src [1:0]; endmodule
 module top; ifc i(); dut d(); assign i.arr = d.src; endmodule
 "#,
     );
@@ -58,8 +58,8 @@ module top; ifc i(); dut d(); assign i.arr = d.src; endmodule
     assert_eq!(
         pairs,
         [
-            (Some("i.arr[0]".into()), Some("d.src[0]".into())),
-            (Some("i.arr[1]".into()), Some("d.src[1]".into())),
+            (Some("i.arr[0]".into()), Some("d.src[1]".into())),
+            (Some("i.arr[1]".into()), Some("d.src[0]".into())),
         ],
     );
 }
