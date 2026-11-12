@@ -2847,6 +2847,13 @@ impl Rw<'_> {
         self.ports(&mut cg.ports);
         self.ports(&mut cg.sample_ports);
         cg.for_each_expr_mut(&mut |e| self.expr(e));
+        // §19.5.1.1: `item` in a bin filter is the candidate value, not a
+        // package value a wildcard import happens to declare with the same name.
+        let mut f = Frame::default();
+        f.values.insert("item".to_string());
+        self.frames.push(f);
+        cg.for_each_bin_filter_mut(&mut |e| self.expr(e));
+        self.frames.pop();
     }
 
     fn class(&mut self, c: &mut ClassDeclaration) {
