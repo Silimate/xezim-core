@@ -35,9 +35,12 @@ pub(super) fn specialized_receiver(
 /// name that instance's parameters. Qualify each name the instance declares
 /// as an expression reference to it is qualified, so instances with
 /// different parameter values name different specializations (a bare `W`
-/// resolved to one instance's value for every instance). Named-argument
-/// labels (`.W(`), scoped names (`p::N`, `C::N`), literals and strings keep
-/// their spelling.
+/// resolved to one instance's value for every instance). Identifiers in a
+/// type position (`virtual iface`, a typedef or class name, §3.13) keep the
+/// unqualified type spelling so a package `db#(virtual clk_rst_if)` and a
+/// module `db#(virtual clk_rst_if)` name the same specialization. Named-
+/// argument labels (`.W(`), scoped names (`p::N`, `C::N`), literals and
+/// strings keep their spelling.
 pub(super) fn spec_args_text(
     text: &str,
     prefix: &str,
@@ -46,6 +49,243 @@ pub(super) fn spec_args_text(
     if prefix.is_empty() || local_names.is_empty() {
         return text.to_string();
     }
+    let mut out = String::with_capacity(text.len());
+    let mut depth = 0i32;
+    let mut start = 0usize;
+    let b = text.as_bytes();
+     for (i, ch) in text.char_indices() {
+        match ch {
+            '(' | '[' | '{' => depth += 1,
+            ')' | ']' | '}' => depth -= 1,
+            ',' if depth == 0 => {
+                out.push_str(&qualify_one_spec_arg(
+                    &text[start..i],
+                    prefix,
+                    local_names,
+                ));
+                out.push(ch);
+                start = i + ch.len_utf8();
+            }
+            _ => {}
+        }
+    }
+    if start < text.len() || text.is_empty() {
+        out.push_str(&qualify_one_spec_arg(
+            &text[start..],
+            prefix,
+            local_names,
+        ));
+    }
+    out
+}
+
+fn qualify_named_spec_arg(
+    piece: &str,
+    prefix: &str,
+    local_names: &std::collections::HashSet<String>,
+) -> String {
+    if let Some(open) = piece.find('(') {
+        let mut depth = 0i32;
+        let b = piece.as_bytes();
+        for (i, &c) in b[open..].iter().enumerate() {
+            match c {
+                b'(' | b'[' | b'{' => depth += 1,
+                b')' | b']' | b'}' => {
+                    depth -= 1;
+                    if depth == 0 && c == b')' {
+                        let head = &piece[..open + 1];
+                        let inner = &piece[open + 1..open + i];
+                        let tail = &piece[open + i..];
+                        return format!(
+                            "{head}{}{tail}",
+                            qualify_spec_expr_text(inner, prefix, local_names)
+                        );
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    qualify_spec_expr_text(piece, prefix, local_names)
+}
+
+fn parse_spec_arg_type(text: &str) -> Option<DataType> {
+    let t = text.trim();
+    if t.is_empty() {
+        return None;
+    }
+    let source = format!("module __type_override; typedef {t} __bound_type; endmodule");
+    let parsed = crate::parse(&source);
+    if !parsed.errors.is_empty() {
+        return None;
+    }
+    let crate::ast::Description::Module(module) = parsed.source.descriptions.into_iter().next()?
+    else {
+        return None;
+    };
+    module.items.into_iter().find_map(|item| match item {
+        ModuleItem::TypedefDeclaration(t) => Some(t.data_type),
+        _ => None,
+    })
+}
+
+enum SpecArgKind {
+    Type,
+    Expr,
+    Named,
+}
+
+fn classify_spec_arg(piece: &str) -> SpecArgKind {
+    let t = piece.trim();
+    if t.starts_with('.') {
+        return SpecArgKind::Named;
+    }
+    if t.starts_with("virtual") {
+        return SpecArgKind::Type;
+    }
+    let as_type = parse_spec_arg_type(t);
+    let as_expr = crate::parse_override_value(t);
+    match (as_type.is_some(), as_expr.is_some()) {
+        (true, false) => SpecArgKind::Type,
+        (false, true) | (false, false) => SpecArgKind::Expr,
+        (true, true) => {
+            if t.chars()
+                .any(|c| matches!(c, '*' | '+' | '-' | '<' | '>' | '&' | '|' | '?' | ':'))
+            {
+                SpecArgKind::Expr
+            } else if t.contains('\'') {
+                SpecArgKind::Expr
+            } else {
+                // A bare name parses both ways when it could be a type or a
+                // value parameter (`PW` of `parameter int PW`) — value wins.
+                SpecArgKind::Expr
+            }
+        }
+    }
+}
+
+fn qualify_one_spec_arg(
+    piece: &str,
+    prefix: &str,
+    local_names: &std::collections::HashSet<String>,
+) -> String {
+    let lead = piece.len() - piece.trim_start().len();
+    let trail = piece.len() - piece.trim_end().len();
+    let (lead_s, rest) = piece.split_at(lead);
+    let (body, trail_s) = rest.split_at(rest.len().saturating_sub(trail));
+    let rewritten = match classify_spec_arg(body) {
+        SpecArgKind::Named => qualify_named_spec_arg(body, prefix, local_names),
+        SpecArgKind::Type => qualify_spec_type_text(body.trim(), prefix, local_names),
+        SpecArgKind::Expr => qualify_spec_expr_text(body, prefix, local_names),
+    };
+    format!("{lead_s}{rewritten}{trail_s}")
+}
+
+/// Type positions in a specialization argument: spell type names verbatim,
+/// but still qualify instance-local VALUE names inside nested `#(...)`.
+fn qualify_spec_type_text(
+    text: &str,
+    prefix: &str,
+    local_names: &std::collections::HashSet<String>,
+) -> String {
+    let b = text.as_bytes();
+    let ident = |c: u8| c.is_ascii_alphanumeric() || c == b'_' || c == b'$';
+    let mut out = String::with_capacity(text.len());
+    let mut i = 0usize;
+    let mut type_head = true;
+    while i < b.len() {
+        let start = i;
+        let c = b[i];
+        if c.is_ascii_whitespace() {
+            i += text[i..].chars().next().map_or(1, char::len_utf8);
+            out.push_str(&text[start..i]);
+            continue;
+        }
+        if c == b'#' && i + 1 < b.len() && b[i + 1] == b'(' {
+            out.push_str(&text[start..i + 2]);
+            i += 2;
+            let inner_start = i;
+            let mut depth = 1i32;
+            while i < b.len() && depth > 0 {
+                match b[i] {
+                    b'(' | b'[' | b'{' => depth += 1,
+                    b')' | b']' | b'}' => depth -= 1,
+                    _ => {}
+                }
+                if depth > 0 {
+                    i += 1;
+                }
+            }
+            out.push_str(&spec_args_text(
+                &text[inner_start..i],
+                prefix,
+                local_names,
+            ));
+            if i < b.len() && b[i] == b')' {
+                out.push(')');
+                i += 1;
+            }
+            type_head = false;
+            continue;
+        }
+        if c == b'"' {
+            i += 1;
+            while i < b.len() && b[i] != b'"' {
+                i += if b[i] == b'\\' { 2 } else { 1 };
+            }
+            i = (i + 1).min(b.len());
+            out.push_str(&text[start..i]);
+            continue;
+        }
+        if c == b'\'' || c.is_ascii_digit() || c == b'$' {
+            i += 1;
+            while i < b.len() && (ident(b[i]) || b[i] == b'\'') {
+                i += 1;
+            }
+            out.push_str(&text[start..i]);
+            continue;
+        }
+        if c.is_ascii_alphabetic() || c == b'_' {
+            while i < b.len() && ident(b[i]) {
+                i += 1;
+            }
+            let tok = &text[start..i];
+            let after = text[i..].trim_start();
+            if type_head && matches!(tok, "virtual" | "interface" | "type") {
+                out.push_str(tok);
+                continue;
+            }
+            if type_head && !after.starts_with("::") {
+                out.push_str(tok);
+                if !after.starts_with('#') {
+                    type_head = false;
+                }
+                continue;
+            }
+            let before = text[..start].trim_end();
+            if local_names.contains(tok)
+                && !before.ends_with('.')
+                && !before.ends_with("::")
+                && !after.starts_with("::")
+            {
+                out.push_str(prefix);
+                out.push_str(tok);
+            } else {
+                out.push_str(tok);
+            }
+            continue;
+        }
+        i += text[i..].chars().next().map_or(1, char::len_utf8);
+        out.push_str(&text[start..i]);
+    }
+    out
+}
+
+fn qualify_spec_expr_text(
+    text: &str,
+    prefix: &str,
+    local_names: &std::collections::HashSet<String>,
+) -> String {
     let b = text.as_bytes();
     let ident = |c: u8| c.is_ascii_alphanumeric() || c == b'_' || c == b'$';
     let mut out = String::with_capacity(text.len());
@@ -60,7 +300,6 @@ pub(super) fn spec_args_text(
             }
             i = (i + 1).min(b.len());
         } else if c == b'\'' || c.is_ascii_digit() || c == b'$' {
-            // A based literal (`8'hFF`, `'1`), a number, a system name.
             i += 1;
             while i < b.len() && (ident(b[i]) || b[i] == b'\'') {
                 i += 1;
