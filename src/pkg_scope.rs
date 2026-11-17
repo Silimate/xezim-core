@@ -819,9 +819,10 @@ struct Rw<'a> {
     in_const: u32,
     /// Nesting of `inline_type` replacements being walked (a guard).
     inline_depth: u32,
-    /// (scope, name) pairs already warned about under
-    /// --relax-wildcard-import-conflict.
-    warned: std::cell::RefCell<HashSet<(String, String)>>,
+    /// (scope, name, packages in import order) already warned about under
+    /// --relax-wildcard-import-conflict. Two scopes that share a label but
+    /// import in another order pick another package, so warn again.
+    warned: std::cell::RefCell<HashSet<(String, String, Vec<String>)>>,
 }
 
 /// A name looked up in a class and its bases.
@@ -1464,7 +1465,7 @@ impl Rw<'_> {
         if !self
             .warned
             .borrow_mut()
-            .insert((scope.clone(), n.to_string()))
+            .insert((scope.clone(), n.to_string(), pkgs.to_vec()))
         {
             return;
         }
@@ -1531,6 +1532,32 @@ impl Rw<'_> {
             }
         }
         Res::Keep
+    }
+
+    /// --relax-wildcard-import-conflict, and `n` is an enum member that the
+    /// wildcard imports of the nearest scope offering it provide from more
+    /// than one package.
+    fn relaxed_member(&self, n: &str) -> bool {
+        if !crate::sv_parser::RELAX_WILDCARD_IMPORT_CONFLICT.get()
+            || !self.info.colliding_members.contains(n)
+        {
+            return false;
+        }
+        self.frames
+            .iter()
+            .rev()
+            .find_map(|f| {
+                let mut owners: Vec<String> = Vec::new();
+                for q in &f.wild {
+                    if let Some(o) = self.info.member_owner(q, n, 0)
+                        && !owners.contains(&o)
+                    {
+                        owners.push(o);
+                    }
+                }
+                (!owners.is_empty()).then_some(owners.len() > 1)
+            })
+            .unwrap_or(false)
     }
 
     /// The package whose enum member a bare `n` denotes, when that is not
@@ -2236,12 +2263,15 @@ impl Rw<'_> {
                             );
                             return;
                         }
-                    } else if self.in_const == 0 {
+                    } else if self.in_const == 0 || self.relaxed_member(n) {
                         // §26.3 / §6.19: an enum member of a package, named
                         // bare where that package's declaration is the one in
                         // scope. All packages' members share one flat table,
                         // where the last package registered wins, so spell
                         // the reference `pkg::NAME` — the qualified lookup.
+                        // In a constant context only for a member that the
+                        // relaxation resolves, so a constant and a run-time
+                        // reference get the same import's value.
                         if let Some(p) = self.resolve_member(n) {
                             let span = e.span;
                             let member = h.path[0].name.clone();
