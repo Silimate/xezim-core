@@ -4790,6 +4790,103 @@ impl<'a> Definition<'a> {
     }
 }
 
+/// Whether a `gated_clk_cell` definition is the OpenC910 pass-through:
+/// `clk_in` an input, `clk_out` the only output, driven solely by an
+/// undelayed `assign clk_out = clk_in;`, and nothing else in the body but
+/// declarations and continuous assignments to internal nets (the dead enable
+/// logic). Such an instance behaves as a direct assignment of its
+/// connections; anything else (a latch, an `always` block, an instance,
+/// another output) is a real cell and must be elaborated as written.
+fn is_clock_passthrough_cell(def: &Definition) -> bool {
+    let Definition::Module(_) = def else {
+        return false;
+    };
+    let mut dirs: HashMap<&str, PortDirection> = HashMap::default();
+    if let PortList::Ansi(ports) = def.ports() {
+        // §23.2.2.3: an ANSI port without a direction inherits the previous.
+        let mut last = PortDirection::Inout;
+        for p in ports {
+            if let Some(d) = p.direction {
+                last = d;
+            }
+            dirs.insert(p.name.name.as_str(), last);
+        }
+    }
+    let is_ident = |e: &Expression, name: &str| {
+        matches!(&e.kind, ExprKind::Ident(h)
+            if h.root.is_none()
+                && h.path.len() == 1
+                && h.path[0].selects.is_empty()
+                && h.path[0].name.name == name)
+    };
+    let mut out_drivers = 0usize;
+    let mut internal_lhs: Vec<&Expression> = Vec::new();
+    for item in def.items() {
+        match item {
+            ModuleItem::PortDeclaration(pd) => {
+                for d in &pd.declarators {
+                    if d.init.is_some() {
+                        return false;
+                    }
+                    dirs.insert(d.name.name.as_str(), pd.direction);
+                }
+            }
+            ModuleItem::NetDeclaration(nd) => {
+                if nd
+                    .declarators
+                    .iter()
+                    .any(|d| d.name.name == "clk_out" && d.init.is_some())
+                {
+                    return false;
+                }
+            }
+            ModuleItem::DataDeclaration(dd) => {
+                if dd
+                    .declarators
+                    .iter()
+                    .any(|d| d.name.name == "clk_out" && d.init.is_some())
+                {
+                    return false;
+                }
+            }
+            ModuleItem::ContinuousAssign(ca) => {
+                if ca.delay.is_some() || ca.strength.is_some() {
+                    return false;
+                }
+                for (lhs, rhs) in &ca.assignments {
+                    if is_ident(lhs, "clk_out") {
+                        if !is_ident(rhs, "clk_in") {
+                            return false;
+                        }
+                        out_drivers += 1;
+                    } else {
+                        internal_lhs.push(lhs);
+                    }
+                }
+            }
+            ModuleItem::ParameterDeclaration(_)
+            | ModuleItem::LocalparamDeclaration(_)
+            | ModuleItem::TimeunitsDecl(_) => {}
+            _ => return false,
+        }
+    }
+    // Every other driven net must be internal: an assignment to a port, or
+    // to a part of `clk_out`, is observable outside the cell.
+    let internal = |e: &Expression| match &e.kind {
+        ExprKind::Ident(h) if h.root.is_none() && h.path.len() == 1 => {
+            !dirs.contains_key(h.path[0].name.name.as_str())
+        }
+        _ => false,
+    };
+    out_drivers == 1
+        && internal_lhs.iter().all(|e| internal(e))
+        && dirs.get("clk_in") == Some(&PortDirection::Input)
+        && dirs.get("clk_out") == Some(&PortDirection::Output)
+        && dirs.iter().all(|(n, d)| {
+            *n == "clk_out" || !matches!(d, PortDirection::Output | PortDirection::Inout)
+        })
+}
+
 fn get_type_name(dt: &DataType) -> Option<String> {
     match dt {
         DataType::TypeReference { name, .. } => Some(name.name.name.clone()),
@@ -40265,7 +40362,12 @@ fn inline_module_items(
                 // clock. Replace the entire instance with a single direct
                 // cont-assign `parent_clk_out = parent_clk_in` so the
                 // gated clock unifies with its source.
-                if sub_mod_name == "gated_clk_cell" {
+                //
+                // Only a cell whose body really is that pass-through: other
+                // designs use the same name for a real clock gate (Wujian100's
+                // `soc/common.v` latches its enable), which this ran as a
+                // wire, dropping the gate and its sub-instances.
+                if sub_mod_name == "gated_clk_cell" && is_clock_passthrough_cell(&sub_mod) {
                     if let (Some(clk_out_expr), Some(clk_in_expr)) = (
                         port_map.get("clk_out").cloned(),
                         port_map.get("clk_in").cloned(),
