@@ -1,0 +1,60 @@
+//! §23.3.3.7, §11.8.1: an input port's own declaration decides whether the
+//! module body reads it as signed, and the connection converts the actual to
+//! that type. Renaming the port to its actual is only sound when the two
+//! agree: a concatenation or a select is unsigned, so substituting
+//! `{c[11], c}` for `input logic signed [12:0] e_i` made `e_i < 0` false and
+//! `a_i - e_i` unsigned in the body. Such a port keeps its own net, driven by
+//! the connection; an actual of the formal's signedness is still renamed.
+
+fn elaborate(src: &str) -> xezim_core::ElaboratedModule {
+    xezim_core::parse_and_elaborate_multi(
+        &[src.to_string()],
+        Some("top"),
+        &[],
+        &["top.sv".to_string()],
+        &[],
+    )
+    .expect("elaborate")
+    .1
+}
+
+#[test]
+fn an_input_is_renamed_only_to_an_actual_of_its_signedness() {
+    let m = elaborate(
+        r#"
+module ks (input logic signed [12:0] e_i);
+  wire lt = e_i < 0;
+endmodule
+module ku (input logic [12:0] e_i);
+  wire lt = e_i < 0;
+endmodule
+module top;
+  logic signed [11:0] c = -12'sd27;
+  logic signed [12:0] sv = -13'sd27;
+  logic [12:0] uv = 13'h1fe5;
+  ks s_concat (.e_i({c[11], c}));
+  ks s_unsigned (.e_i(uv));
+  ks s_signed (.e_i(sv));
+  ks s_part (.e_i(sv[12:0]));
+  ku u_signed (.e_i(sv));
+  ku u_concat (.e_i({c[11], c}));
+  ku u_unsigned (.e_i(uv));
+endmodule
+"#,
+    );
+    let renamed = |inst: &str| {
+        m.input_port_actuals
+            .iter()
+            .any(|(f, ..)| f.rsplit('.').nth(1) == Some(inst) && f.ends_with(".e_i"))
+    };
+    // A signed formal keeps its net for an unsigned actual.
+    assert!(!renamed("s_concat"));
+    assert!(!renamed("s_unsigned"));
+    assert!(!renamed("s_part"));
+    // An unsigned formal keeps its net for a signed actual.
+    assert!(!renamed("u_signed"));
+    // Matching signedness is still a rename.
+    assert!(renamed("s_signed"));
+    assert!(renamed("u_concat"));
+    assert!(renamed("u_unsigned"));
+}
