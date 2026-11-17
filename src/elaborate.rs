@@ -40204,6 +40204,67 @@ fn inline_module_items(
                     }
                 }
 
+                // §25.3, §23.3.3: an interface port is connected to an
+                // interface instance or to an interface port of the parent;
+                // it cannot be left unconnected (absent, `.p()` or an empty
+                // ordered slot), since its members would name nothing.
+                // `--relax-unconnected-interface-port` elaborates it anyway,
+                // with a warning, its members as signals of the instance.
+                if !sub_iface_ports.is_empty() {
+                    // Only an ANSI port is an interface port (above).
+                    let ports: &[AnsiPort] = match sub_mod.ports() {
+                        PortList::Ansi(ports) => ports,
+                        _ => &[],
+                    };
+                    let given: HashSet<&str> = hi
+                        .connections
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(i, c)| match c {
+                            PortConnection::Named {
+                                name,
+                                expr,
+                                implicit,
+                            } if expr.is_some() || *implicit => Some(name.name.as_str()),
+                            PortConnection::Ordered(Some(_)) => {
+                                ports.get(i).map(|p| p.name.name.as_str())
+                            }
+                            _ => None,
+                        })
+                        .collect();
+                    let mut open: Vec<&str> = sub_iface_ports
+                        .iter()
+                        .map(String::as_str)
+                        .filter(|p| !given.contains(p) && !sub_interface_map.contains_key(*p))
+                        .collect();
+                    open.sort_unstable();
+                    let path = inst_prefix.trim_end_matches('.');
+                    if sv_parser::RELAX_UNCONNECTED_INTERFACE_PORT.get() {
+                        for port in &open {
+                            crate::elab_diag(format!(
+                                "[xezim][warning] interface port '{port}' of instance '{path}' \
+                                 (module '{sub_mod_name}') is not connected (§25.3); elaborated \
+                                 because --relax-unconnected-interface-port is in effect"
+                            ));
+                        }
+                    } else if let Some(port) = open.first() {
+                        return Err(span_error_of(
+                            elab,
+                            hi.span,
+                            source_def.name(),
+                            &format!(
+                                "interface port '{port}' of instance '{path}' (module \
+                                 '{sub_mod_name}') is not connected; an interface port shall be \
+                                 connected to an interface instance or an interface port \
+                                 (IEEE 1800-2023 §25.3, §23.3.3).\n  \
+                                 fix: connect it, or accept it as-is: \
+                                 --relax-unconnected-interface-port \
+                                 (env XEZIM_RELAX_UNCONNECTED_INTERFACE_PORT=1)"
+                            ),
+                        ));
+                    }
+                }
+
                 // §23.2.2.4: an input port left unconnected (empty ordered
                 // slot `dut(,x)`, named `.i()`, or absent from a short
                 // connection list) that declares a default value is driven by

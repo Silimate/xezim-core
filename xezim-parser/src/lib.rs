@@ -421,8 +421,16 @@ pub static RELAX_LIBRARY_PACKAGES: RelaxFlag = RelaxFlag::new(
     "compile the packages a -v library file declares, as if the file were also a source file",
 );
 
+/// §25.3: an instance that leaves an interface port unconnected is
+/// elaborated (checked at elaboration; the flag lives here with the others).
+pub static RELAX_UNCONNECTED_INTERFACE_PORT: RelaxFlag = RelaxFlag::new(
+    "unconnected-interface-port",
+    "XEZIM_RELAX_UNCONNECTED_INTERFACE_PORT",
+    "elaborate an instance that leaves an interface port unconnected (§25.3)",
+);
+
 /// Every parser relaxation, for command-line options and cache keys.
-pub fn relax_flags() -> [&'static RelaxFlag; 10] {
+pub fn relax_flags() -> [&'static RelaxFlag; 11] {
     [
         &RELAX_DUPLICATE_DECLS,
         &RELAX_ENUM_NO_BASE,
@@ -434,6 +442,7 @@ pub fn relax_flags() -> [&'static RelaxFlag; 10] {
         &RELAX_CROSS_HIER_ITEM,
         &RELAX_USE_BEFORE_DECL,
         &RELAX_LIBRARY_PACKAGES,
+        &RELAX_UNCONNECTED_INTERFACE_PORT,
     ]
 }
 
