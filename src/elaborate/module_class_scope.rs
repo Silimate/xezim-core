@@ -49,36 +49,60 @@ pub(super) fn spec_args_text(
     if prefix.is_empty() || local_names.is_empty() {
         return text.to_string();
     }
+    let pieces = split_spec_arg_pieces(text);
     let mut out = String::with_capacity(text.len());
-    let mut depth = 0i32;
-    let mut start = 0usize;
-    let b = text.as_bytes();
-     for (i, ch) in text.char_indices() {
-        match ch {
-            '(' | '[' | '{' => depth += 1,
-            ')' | ']' | '}' => depth -= 1,
-            ',' if depth == 0 => {
-                out.push_str(&qualify_one_spec_arg(
-                    &text[start..i],
-                    prefix,
-                    local_names,
-                ));
-                out.push(ch);
-                start = i + ch.len_utf8();
-            }
-            _ => {}
+    for (n, piece) in pieces.iter().enumerate() {
+        if n > 0 {
+            out.push(',');
         }
-    }
-    if start < text.len() || text.is_empty() {
-        out.push_str(&qualify_one_spec_arg(
-            &text[start..],
-            prefix,
-            local_names,
-        ));
+        out.push_str(&qualify_one_spec_arg(piece, prefix, local_names));
     }
     out
 }
 
+/// Split `#(...)` text into top-level arguments without breaking string
+/// literals or nested brackets (`C#("a,b", W + 1)` stays two arguments).
+fn split_spec_arg_pieces(text: &str) -> Vec<&str> {
+    let b = text.as_bytes();
+    let ident = |c: u8| c.is_ascii_alphanumeric() || c == b'_' || c == b'$';
+    let mut depth = 0i32;
+    let mut start = 0usize;
+    let mut pieces = Vec::new();
+    let mut i = 0usize;
+    while i < b.len() {
+        let c = b[i];
+        if c == b'"' {
+            i += 1;
+            while i < b.len() && b[i] != b'"' {
+                i += if b[i] == b'\\' { 2 } else { 1 };
+            }
+            i = (i + 1).min(b.len());
+            continue;
+        }
+        if c == b'\'' || c.is_ascii_digit() || c == b'$' {
+            i += 1;
+            while i < b.len() && (ident(b[i]) || b[i] == b'\'') {
+                i += 1;
+            }
+            continue;
+        }
+        match c {
+            b'(' | b'[' | b'{' => depth += 1,
+            b')' | b']' | b'}' => depth -= 1,
+            b',' if depth == 0 => {
+                pieces.push(&text[start..i]);
+                start = i + 1;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    pieces.push(&text[start..]);
+    pieces
+}
+
+/// Named arguments (`.W(PW)`) only rewrite the parenthesized body; labels and
+/// punctuation outside it keep their original spacing.
 fn qualify_named_spec_arg(
     piece: &str,
     prefix: &str,
@@ -96,10 +120,13 @@ fn qualify_named_spec_arg(
                         let head = &piece[..open + 1];
                         let inner = &piece[open + 1..open + i];
                         let tail = &piece[open + i..];
-                        return format!(
-                            "{head}{}{tail}",
-                            qualify_spec_expr_text(inner, prefix, local_names)
-                        );
+                        let rewritten = match classify_spec_arg(inner) {
+                            SpecArgKind::Type => {
+                                qualify_spec_type_text(inner.trim(), prefix, local_names)
+                            }
+                            _ => qualify_spec_expr_text(inner, prefix, local_names),
+                        };
+                        return format!("{head}{rewritten}{tail}");
                     }
                 }
                 _ => {}
@@ -107,6 +134,18 @@ fn qualify_named_spec_arg(
         }
     }
     qualify_spec_expr_text(piece, prefix, local_names)
+}
+
+fn leads_with_virtual_keyword(text: &str) -> bool {
+    let t = text.trim();
+    let Some(rest) = t.strip_prefix("virtual") else {
+        return false;
+    };
+    rest.is_empty()
+        || rest
+            .as_bytes()
+            .first()
+            .is_some_and(|c| c.is_ascii_whitespace())
 }
 
 fn parse_spec_arg_type(text: &str) -> Option<DataType> {
@@ -135,12 +174,14 @@ enum SpecArgKind {
     Named,
 }
 
+/// Choose whether a specialization-argument fragment is a type (`virtual Ifc`,
+/// `int`), a value expression (`PW * 2`), or a named wrapper (`.W(PW)`).
 fn classify_spec_arg(piece: &str) -> SpecArgKind {
     let t = piece.trim();
     if t.starts_with('.') {
         return SpecArgKind::Named;
     }
-    if t.starts_with("virtual") {
+    if leads_with_virtual_keyword(t) {
         return SpecArgKind::Type;
     }
     let as_type = parse_spec_arg_type(t);

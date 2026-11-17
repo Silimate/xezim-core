@@ -47,7 +47,7 @@ module u_tb(output bit a, output bit b);
   import p::*;
   clk_rst_if clk_rst_if();
   assign a = db#(virtual clk_rst_if)::found.exists("k");
-  assign b = db#(virtual clk_rst_if)::found.exists("k");
+  assign b = db#(.T(virtual clk_rst_if))::found.exists("k");
 endmodule
 module top;
   bit a, b;
