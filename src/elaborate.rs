@@ -5653,9 +5653,26 @@ fn overlay_scoped_param(
     }
 }
 
-/// §26.3: overlay onto the bare map the parameters that package `p` makes
-/// visible through its OWN import declarations, read from their scoped
-/// `src::name` values, and return what to restore.
+/// The names package `src` offers an importer as constants, as (name, is an
+/// unpacked-array parameter): its value parameters and the members of its
+/// enum typedefs (§6.19), which a default can read just the same.
+fn pkg_import_candidates(src: &crate::ast::module::PackageDeclaration) -> Vec<(String, bool)> {
+    let mut out: Vec<(String, bool)> = pkg_value_params(src)
+        .map(|(n, is_array)| (n.to_string(), is_array))
+        .collect();
+    for item in &src.items {
+        if let PackageItem::Typedef(td) = item {
+            crate::scope_tree::for_each_enum_member(&td.data_type, &mut |m| {
+                out.push((m.name.clone(), false))
+            });
+        }
+    }
+    out
+}
+
+/// §26.3: overlay onto the bare map the parameters and enum members that
+/// package `p` makes visible through its OWN import declarations, read from
+/// their scoped `src::name` values, and return what to restore.
 ///
 /// A package parameter's default is evaluated in the package that declares
 /// it (§6.20, §26.3), but every site that evaluates one does so against one
@@ -5694,8 +5711,7 @@ fn overlay_pkg_imports(
         _ => None,
     };
     // (name, source package, is an unpacked array), explicit imports first.
-    let mut visible: Vec<(&str, &str, bool)> = Vec::new();
-    let mut explicit: HashSet<&str> = HashSet::default();
+    let mut visible: Vec<(String, &str, bool)> = Vec::new();
     for ii in &imports {
         let (Some(item), Some(src)) = (&ii.item, src_pkg(&ii.package.name)) else {
             continue;
@@ -5703,41 +5719,50 @@ fn overlay_pkg_imports(
         if own.contains(&item.name) {
             continue;
         }
-        if let Some((name, is_array)) = pkg_value_params(src).find(|(n, _)| *n == item.name) {
-            explicit.insert(name);
+        if let Some((name, is_array)) = pkg_import_candidates(src)
+            .into_iter()
+            .find(|(n, _)| *n == item.name)
+        {
             visible.push((name, src.name.name.as_str(), is_array));
         }
     }
-    let mut wild: Vec<(&str, &str, bool)> = Vec::new();
+    // Each remaining name's wildcard sources, in the order of the imports.
+    let mut wild: Vec<(String, Vec<(&str, bool)>)> = Vec::new();
+    let mut slot: HashMap<String, usize> = HashMap::default();
     for ii in &imports {
         let (None, Some(src)) = (&ii.item, src_pkg(&ii.package.name)) else {
             continue;
         };
-        for (name, is_array) in pkg_value_params(src) {
-            if !own.contains(name) && !explicit.contains(name) {
-                wild.push((name, src.name.name.as_str(), is_array));
+        for (name, is_array) in pkg_import_candidates(src) {
+            if own.contains(&name) || visible.iter().any(|(n, ..)| *n == name) {
+                continue;
+            }
+            let i = *slot.entry(name.clone()).or_insert_with(|| {
+                wild.push((name, Vec::new()));
+                wild.len() - 1
+            });
+            if !wild[i].1.iter().any(|(s, _)| *s == src.name.name) {
+                wild[i].1.push((src.name.name.as_str(), is_array));
             }
         }
     }
-    for &(name, src, is_array) in &wild {
-        if visible.iter().any(|&(n, ..)| n == name) {
-            continue;
-        }
+    for (name, srcs) in wild {
+        let (src, is_array) = srcs[0];
         // Two wildcard imports of one name: not visible (§26.3). A default
         // that reads it anyway is evaluated only when every candidate holds
         // the same value, so the result cannot depend on which one a tool
         // that accepts the reference would pick (CORE-ET's `icache_pkg`
         // reads `PaSize`, 40 in both `etlink_pkg` and `minion_pkg`).
         let value = |s: &str| elab.parameters.get(&format!("{s}::{name}"));
-        let ambiguous = wild
+        let ambiguous = srcs[1..]
             .iter()
-            .any(|&(n, s, _)| n == name && s != src && (is_array || value(s) != value(src)));
+            .any(|&(s, a)| is_array || a || value(s) != value(src));
         if !ambiguous {
             visible.push((name, src, is_array));
         }
     }
     for (name, src, is_array) in visible {
-        overlay_scoped_param(elab, src, name, is_array, &mut saved);
+        overlay_scoped_param(elab, src, &name, is_array, &mut saved);
     }
     saved
 }
@@ -5790,11 +5815,36 @@ fn packages_in_dependency_order<'d, 'a>(
                     );
                 }
             }
-            d.extend(
-                package_referenced_names(p)
-                    .iter()
-                    .filter_map(|n| index.get(n.as_str()).copied()),
-            );
+            // `src::name` anywhere in a parameter or variable initializer,
+            // assignment patterns and calls included.
+            let mut note = |e: &Expression| {
+                for_each_sub_expr(e, &mut |x| {
+                    if let ExprKind::Ident(h) = &x.kind
+                        && h.root.is_none()
+                        && let Some(j) =
+                            h.path.first().and_then(|s| index.get(s.name.name.as_str()))
+                    {
+                        d.insert(*j);
+                    }
+                })
+            };
+            for item in &p.items {
+                match item {
+                    PackageItem::Parameter(ParameterDeclaration {
+                        kind: ParameterKind::Data { assignments, .. },
+                        ..
+                    }) => assignments
+                        .iter()
+                        .filter_map(|a| a.init.as_ref())
+                        .for_each(&mut note),
+                    PackageItem::Data(dd) => dd
+                        .declarators
+                        .iter()
+                        .filter_map(|v| v.init.as_ref())
+                        .for_each(&mut note),
+                    _ => {}
+                }
+            }
             d.remove(&i);
             d.into_iter().collect()
         })
