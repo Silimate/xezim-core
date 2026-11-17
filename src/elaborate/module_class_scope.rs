@@ -108,30 +108,50 @@ fn qualify_named_spec_arg(
     prefix: &str,
     local_names: &std::collections::HashSet<String>,
 ) -> String {
-    if let Some(open) = piece.find('(') {
-        let mut depth = 0i32;
-        let b = piece.as_bytes();
-        for (i, &c) in b[open..].iter().enumerate() {
-            match c {
-                b'(' | b'[' | b'{' => depth += 1,
-                b')' | b']' | b'}' => {
-                    depth -= 1;
-                    if depth == 0 && c == b')' {
-                        let head = &piece[..open + 1];
-                        let inner = &piece[open + 1..open + i];
-                        let tail = &piece[open + i..];
-                        let rewritten = match classify_spec_arg(inner) {
-                            SpecArgKind::Type => {
-                                qualify_spec_type_text(inner.trim(), prefix, local_names)
-                            }
-                            _ => qualify_spec_expr_text(inner, prefix, local_names),
-                        };
-                        return format!("{head}{rewritten}{tail}");
-                    }
-                }
-                _ => {}
+    let Some(open) = piece.find('(') else {
+        return qualify_spec_expr_text(piece, prefix, local_names);
+    };
+    let b = piece.as_bytes();
+    let mut depth = 1i32;
+    let mut i = open + 1;
+    while i < b.len() && depth > 0 {
+        let c = b[i];
+        if c == b'"' {
+            i += 1;
+            while i < b.len() && b[i] != b'"' {
+                i += if b[i] == b'\\' { 2 } else { 1 };
             }
+            i = (i + 1).min(b.len());
+            continue;
         }
+        if c == b'\'' {
+            i += 1;
+            while i < b.len() && (b[i].is_ascii_alphanumeric() || b[i] == b'_' || b[i] == b'$')
+            {
+                i += 1;
+            }
+            continue;
+        }
+        match c {
+            b'(' | b'[' | b'{' => depth += 1,
+            b')' | b']' | b'}' => {
+                depth -= 1;
+                if depth == 0 && c == b')' {
+                    let head = &piece[..open + 1];
+                    let inner = &piece[open + 1..i];
+                    let tail = &piece[i..];
+                    let rewritten = match classify_spec_arg(inner) {
+                        SpecArgKind::Type => {
+                            qualify_spec_type_text(inner.trim(), prefix, local_names)
+                        }
+                        _ => qualify_spec_expr_text(inner, prefix, local_names),
+                    };
+                    return format!("{head}{rewritten}{tail}");
+                }
+            }
+            _ => {}
+        }
+        i += 1;
     }
     qualify_spec_expr_text(piece, prefix, local_names)
 }
@@ -242,9 +262,14 @@ fn qualify_spec_type_text(
             out.push_str(&text[start..i]);
             continue;
         }
-        if c == b'#' && i + 1 < b.len() && b[i + 1] == b'(' {
-            out.push_str(&text[start..i + 2]);
-            i += 2;
+        if c == b'#' {
+            let mut j = i + 1;
+            while j < b.len() && b[j].is_ascii_whitespace() {
+                j += 1;
+            }
+            if j < b.len() && b[j] == b'(' {
+                out.push_str(&text[start..=j]);
+                i = j + 1;
             let inner_start = i;
             let mut depth = 1i32;
             while i < b.len() && depth > 0 {
@@ -268,6 +293,7 @@ fn qualify_spec_type_text(
             }
             type_head = false;
             continue;
+            }
         }
         if c == b'"' {
             i += 1;
