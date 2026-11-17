@@ -1898,7 +1898,7 @@ fn hoist_class_consts(defs: &HashMap<String, Definition>, elab: &mut ElaboratedM
                     if !has_class {
                         continue;
                     }
-                    let ov = overlay_pkg_params(p, elab);
+                    let ov = overlay_pkg_scope(p, elab, defs);
                     for item in &p.items {
                         if let PackageItem::Class(c) = item {
                             let prefixes = [
@@ -5604,6 +5604,229 @@ fn restore_overlay(elab: &mut ElaboratedModule, saved: Vec<(String, Option<Value
     }
 }
 
+/// The value parameters package `pkg` declares, as (name, is an unpacked
+/// array), in declaration order.
+fn pkg_value_params(
+    pkg: &crate::ast::module::PackageDeclaration,
+) -> impl Iterator<Item = (&str, bool)> {
+    pkg.items.iter().flat_map(|item| {
+        let assignments = match item {
+            PackageItem::Parameter(ParameterDeclaration {
+                kind: ParameterKind::Data { assignments, .. },
+                ..
+            }) => assignments.as_slice(),
+            _ => &[][..],
+        };
+        assignments
+            .iter()
+            .map(|a| (a.name.name.as_str(), !a.dimensions.is_empty()))
+    })
+}
+
+/// Make `src::name` (and, for an unpacked-array parameter, its `src::name[i]`
+/// elements) visible as the bare `name`, recording what to restore in
+/// `saved`. Nothing happens when `src::name` has not been evaluated yet.
+fn overlay_scoped_param(
+    elab: &mut ElaboratedModule,
+    src: &str,
+    name: &str,
+    is_array: bool,
+    saved: &mut Vec<(String, Option<Value>)>,
+) {
+    let key = format!("{src}::{name}");
+    if is_array {
+        let prefix = format!("{key}[");
+        let elems: Vec<(String, Value)> = elab
+            .parameters
+            .iter()
+            .filter(|(k, _)| k.starts_with(&prefix))
+            .map(|(k, v)| (k[src.len() + 2..].to_string(), v.clone()))
+            .collect();
+        for (k, v) in elems {
+            saved.push((k.clone(), elab.parameters.get(&k).cloned()));
+            elab.set_param(line!(), k, v);
+        }
+    }
+    if let Some(v) = elab.parameters.get(&key).cloned() {
+        saved.push((name.to_string(), elab.parameters.get(name).cloned()));
+        elab.set_param(line!(), name.to_string(), v);
+    }
+}
+
+/// §26.3: overlay onto the bare map the parameters that package `p` makes
+/// visible through its OWN import declarations, read from their scoped
+/// `src::name` values, and return what to restore.
+///
+/// A package parameter's default is evaluated in the package that declares
+/// it (§6.20, §26.3), but every site that evaluates one does so against one
+/// design-wide bare map. Without this overlay, `package z; import e::*;
+/// localparam B = DataSize / 64;` read `DataSize` only when some earlier step
+/// had left `e`'s bare name behind, which depended on hash order, and in a
+/// module that imports `z` the importer's own names stood in for `z`'s.
+///
+/// The §26.3 rules decide what is visible: a name `p` declares itself is not
+/// imported (and its own parameters are overlaid separately by
+/// `overlay_pkg_params`), an explicit `import src::name` beats a wildcard
+/// import, and a name that two wildcard imports provide from different
+/// packages is not visible at all, so it is left alone unless both hold the
+/// same value.
+fn overlay_pkg_imports(
+    p: &crate::ast::module::PackageDeclaration,
+    elab: &mut ElaboratedModule,
+    defs: &HashMap<String, Definition>,
+) -> Vec<(String, Option<Value>)> {
+    let mut saved: Vec<(String, Option<Value>)> = Vec::new();
+    let imports: Vec<&ImportItem> = p
+        .items
+        .iter()
+        .filter_map(|item| match item {
+            PackageItem::Import(imp) => Some(imp.items.iter()),
+            _ => None,
+        })
+        .flatten()
+        .collect();
+    if imports.is_empty() {
+        return saved;
+    }
+    let own: HashSet<String> = p.items.iter().flat_map(package_item_names).collect();
+    let src_pkg = |name: &str| match defs.get(name) {
+        Some(Definition::Package(src)) => Some(*src),
+        _ => None,
+    };
+    // (name, source package, is an unpacked array), explicit imports first.
+    let mut visible: Vec<(&str, &str, bool)> = Vec::new();
+    let mut explicit: HashSet<&str> = HashSet::default();
+    for ii in &imports {
+        let (Some(item), Some(src)) = (&ii.item, src_pkg(&ii.package.name)) else {
+            continue;
+        };
+        if own.contains(&item.name) {
+            continue;
+        }
+        if let Some((name, is_array)) = pkg_value_params(src).find(|(n, _)| *n == item.name) {
+            explicit.insert(name);
+            visible.push((name, src.name.name.as_str(), is_array));
+        }
+    }
+    let mut wild: Vec<(&str, &str, bool)> = Vec::new();
+    for ii in &imports {
+        let (None, Some(src)) = (&ii.item, src_pkg(&ii.package.name)) else {
+            continue;
+        };
+        for (name, is_array) in pkg_value_params(src) {
+            if !own.contains(name) && !explicit.contains(name) {
+                wild.push((name, src.name.name.as_str(), is_array));
+            }
+        }
+    }
+    for &(name, src, is_array) in &wild {
+        if visible.iter().any(|&(n, ..)| n == name) {
+            continue;
+        }
+        // Two wildcard imports of one name: not visible (§26.3). A default
+        // that reads it anyway is evaluated only when every candidate holds
+        // the same value, so the result cannot depend on which one a tool
+        // that accepts the reference would pick (CORE-ET's `icache_pkg`
+        // reads `PaSize`, 40 in both `etlink_pkg` and `minion_pkg`).
+        let value = |s: &str| elab.parameters.get(&format!("{s}::{name}"));
+        let ambiguous = wild
+            .iter()
+            .any(|&(n, s, _)| n == name && s != src && (is_array || value(s) != value(src)));
+        if !ambiguous {
+            visible.push((name, src, is_array));
+        }
+    }
+    for (name, src, is_array) in visible {
+        overlay_scoped_param(elab, src, name, is_array, &mut saved);
+    }
+    saved
+}
+
+/// §26.3: everything package `p` can name without a qualification while its
+/// own declarations are evaluated: its imports, then its own parameters,
+/// which shadow them.
+fn overlay_pkg_scope(
+    p: &crate::ast::module::PackageDeclaration,
+    elab: &mut ElaboratedModule,
+    defs: &HashMap<String, Definition>,
+) -> Vec<(String, Option<Value>)> {
+    let mut saved = overlay_pkg_imports(p, elab, defs);
+    saved.extend(overlay_pkg_params(p, elab));
+    saved
+}
+
+/// The packages of `defs`, each after the packages it imports or names with
+/// a scope in a parameter or variable initializer (`src::name`), so that a
+/// single pass evaluates a parameter after everything its default reads
+/// (§6.20, §26.3). Ties, and the packages of an import cycle, go by name, so
+/// the order does not depend on hashing.
+fn packages_in_dependency_order<'d, 'a>(
+    defs: &'d HashMap<String, Definition<'a>>,
+) -> Vec<(&'d String, &'a crate::ast::module::PackageDeclaration)> {
+    let mut pkgs: Vec<(&'d String, &'a crate::ast::module::PackageDeclaration)> = defs
+        .iter()
+        .filter_map(|(k, d)| match d {
+            Definition::Package(p) => Some((k, *p)),
+            _ => None,
+        })
+        .collect();
+    pkgs.sort_by(|a, b| a.0.cmp(b.0));
+    let index: HashMap<&str, usize> = pkgs
+        .iter()
+        .enumerate()
+        .map(|(i, (_, p))| (p.name.name.as_str(), i))
+        .collect();
+    let deps: Vec<Vec<usize>> = pkgs
+        .iter()
+        .enumerate()
+        .map(|(i, (_, p))| {
+            let mut d: std::collections::BTreeSet<usize> = std::collections::BTreeSet::new();
+            for item in &p.items {
+                if let PackageItem::Import(imp) = item {
+                    d.extend(
+                        imp.items
+                            .iter()
+                            .filter_map(|ii| index.get(ii.package.name.as_str()).copied()),
+                    );
+                }
+            }
+            d.extend(
+                package_referenced_names(p)
+                    .iter()
+                    .filter_map(|n| index.get(n.as_str()).copied()),
+            );
+            d.remove(&i);
+            d.into_iter().collect()
+        })
+        .collect();
+    // Depth-first post-order; a package already on the stack (a cycle) is
+    // skipped, so every package is emitted once.
+    let mut state = vec![0u8; pkgs.len()];
+    let mut out = Vec::with_capacity(pkgs.len());
+    for root in 0..pkgs.len() {
+        if state[root] != 0 {
+            continue;
+        }
+        state[root] = 1;
+        let mut stack: Vec<(usize, usize)> = vec![(root, 0)];
+        while let Some(top) = stack.last_mut() {
+            let (v, next) = *top;
+            if let Some(&w) = deps[v].get(next) {
+                top.1 += 1;
+                if state[w] == 0 {
+                    state[w] = 1;
+                    stack.push((w, 0));
+                }
+            } else {
+                state[v] = 2;
+                out.push(pkgs[v]);
+                stack.pop();
+            }
+        }
+    }
+    out
+}
+
 /// `XEZIM_TRACE_SIGNAL=<substr>[,<substr>...]` — trace every write to the
 /// elaboration signal table for matching names. The type-table tracer proved
 /// a declaration can be SIZED correctly (resolve:type_ref logs 292) while the
@@ -5716,7 +5939,8 @@ fn hoist_package_struct_params(defs: &HashMap<String, Definition>, elab: &mut El
     // Two passes: a struct parameter may be built from another package's.
     for _pass in 0..2 {
         for p in &pkgs {
-            let mut own_overlay = overlay_pkg_params(p, elab);
+            // §26.3: in the package's own scope, imports included.
+            let mut own_overlay = overlay_pkg_scope(p, elab, defs);
             for item in &p.items {
                 let crate::ast::decl::PackageItem::Parameter(pd) = item else {
                     continue;
@@ -5969,6 +6193,14 @@ fn hoist_package_params(defs: &HashMap<String, Definition>, elab: &mut Elaborate
     // this, TLS held whatever the last package elaboration left, so a
     // module-context dimension call silently missed and the dim fell to 1.
     set_funcs_tls(&elab.functions);
+    // §26.3: each package after the packages it imports, so the first pass
+    // already evaluates `B = DataSize / 64` after `import e::*` gave it
+    // `e::DataSize`, whatever the two packages are called.
+    let eval_order: Vec<&crate::ast::module::PackageDeclaration> =
+        packages_in_dependency_order(defs)
+            .into_iter()
+            .map(|(_, p)| p)
+            .collect();
     for _pass in 0..3 {
         // Bare visibility of EVERY package's params (read back from their
         // pkg:: aliases, i.e. the PREVIOUS pass's values) for the whole pass.
@@ -5982,10 +6214,11 @@ fn hoist_package_params(defs: &HashMap<String, Definition>, elab: &mut Elaborate
         for p in &pkgs {
             pass_overlay.extend(overlay_pkg_params(p, elab));
         }
-        for p in &pkgs {
-            // This package's OWN params win over a same-named param from
-            // another package while its items are evaluated.
-            let own_overlay = overlay_pkg_params(p, elab);
+        for p in &eval_order {
+            // This package's own scope (§26.3): what it imports, then its
+            // OWN params, which win over a same-named param from another
+            // package while its items are evaluated.
+            let own_overlay = overlay_pkg_scope(p, elab, defs);
             // A bare call inside THIS package binds this package's own
             // function even when another package registered the same bare
             // name first (`pa::f` won the or_insert; `pb`'s `W = f(3)` must
@@ -9806,7 +10039,7 @@ pub fn elaborate_module_with_defs(
                 let Definition::Package(pkg) = def else {
                     continue;
                 };
-                let ov = overlay_pkg_params(pkg, &mut elab);
+                let ov = overlay_pkg_scope(pkg, &mut elab, defs);
                 for item in &pkg.items {
                     if let crate::ast::decl::PackageItem::Typedef(td) = item {
                         process_typedef(td, &mut elab);
@@ -9863,9 +10096,10 @@ pub fn elaborate_module_with_defs(
                 }
                 Definition::Package(p) => {
                     elab.packages.insert(p.name.name.clone());
-                    // Bounded bare view of this package's own parameters while
-                    // ITS items are hoisted (see overlay_pkg_params).
-                    let __pkg_overlay = overlay_pkg_params(p, &mut elab);
+                    // Bounded bare view of this package's scope, its imports
+                    // and own parameters, while ITS items are hoisted (see
+                    // overlay_pkg_scope).
+                    let __pkg_overlay = overlay_pkg_scope(p, &mut elab, defs);
                     // Hoist package-scope functions/tasks for `pkg::f(...)`
                     // and bare-name resolution after `import pkg::*`. A
                     // scoped name (`ClassName::m`) is an out-of-class method
@@ -34144,8 +34378,22 @@ fn inline_instantiations_inner(
             elab.def_pkg_imports.insert(name.clone(), imports);
         }
     }
-    // Populate class and covergroup definitions from global scope
-    for (name, def) in definitions {
+    // Populate class and covergroup definitions from global scope. §26.3:
+    // the packages fill their slots in dependency order, so a package is
+    // evaluated after the packages it imports, whatever the map's iteration
+    // order; the other definitions keep theirs.
+    let mut pkg_order = packages_in_dependency_order(definitions).into_iter();
+    let visit_order: Vec<(&String, &Definition)> = definitions
+        .iter()
+        .map(|(name, def)| match def {
+            Definition::Package(_) => pkg_order
+                .next()
+                .map(|(k, _)| (k, &definitions[k]))
+                .unwrap_or((name, def)),
+            _ => (name, def),
+        })
+        .collect();
+    for (name, def) in visit_order {
         match def {
             Definition::Class(c) => {
                 register_class_enum_members(c, elab);
@@ -34159,6 +34407,10 @@ fn inline_instantiations_inner(
             }
             Definition::Package(p) => {
                 elab.packages.insert(name.clone());
+                // §26.3: the parameters this package imports are visible
+                // bare while its own items are evaluated below, and only
+                // then; its own parameters it registers itself.
+                let import_overlay = overlay_pkg_imports(p, elab, definitions);
                 // Forward-reference fixpoint: package items may reference
                 // parameters/localparams declared LATER in include order.
                 // black-parrot's bp_common_pkg includes aviary_pkgdef (which has
@@ -35056,6 +35308,7 @@ fn inline_instantiations_inner(
                         _ => {}
                     }
                 }
+                restore_overlay(elab, import_overlay);
             }
             _ => {}
         }
@@ -55114,6 +55367,17 @@ fn process_import(
             if let Some(sym) = &ii.item {
                 let sym_name = &sym.name;
                 let mut found = false;
+                // §26.3, §6.20: the symbol's declaration is evaluated in the
+                // package's scope, not the importer's: everything the package
+                // imports, and its other parameters (`B = A * 2` with only
+                // `B` imported). Restored before the import binds anything,
+                // so none of it becomes visible here.
+                let mut scope_overlay = overlay_pkg_imports(pkg, elab, defs);
+                for (name, is_array) in pkg_value_params(pkg) {
+                    if name != sym_name.as_str() {
+                        overlay_scoped_param(elab, pkg_name, name, is_array, &mut scope_overlay);
+                    }
+                }
                 for pi in &pkg.items {
                     match pi {
                         PackageItem::Parameter(pd) => {
@@ -55485,6 +55749,7 @@ fn process_import(
                         break;
                     }
                 }
+                restore_overlay(elab, scope_overlay);
                 if !found {
                     // §26.6 re-export: `package P2; import P1::x; export P1::*;`
                     // makes P1's `x` visible to importers of P2. Non-DPI exports
@@ -55557,6 +55822,17 @@ fn process_import(
                     }
                 }
                 set_funcs_tls(&elab.functions);
+                // §26.3, §6.20: the package's declarations are evaluated in
+                // its own scope: what it imports, and any parameter of its own
+                // that a local declaration here displaces, so is not bound
+                // below. The loop binds every other parameter in order.
+                // Restored after the loop, so none of it becomes visible here.
+                let mut scope_overlay = overlay_pkg_imports(pkg, elab, defs);
+                for (name, is_array) in pkg_value_params(pkg) {
+                    if elab.local_decl_displaces(name) {
+                        overlay_scoped_param(elab, pkg_name, name, is_array, &mut scope_overlay);
+                    }
+                }
                 for pi in &pkg.items {
                     match pi {
                         PackageItem::Parameter(pd) => {
@@ -55910,6 +56186,7 @@ fn process_import(
                         _ => {}
                     }
                 }
+                restore_overlay(elab, scope_overlay);
                 // §26.2: follow the package's OWN wildcard imports one hop per
                 // level (depth-guarded). `import P::*;` where P itself does
                 // `import CHIP::*;` is how large testbenches reach core types —
