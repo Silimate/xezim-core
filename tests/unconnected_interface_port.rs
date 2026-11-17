@@ -54,6 +54,17 @@ fn an_unconnected_interface_port_is_an_error_unless_relaxed() {
         elaborate(inst).unwrap_or_else(|e| panic!("{inst}: {e}"));
     }
 
+    // A module with an interface port that nothing instantiates is a top
+    // when the tops are found automatically; the shared root instantiates
+    // it with no connections, which is not an unconnected port.
+    let src = "interface i_if; logic a; endinterface\n\
+               module lone (i_if p); endmodule\n\
+               module top; logic x; endmodule\n"
+        .to_string();
+    xezim_core::parse_and_elaborate_multi(&[src], None, &[], &["top.sv".into()], &[])
+        .map(|_| ())
+        .expect("an automatically found top keeps its interface port");
+
     xezim_core::sv_parser::RELAX_UNCONNECTED_INTERFACE_PORT.set(true);
     elaborate("dut u (.clk(clk), .q(q));").expect("elaborated with the switch");
     xezim_core::sv_parser::RELAX_UNCONNECTED_INTERFACE_PORT.set(false);
