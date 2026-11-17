@@ -54,3 +54,53 @@ endmodule
         );
     }
 }
+
+/// §6.10, §26.3: a label a module imports from a package (or `$unit`) and
+/// uses in a port actual is the package's constant, not a local name of the
+/// module: the inlined module's uses of it keep the bare name instead of
+/// taking the instance path (`m.l.SYS_CSR`, which names nothing).
+#[test]
+fn imported_enum_label_in_a_port_actual_keeps_its_name() {
+    let src = |top: &str| {
+        format!(
+            r#"
+package pk;
+  typedef enum logic [2:0] {{SYS_CSR, SYS_ERET}} sys_op_e;
+endpackage
+typedef enum logic [1:0] {{U_A, U_B}} u_e;
+module probe (input i);
+endmodule
+module leaf;
+  import pk::*;
+  logic [2:0] op = 3'd0;
+  logic y, z;
+  probe p (.i(op == SYS_CSR));
+  probe q (.i(op == U_B));
+  assign y = op == SYS_CSR;
+  assign z = op == U_B;
+endmodule
+module mid; leaf l(); endmodule
+module top; {top} endmodule
+"#
+        )
+    };
+    for (top, path) in [("leaf l();", "l."), ("mid m();", "m.l.")] {
+        let m = xezim_core::parse_and_elaborate_multi(
+            &[src(top)],
+            Some("top"),
+            &[],
+            &["top.sv".to_string()],
+            &[],
+        )
+        .expect("elaborate")
+        .1;
+        let assigns = format!("{:?}", m.continuous_assigns);
+        for label in ["SYS_CSR", "U_B"] {
+            assert!(assigns.contains(&format!("\"{label}\"")), "{top}: {label} missing");
+            assert!(
+                !assigns.contains(&format!("\"{path}{label}\"")),
+                "{top}: {label} took the instance path {path}"
+            );
+        }
+    }
+}
