@@ -812,6 +812,16 @@ fn adopted_lib_files_cell() -> &'static std::sync::Mutex<Vec<(std::path::PathBuf
     ADOPTED_LIB_FILES.get_or_init(|| std::sync::Mutex::new(Vec::new()))
 }
 
+/// A library file's text, decoded as source files and `include`d files are:
+/// a byte sequence that is not UTF-8 (a Latin-1 `®` in a comment) becomes
+/// U+FFFD instead of failing the read, which dropped the whole file.
+fn read_library_file(path: &std::path::Path) -> std::io::Result<String> {
+    std::fs::read(path).map(|bytes| {
+        String::from_utf8(bytes)
+            .unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned())
+    })
+}
+
 pub(crate) fn record_adopted_lib_file(path: std::path::PathBuf, module: &str) {
     if let Ok(mut v) = adopted_lib_files_cell().lock() {
         if let Some((_, mods)) = v.iter_mut().find(|(p, _)| *p == path) {
@@ -891,7 +901,7 @@ pub(crate) fn record_adopted_lib_pp_context(
 /// bytes so the merged dump still contains the file either way.
 pub fn preprocess_adopted_lib(path: &std::path::Path) -> Option<String> {
     let ctx = adopted_lib_pp_context_cell().lock().ok()?.clone()?;
-    let source = std::fs::read_to_string(path).ok()?;
+    let source = read_library_file(path).ok()?;
     let mut pp = preprocessor::Preprocessor::new();
     for dir in &ctx.0 {
         pp.add_include_dir(std::path::PathBuf::from(dir));
@@ -1438,7 +1448,7 @@ pub fn parse_and_elaborate_multi_preprocessed(
         for file in lib_files {
             let path = std::path::PathBuf::from(&file);
             // An unreadable file is reported when the library is indexed.
-            let Ok(text) = std::fs::read_to_string(&path) else {
+            let Ok(text) = read_library_file(&path) else {
                 continue;
             };
             let mut lpp = preprocessor::Preprocessor::new();
@@ -4292,7 +4302,7 @@ fn resolve_library_modules(
         lib_origins: &mut crate::hasher::HashMap<String, (std::path::PathBuf, bool, &'static str)>,
         lib_sources: &mut elaborate::LibrarySources,
     ) {
-        let source = match std::fs::read_to_string(&path) {
+        let source = match read_library_file(&path) {
             Ok(s) => s,
             Err(e) => {
                 eprintln!(
@@ -4736,7 +4746,7 @@ fn resolve_library_modules(
             let prim_pat = format!("primitive {}", name);
             let prim_pat2 = format!("primitive  {}", name);
             if let Some(f) = scanned_paths.iter().find(|p| {
-                std::fs::read_to_string(p)
+                read_library_file(p)
                     .map(|s| s.contains(&prim_pat) || s.contains(&prim_pat2))
                     .unwrap_or(false)
             }) {
