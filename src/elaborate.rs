@@ -18975,10 +18975,20 @@ fn create_implicit_nets(
 /// dotted reference (`testbench.chip_inst.dqs`) is a HIERARCHICAL path, and its
 /// first segment names an instance, not an undeclared net. Descending created a
 /// bogus `<prefix>.testbench` net that then drove the real one to X.
+///
+/// §6.10 makes a net only of a name "not declared previously in the scope
+/// ... or in any scope whose declarations can be directly referenced from
+/// the scope", so a name the binder found through an import or `$unit`
+/// (`Bound::NO_TARGET`: a wildcard-imported package enum label in
+/// `.i(op == SYS_CSR)`) is no candidate. As one it joined the inlined
+/// module's local names, so every use of it in the module took the instance
+/// path (`m.l.SYS_CSR`), which names nothing, and read x.
 fn collect_implicit_net_candidates(expr: &Expression, out: &mut Vec<String>) {
     match &expr.kind {
         ExprKind::Ident(hier) if hier.path.len() == 1 && hier.path[0].selects.is_empty() => {
-            out.push(hier.path[0].name.name.clone());
+            if hier.bound != Bound::NO_TARGET {
+                out.push(hier.path[0].name.name.clone());
+            }
         }
         ExprKind::MemberAccess { .. } => {}
         ExprKind::Unary { operand, .. } => collect_implicit_net_candidates(operand, out),
