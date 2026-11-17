@@ -40210,7 +40210,9 @@ fn inline_module_items(
                 // ordered slot), since its members would name nothing.
                 // `--relax-unconnected-interface-port` elaborates it anyway,
                 // with a warning, its members as signals of the instance.
-                if !sub_iface_ports.is_empty() {
+                // The root that several tops share instantiates each with no
+                // connections; a top's interface ports keep the old leniency.
+                if !sub_iface_ports.is_empty() && source_def.name() != crate::MULTI_TOP_WRAPPER {
                     // Only an ANSI port is an interface port (above).
                     let ports: &[AnsiPort] = match sub_mod.ports() {
                         PortList::Ansi(ports) => ports,
