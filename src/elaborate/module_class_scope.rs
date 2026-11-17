@@ -273,7 +273,24 @@ fn qualify_spec_type_text(
             let inner_start = i;
             let mut depth = 1i32;
             while i < b.len() && depth > 0 {
-                match b[i] {
+                let c = b[i];
+                if c == b'"' {
+                    i += 1;
+                    while i < b.len() && b[i] != b'"' {
+                        i += if b[i] == b'\\' { 2 } else { 1 };
+                    }
+                    i = (i + 1).min(b.len());
+                    continue;
+                }
+                if c == b'\'' {
+                    i += 1;
+                    while i < b.len() && (b[i].is_ascii_alphanumeric() || b[i] == b'_' || b[i] == b'$')
+                    {
+                        i += 1;
+                    }
+                    continue;
+                }
+                match c {
                     b'(' | b'[' | b'{' => depth += 1,
                     b')' | b']' | b'}' => depth -= 1,
                     _ => {}
