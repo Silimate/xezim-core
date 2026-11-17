@@ -850,10 +850,28 @@ fn adopted_lib_pp_context_cell()
     ADOPTED_LIB_PP_CONTEXT.get_or_init(|| std::sync::Mutex::new(None))
 }
 
+/// The macros each indexed library file started from (§22.5.1: the design's,
+/// and those of every library file read before it), for
+/// `preprocess_adopted_lib`.
+static LIB_FILE_DEFINES: std::sync::OnceLock<
+    std::sync::Mutex<
+        std::collections::HashMap<std::path::PathBuf, Vec<(String, preprocessor::MacroDef)>>,
+    >,
+> = std::sync::OnceLock::new();
+
+fn lib_file_defines_cell() -> &'static std::sync::Mutex<
+    std::collections::HashMap<std::path::PathBuf, Vec<(String, preprocessor::MacroDef)>>,
+> {
+    LIB_FILE_DEFINES.get_or_init(Default::default)
+}
+
 pub(crate) fn record_adopted_lib_pp_context(
     include_dirs: &[String],
     lib_defines: &std::collections::HashMap<String, preprocessor::MacroDef>,
 ) {
+    if let Ok(mut g) = lib_file_defines_cell().lock() {
+        g.clear();
+    }
     if let Ok(mut g) = adopted_lib_pp_context_cell().lock() {
         *g = Some((
             include_dirs.to_vec(),
@@ -867,8 +885,8 @@ pub(crate) fn record_adopted_lib_pp_context(
 
 /// Preprocess one adopted library file exactly as the `-v`/`-y` indexing pass
 /// did: a FRESH preprocessor per file with the recorded include dirs and the
-/// post-primary-source macro snapshot, resolving includes relative to the
-/// file itself. Returns None when no context was recorded (no library pass
+/// macros that file started from, resolving includes relative to the file
+/// itself. Returns None when no context was recorded (no library pass
 /// ran) or when preprocessing reports errors — callers fall back to the raw
 /// bytes so the merged dump still contains the file either way.
 pub fn preprocess_adopted_lib(path: &std::path::Path) -> Option<String> {
@@ -878,7 +896,11 @@ pub fn preprocess_adopted_lib(path: &std::path::Path) -> Option<String> {
     for dir in &ctx.0 {
         pp.add_include_dir(std::path::PathBuf::from(dir));
     }
-    for (name, def) in &ctx.1 {
+    let own = lib_file_defines_cell()
+        .lock()
+        .ok()
+        .and_then(|g| g.get(path).cloned());
+    for (name, def) in own.as_ref().unwrap_or(&ctx.1) {
         pp.define(name.clone(), def.clone());
     }
     let text = pp.preprocess_file(&source, Some(path));
@@ -4219,6 +4241,9 @@ fn resolve_library_modules(
         if path.is_dir() {
             let mut found = Vec::new();
             collect_sv_files(path, &exts, &mut found)?;
+            // Directory order is the filesystem's; the files are read, and
+            // their macros defined, in a fixed order instead.
+            found.sort();
             pending.extend(found);
         }
     }
@@ -4250,12 +4275,15 @@ fn resolve_library_modules(
     // name), so a diagnostic inside an ADOPTED definition names its own file;
     // and the packages library files declared, which are never compiled.
     let mut lib_sources = elaborate::LibrarySources::default();
+    // The macros defined so far: the design's, then each library file's as
+    // it is read (see `index_library_file`).
+    let mut lib_macros = lib_defines.clone();
     #[allow(clippy::too_many_arguments)]
     fn index_library_file(
         path: std::path::PathBuf,
         explicit_v: bool,
         include_dirs: &[String],
-        lib_defines: &std::collections::HashMap<String, preprocessor::MacroDef>,
+        lib_defines: &mut std::collections::HashMap<String, preprocessor::MacroDef>,
         lib_cli: &LibraryCli,
         lib: &mut crate::hasher::HashMap<String, SourceDefinition>,
         lib_typedefs: &mut Vec<Rc<ast::decl::TypedefDeclaration>>,
@@ -4280,10 +4308,27 @@ fn resolve_library_modules(
         for dir in include_dirs {
             pp.add_include_dir(std::path::PathBuf::from(dir));
         }
-        for (name, def) in lib_defines {
+        for (name, def) in lib_defines.iter() {
             pp.define(name.clone(), def.clone());
         }
+        if let Ok(mut g) = lib_file_defines_cell().lock() {
+            g.insert(
+                path.clone(),
+                lib_defines
+                    .iter()
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect(),
+            );
+        }
         let preprocessed = pp.preprocess_file(&source, Some(&path));
+        // §22.5.1, §3.12.1: a library file is read as part of the one
+        // compilation, so a macro it defines (or an `include` of the
+        // design's headers defines) stays defined for every library file
+        // read after it, and one it undefines is gone. Each file started
+        // from only the design's macros, so a library module that included
+        // the headers did not share them with the library modules it
+        // instantiates.
+        *lib_defines = pp.snapshot_defines();
         let line_map = pp.take_line_map();
         // A missing `include or illegal directive in a library file: nothing
         // else reports the preprocessor's list on this path.
@@ -4477,7 +4522,7 @@ fn resolve_library_modules(
             path,
             explicit_v,
             include_dirs,
-            lib_defines,
+            &mut lib_macros,
             lib_cli,
             &mut lib,
             &mut lib_typedefs,
@@ -4527,7 +4572,10 @@ fn resolve_library_modules(
         }
         seed.extend(names);
     }
+    // Resolved in a fixed order: library files are read, and their macros
+    // defined (§22.5.1), in the order their modules are resolved.
     let mut work: Vec<String> = seed.into_iter().collect();
+    work.sort_unstable_by(|a, b| b.cmp(a));
     let mut unresolved: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     let mut adopted_from_v = 0usize;
     let mut adopted: std::collections::HashSet<String> = std::collections::HashSet::new();
@@ -4555,7 +4603,7 @@ fn resolve_library_modules(
                     path,
                     false,
                     include_dirs,
-                    lib_defines,
+                    &mut lib_macros,
                     lib_cli,
                     &mut lib,
                     &mut lib_typedefs,
@@ -4572,7 +4620,7 @@ fn resolve_library_modules(
                         path,
                         false,
                         include_dirs,
-                        lib_defines,
+                        &mut lib_macros,
                         lib_cli,
                         &mut lib,
                         &mut lib_typedefs,
@@ -4604,6 +4652,8 @@ fn resolve_library_modules(
             }
             let mut more = std::collections::HashSet::new();
             instantiations(def, &mut more);
+            let mut more: Vec<String> = more.into_iter().collect();
+            more.sort_unstable_by(|a, b| b.cmp(a));
             let mut def = def.clone();
             scope_tree::adopt(&mut def);
             definitions.insert(name.clone(), def);
@@ -4721,7 +4771,7 @@ fn resolve_library_modules(
                 path,
                 false,
                 include_dirs,
-                lib_defines,
+                &mut lib_macros,
                 lib_cli,
                 &mut lib,
                 &mut lib_typedefs,
