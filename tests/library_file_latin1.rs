@@ -1,7 +1,8 @@
-//! A `-v`/`-y` library file is decoded as source files and `include`d files
-//! are: a byte that is not UTF-8 (a Latin-1 `®`, 0xAE, in a comment) becomes
-//! U+FFFD. The read used to fail ("stream did not contain valid UTF-8") and
-//! the whole file was dropped, so its modules were "not found".
+//! IEEE 1800-2023 §5.4: the text of a comment is not interpreted. A `-v`/`-y`
+//! library file is decoded as source files and `include`d files are: a byte
+//! that is not UTF-8 (a Latin-1 `®`, 0xAE, in a comment) becomes U+FFFD. The
+//! read used to fail ("stream did not contain valid UTF-8") and the whole
+//! file was dropped, so its modules were "not found".
 
 #[test]
 fn latin1_byte_in_a_library_file_keeps_the_file() {
