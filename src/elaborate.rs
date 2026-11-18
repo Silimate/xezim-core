@@ -36702,6 +36702,66 @@ fn collect_effective_items(
     result
 }
 
+/// §23.3.2.4: whether the instantiating definition `def` holds an
+/// interface named `name` for a `.*` connection to an interface port: an
+/// interface port of its own (bound for this instance in `interface_map`,
+/// or in its header; a non-ANSI header names it without a type), or an
+/// interface instance anywhere in its items.
+fn parent_declares_interface(
+    def: Definition,
+    definitions: &HashMap<String, Definition>,
+    interface_map: &HashMap<String, String>,
+    name: &str,
+) -> bool {
+    fn instantiates(
+        items: &[ModuleItem],
+        definitions: &HashMap<String, Definition>,
+        name: &str,
+    ) -> bool {
+        items.iter().any(|it| match it {
+            ModuleItem::ModuleInstantiation(mi) => {
+                matches!(
+                    definitions.get(&mi.module_name.name),
+                    Some(Definition::Interface(_))
+                ) && mi.instances.iter().any(|hi| hi.name.name == name)
+            }
+            ModuleItem::GenerateRegion(g) => instantiates(&g.items, definitions, name),
+            ModuleItem::GenerateIf(g) => g
+                .branches
+                .iter()
+                .any(|(_, i)| instantiates(i, definitions, name)),
+            ModuleItem::GenerateFor(g) => instantiates(&g.items, definitions, name),
+            ModuleItem::GenerateCase(g) => g
+                .arms
+                .iter()
+                .any(|a| instantiates(&a.items, definitions, name)),
+            _ => false,
+        })
+    }
+    if interface_map.contains_key(name) {
+        return true;
+    }
+    match def.ports() {
+        PortList::Ansi(ports) => {
+            if ports.iter().any(|p| {
+                p.name.name == name
+                    && p.data_type
+                        .as_ref()
+                        .is_some_and(|dt| is_interface_type(dt, definitions))
+            }) {
+                return true;
+            }
+        }
+        PortList::NonAnsi(names) => {
+            if names.iter().any(|n| n.name == name) {
+                return true;
+            }
+        }
+        PortList::Empty => {}
+    }
+    instantiates(def.items(), definitions, name)
+}
+
 fn is_interface_type(dt: &DataType, definitions: &HashMap<String, Definition>) -> bool {
     // Only an actual interface definition makes a port an interface port. A
     // `TypeReference` whose name resolves to a struct/enum/typedef (also stored
@@ -39968,6 +40028,9 @@ fn inline_module_items(
                 // Build port map and interface map
                 let mut port_map = HashMap::default();
                 let mut sub_interface_map = HashMap::default();
+                // Interface ports `.*` filled with a name the parent holds no
+                // interface under (§23.3.2.4): still unconnected (§25.3).
+                let mut wild_missing: HashSet<String> = HashSet::default();
 
                 // Local names of the CURRENT (parent) module — bare names of
                 // signals declared in this scope. Used when rewriting port
@@ -40154,6 +40217,14 @@ fn inline_module_items(
                                     interface_map,
                                 );
                                 if is_if_port {
+                                    if !parent_declares_interface(
+                                        source_def,
+                                        definitions,
+                                        interface_map,
+                                        &name,
+                                    ) {
+                                        wild_missing.insert(name.clone());
+                                    }
                                     sub_interface_map.insert(
                                         name,
                                         whole_net_ident_name(&actual).unwrap_or(parent_name),
@@ -40237,7 +40308,10 @@ fn inline_module_items(
                     let mut open: Vec<&str> = sub_iface_ports
                         .iter()
                         .map(String::as_str)
-                        .filter(|p| !given.contains(p) && !sub_interface_map.contains_key(*p))
+                        .filter(|p| {
+                            !given.contains(p)
+                                && (wild_missing.contains(*p) || !sub_interface_map.contains_key(*p))
+                        })
                         .collect();
                     open.sort_unstable();
                     let path = inst_prefix.trim_end_matches('.');
