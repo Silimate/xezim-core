@@ -58,3 +58,38 @@ endmodule
     assert!(renamed("u_concat"));
     assert!(renamed("u_unsigned"));
 }
+
+/// An actual whose signedness elaboration cannot read here (an element of
+/// an unpacked array, a struct member) keeps the formal for either formal
+/// signedness: renaming `sa[0]` of `logic signed [12:0] sa [2]` into an
+/// unsigned port made `e_i < 0` true in the body.
+#[test]
+fn an_actual_of_unknown_signedness_keeps_the_formal() {
+    let m = elaborate(
+        r#"
+module ks (input logic signed [12:0] e_i);
+  wire lt = e_i < 0;
+endmodule
+module ku (input logic [12:0] e_i);
+  wire lt = e_i < 0;
+endmodule
+module top;
+  typedef struct packed { logic signed [12:0] f; logic [2:0] g; } st_t;
+  logic signed [12:0] sa [2];
+  logic [12:0] ua [2];
+  st_t st;
+  ku u_elem (.e_i(sa[0]));
+  ku u_member (.e_i(st.f));
+  ks s_elem (.e_i(ua[1]));
+endmodule
+"#,
+    );
+    let renamed = |inst: &str| {
+        m.input_port_actuals
+            .iter()
+            .any(|(f, ..)| f.rsplit('.').nth(1) == Some(inst) && f.ends_with(".e_i"))
+    };
+    assert!(!renamed("u_elem"));
+    assert!(!renamed("u_member"));
+    assert!(!renamed("s_elem"));
+}
