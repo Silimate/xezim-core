@@ -22047,56 +22047,52 @@ fn lsdd_literal(v: i64) -> ExprKind {
 
 /// Const-evaluate a dimension endpoint in this scope. §11.7: `$signed(x)`
 /// and `$unsigned(x)` reinterpret `x` at its own width (`$signed` of an
-/// 8-bit `8'hff` is -1), which `const_eval_i64_with_params` cannot see: it
-/// treats both as the identity. Each such call is folded first from the
-/// operand's sized value; one whose operand has no known integral value
-/// leaves the endpoint unfolded.
+/// 8-bit `8'hff` is -1), while `const_eval_i64_with_params` reads both as
+/// the identity on a 64-bit value. The endpoint is folded only when that
+/// reading gives the same number as the reinterpretation for every such
+/// call: otherwise, or when the operand's sized value is not known, it is
+/// left for the run time, as it was before value calls were folded.
 fn lsdd_eval(e: &Expression, env: &HashMap<String, Value>) -> Option<i64> {
-    let mut has_cast = false;
+    let mut agree = true;
     for_each_sub_expr(e, &mut |x| {
-        has_cast |= matches!(&x.kind, ExprKind::SystemCall { name, args }
-            if (name == "$signed" || name == "$unsigned") && args.len() == 1);
-    });
-    if !has_cast {
-        return const_eval_i64_with_params(e, Some(env));
-    }
-    let mut e = e.clone();
-    let mut ok = true;
-    for_each_sub_expr_mut(&mut e, &mut |x| {
         let ExprKind::SystemCall { name, args } = &x.kind else {
             return;
         };
-        if !((name == "$signed" || name == "$unsigned") && args.len() == 1) || !ok {
+        if !agree || !((name == "$signed" || name == "$unsigned") && args.len() == 1) {
             return;
         }
-        let v = eval_const_expr_val(&args[0], env);
-        let w = v.width;
-        let raw = match v.to_u64() {
-            Some(r) if !v.is_real && !v.has_xz() && (1..=64).contains(&w) => r,
-            _ => {
-                ok = false;
-                return;
-            }
-        };
-        let raw = if w < 64 { raw & ((1u64 << w) - 1) } else { raw };
-        let folded = if name == "$signed" {
-            if w < 64 && raw >> (w - 1) & 1 == 1 {
-                (raw | !((1u64 << w) - 1)) as i64
-            } else {
-                raw as i64
-            }
-        } else if raw > i64::MAX as u64 {
-            ok = false;
+        // An operand the i64 evaluator cannot resolve leaves the whole
+        // endpoint unresolved below; only a resolved one is compared.
+        let Some(v) = const_eval_i64_with_params(&args[0], Some(env)) else {
             return;
-        } else {
-            raw as i64
         };
-        x.kind = lsdd_literal(folded);
+        let sized = eval_const_expr_val(&args[0], env);
+        let w = sized.width;
+        if sized.is_real || sized.has_xz() || !(1..=64).contains(&w) || sized.to_i64() != Some(v)
+        {
+            agree = false;
+            return;
+        }
+        let low = if w < 64 {
+            (v as u64) & ((1u64 << w) - 1)
+        } else {
+            v as u64
+        };
+        let reinterpreted = if name == "$signed" {
+            if w < 64 && (low >> (w - 1)) & 1 == 1 {
+                Some((low | !((1u64 << w) - 1)) as i64)
+            } else {
+                Some(low as i64)
+            }
+        } else {
+            i64::try_from(low).ok()
+        };
+        agree = reinterpreted == Some(v);
     });
-    if !ok {
+    if !agree {
         return None;
     }
-    const_eval_i64_with_params(&e, Some(env))
+    const_eval_i64_with_params(e, Some(env))
 }
 
 /// One subroutine/process body. The fold runs against a lexically scoped
@@ -56969,8 +56965,9 @@ mod prepared_callable_ownership_tests {
     }
 
     /// §20.8.1, §11.7, §20.6.2: a value system function of a parameter folds
-    /// per instance, `$signed` reinterprets its operand at the operand's own
-    /// width, and a query (with everything inside it) is left to the run time.
+    /// per instance; a `$signed`/`$unsigned` whose reinterpretation at the
+    /// operand's own width differs from the plain value is not folded; a
+    /// query, with everything inside it, is left to the run time.
     #[test]
     fn dimension_fold_value_system_functions() {
         let original = module_items(
@@ -56980,6 +56977,8 @@ mod prepared_callable_ownership_tests {
                  logic [($signed(P) < 0 ? 8 : 4)-1:0] b;
                  logic [$unsigned(P)-1:0] c;
                  logic [$bits($signed(N))-1:0] d;
+                 logic [$countones($signed(P))-1:0] e;
+                 logic [($signed(N) > 0 ? 6 : 2)-1:0] f;
                endtask
              endmodule",
         );
@@ -57010,9 +57009,11 @@ mod prepared_callable_ownership_tests {
                 _ => None,
             };
             assert_eq!(folded(0), Some(n.trailing_zeros() as i64 - 1));
-            assert_eq!(folded(1), Some(7));
+            assert_eq!(folded(1), None, "$signed of 8'hff must not fold as 255");
             assert_eq!(folded(2), Some(254));
             assert_eq!(folded(3), None, "a query must stay for the run time");
+            assert_eq!(folded(4), None, "$countones($signed(8'hff)) must not count 64 bits");
+            assert_eq!(folded(5), Some(5));
         }
     }
 
