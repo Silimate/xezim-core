@@ -35238,10 +35238,14 @@ fn substitute_genvar_in_items(items: &[ModuleItem], var: &str, value: i64) -> Ve
 }
 
 /// §6.19: the labels of every enum type a definition declares something
-/// with: a header or body parameter, an ANSI port, a port, net, data or
-/// nettype declaration, or a typedef, generate blocks included (struct
-/// members' enums too, via `for_each_enum_member`). Each label is a constant
-/// of the scope declaring the type, as the scope tree records them.
+/// with in its own scope: a header or body parameter, an ANSI port, a port,
+/// net, data or nettype declaration, or a typedef (struct members' enums
+/// too, via `for_each_enum_member`). Each label is a constant of the scope
+/// declaring the type, as the scope tree records them. A generate region
+/// (§27.3) opens no scope, so its declarations count; a generate block's
+/// (§27.5) are its own, named only from inside it (or by a path through
+/// it), so a label declared there leaves the definition's same-named
+/// implicit net (§6.10) in place.
 fn visit_declared_enum_members(
     params: &[ParameterDeclaration],
     ports: &PortList,
@@ -35266,9 +35270,6 @@ fn visit_declared_enum_members(
                     param(p, f)
                 }
                 ModuleItem::GenerateRegion(g) => body(&g.items, f),
-                ModuleItem::GenerateIf(g) => g.branches.iter().for_each(|(_, b)| body(b, f)),
-                ModuleItem::GenerateCase(g) => g.arms.iter().for_each(|a| body(&a.items, f)),
-                ModuleItem::GenerateFor(g) => body(&g.items, f),
                 _ => {}
             }
         }
@@ -39948,7 +39949,10 @@ fn inline_module_items(
                         // names a declared constant, and §6.10 does not
                         // apply. The labels are registered when this
                         // module's items are, after this pass, so they need
-                        // naming here as the parameters above do.
+                        // naming here as the parameters above do. Only the
+                        // module scope's: the actuals checked here are its
+                        // own (generate-region instances included), and a
+                        // generate block's label is not visible from them.
                         visit_declared_enum_members(
                             sub_mod.params(),
                             sub_mod.ports(),
