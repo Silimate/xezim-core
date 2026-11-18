@@ -75,5 +75,18 @@ fn library_file_macros_reach_later_library_files() {
             .map_or(true, |m| m.parameters.get("u.l.X").and_then(|v| v.to_i64()) != Some(5)),
         "`undef in a library file read before was ignored"
     );
+    // A file named twice is read twice. Its text for `--dump-merged-sv` is
+    // that of the read its module came from, not the second read, which its
+    // include guard leaves empty.
+    let guarded = dir.join("guard").join("mid.v");
+    write(&dir, "guard/mid.v", "`ifndef MID_V\n`define MID_V\nmodule mid;\nendmodule\n`endif\n");
+    let twice = guarded.display().to_string();
+    let cli = xezim_core::LibraryCli {
+        lib_files: vec![twice.clone(), twice],
+        ..Default::default()
+    };
+    elaborate(&dir, cli).expect("guarded file named twice");
+    let text = xezim_core::preprocess_adopted_lib(&guarded).expect("the adopted file's text");
+    assert!(text.contains("module mid"), "{text}");
     xezim_core::set_library_cli(Default::default());
 }
