@@ -29850,6 +29850,18 @@ fn flatten_struct_fields(
                              mdt: &DataType,
                              base_off: u32,
                              out: &mut Vec<(String, u32, u32)>| {
+            // §26.3: a member typed by a package's struct (`q::entry_t [1:0]
+            // a`) sizes the element's fields with that package's parameters.
+            // The element comes back as a bare struct, which no longer names
+            // its package, so take the owner from the member's type here.
+            let owner_aug;
+            let params: &HashMap<String, Value> = match scoped_type_owner(mdt, typedef_types) {
+                Some(pkg) => {
+                    owner_aug = overlay_owner_params(&pkg, params);
+                    &owner_aug
+                }
+                None => params,
+            };
             if let Some((dims, elem_dt)) = packed_struct_array_info(mdt, params, typedef_types) {
                 let counts: Vec<u64> = dims
                     .iter()
