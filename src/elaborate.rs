@@ -6343,17 +6343,10 @@ fn lookup_scoped_type_at<'a, T>(
         .get(&name.qualified())
         .or_else(|| {
             // §6.20.3: a type parameter or typedef used as a class scope
-            // (`C::t`) names the class it is bound to. A specialization
-            // with arguments this lookup cannot bind (`h_t::t` with
-            // `typedef C#(byte, 6) h_t;`) would read the default
-            // specialization's `C::t`, so it keeps the fallback below; its
-            // width is bound by `specialized_class_scope_width`.
+            // (`C::t`) names the class it is bound to.
             (depth < MAX_REWRITES)
                 .then(|| class_scope_types::through_alias(name))
                 .flatten()
-                .filter(|alt| {
-                    !alt.has_specialized_scope() || class_scope_types::specialized(alt).is_some()
-                })
                 .and_then(|alt| lookup_scoped_type_at(&alt, table, depth + 1))
         })
         .or_else(|| table.get(&name.name.name))
