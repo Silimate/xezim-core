@@ -35,6 +35,8 @@ fn an_unconnected_interface_port_is_an_error_unless_relaxed() {
         ("dut u (.clk(clk), .mem(), .q(q));", "mem"),
         ("dut u (clk, , q);", "mem"),
         ("gen g (.o(o));", "bus"),
+        // `.*` with no interface named `bus` in the parent (§23.3.2.4).
+        ("gen g (.*);", "bus"),
     ] {
         let err = elaborate(inst).expect_err(inst);
         assert!(
