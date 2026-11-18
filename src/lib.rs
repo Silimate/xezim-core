@@ -1798,6 +1798,9 @@ fn parse_and_elaborate(
     // flat per-design type tables by it (#300).
     body_type_params::normalize(&mut all_descriptions);
     pkg_scope::qualify_colliding_package_types(&mut all_descriptions)?;
+    // §8.25.1: the parameterized classes whose typedefs name a member of a
+    // type parameter, for `Cls#(args)::t` lookups.
+    elaborate::class_scope_types::install(&all_descriptions);
     pkg_scope::stamp_automatic_subroutines(&mut all_descriptions);
     scope_tree::build_design(&mut all_descriptions);
     let cli = module_timescale_cli();

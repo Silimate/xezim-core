@@ -17,6 +17,7 @@ use std::rc::Rc;
 pub(crate) mod array_params;
 pub mod bind;
 mod canonical;
+pub(crate) mod class_scope_types;
 mod const_context;
 mod const_function_scope;
 #[cfg(test)]
@@ -5447,6 +5448,11 @@ pub fn specialized_class_scope_width(
             Some(link) => (&link.name.name, &link.type_args),
             None => typedef_specialization(&name.scopes.last()?.name.name, elab)?,
         };
+    // A typedef naming a member of a type parameter (`typedef T::m t;`) is
+    // sized through the argument's member type by `lookup_scoped_type`.
+    if class_scope_types::specialized(name).is_some_and(|alt| alt.has_scope()) {
+        return None;
+    }
     let cls = elab.classes.get(cls_name)?;
     // Bind the class's value parameters: defaults first, then the
     // positional `#(...)` args in `param_order` (type and value params
@@ -6281,11 +6287,39 @@ pub fn lookup_scoped_type<'a, T>(
     name: &crate::ast::types::TypeName,
     table: &'a HashMap<String, T>,
 ) -> Option<&'a T> {
+    lookup_scoped_type_at(name, table, 0)
+}
+
+/// `lookup_scoped_type` after `depth` rewrites of the name (a bound on
+/// alias cycles).
+fn lookup_scoped_type_at<'a, T>(
+    name: &crate::ast::types::TypeName,
+    table: &'a HashMap<String, T>,
+    depth: u32,
+) -> Option<&'a T> {
     if name.scopes.is_empty() {
         return table.get(&name.name.name);
     }
+    const MAX_REWRITES: u32 = 8;
+    // §8.25.1: `Cls#(args)::t` whose typedef names a member of a type
+    // parameter is that argument's member type; the `Cls::t` key below is
+    // the default specialization's.
+    if depth < MAX_REWRITES
+        && let Some(alt) = class_scope_types::specialized(name)
+        && let Some(found) = lookup_scoped_type_at(&alt, table, depth + 1)
+    {
+        return Some(found);
+    }
     table
         .get(&name.qualified())
+        .or_else(|| {
+            // §6.20.3: a type parameter or typedef used as a class scope
+            // (`C::t`) names the class it is bound to.
+            (depth < MAX_REWRITES)
+                .then(|| class_scope_types::through_alias(name))
+                .flatten()
+                .and_then(|alt| lookup_scoped_type_at(&alt, table, depth + 1))
+        })
         .or_else(|| table.get(&name.name.name))
 }
 
