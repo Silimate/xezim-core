@@ -29850,12 +29850,13 @@ fn flatten_struct_fields(
                              mdt: &DataType,
                              base_off: u32,
                              out: &mut Vec<(String, u32, u32)>| {
-            // §26.3: a member typed by a package's struct (`q::entry_t [1:0]
-            // a`) sizes the element's fields with that package's parameters.
-            // The element comes back as a bare struct, which no longer names
-            // its package, so take the owner from the member's type here.
+            // §26.3: a member typed by a package's struct (`q::entry_t [N-1:0]
+            // a`) sizes the element's fields with that package's parameters,
+            // while the bounds written on the member are this scope's. The
+            // element comes back as a bare struct, which no longer names its
+            // package, so take the owner from the member's type here.
             let owner_aug;
-            let params: &HashMap<String, Value> = match scoped_type_owner(mdt, typedef_types) {
+            let elem_params: &HashMap<String, Value> = match scoped_type_owner(mdt, typedef_types) {
                 Some(pkg) => {
                     owner_aug = overlay_owner_params(&pkg, params);
                     &owner_aug
@@ -29871,7 +29872,7 @@ fn flatten_struct_fields(
                 if n > 0 && mw as u64 % n == 0 {
                     let elem_w = (mw as u64 / n) as u32;
                     let elem_subs =
-                        flatten_struct_fields(&elem_dt, params, typedefs, typedef_types)
+                        flatten_struct_fields(&elem_dt, elem_params, typedefs, typedef_types)
                             .unwrap_or_default();
                     let expanded = (n as usize).saturating_mul(1 + elem_subs.len());
                     if out.len().saturating_add(expanded) > MAX_FLAT_FIELDS {
