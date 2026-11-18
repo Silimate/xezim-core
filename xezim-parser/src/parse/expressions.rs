@@ -7,7 +7,6 @@ use crate::ast::Span;
 use crate::ast::expr::*;
 use crate::diagnostics::Diagnostic;
 use crate::lexer::token::TokenKind;
-use std::cell::Cell;
 
 impl Parser {
     pub(super) fn parse_expression(&mut self) -> Expression {
@@ -371,7 +370,7 @@ impl Parser {
                                             size: None,
                                             base: NumberBase::Decimal,
                                             value: "100".into(),
-                                            cached_val: Cell::new(None),
+                                            cached_val: crate::ast::cache::LiteralCache::new(None),
                                         }),
                                         self.span_from(start),
                                     )
@@ -465,6 +464,23 @@ impl Parser {
                 continue;
             }
 
+            // §16.12.8: `p implies q` holds when `p` does not hold or `q`
+            // does, both evaluated from the same tick. Kept as the marker
+            // `$sva_implies(p, q)`: as `(not p) or q` its attempt would be
+            // nonvacuous when `p` fails, where §16.14.8 (z) makes it
+            // vacuous, and an `x` antecedent would fail it. Right
+            // associative, at the `until` level of Table 16-3.
+            if self.in_sva_seq && self.at(TokenKind::KwImplies) {
+                if min_bp > 2 {
+                    break;
+                }
+                self.bump();
+                let rhs = self.parse_expr_bp_ctx(2, no_arrow);
+                let span = self.span_from(start);
+                lhs = Self::sva_marker("$sva_implies", vec![lhs, rhs], span);
+                continue;
+            }
+
             // §16.12.9 / Table 16-3: the RHS is a right-associated
             // property. Keep a marker to retain its vacuous outcome.
             if self.in_sva_seq
@@ -492,6 +508,10 @@ impl Parser {
                 if l_bp < min_bp {
                     break;
                 }
+                let until_with = matches!(
+                    self.current_kind(),
+                    TokenKind::KwUntil_with | TokenKind::KwS_until_with
+                );
                 self.bump();
 
                 // Ternary operator
@@ -512,7 +532,7 @@ impl Parser {
                     let count_expr = if self.at(TokenKind::LBracket) {
                         self.parse_sva_delay_range(start)
                     } else {
-                        self.parse_prefix()
+                        self.parse_sva_delay_count()
                     };
                     let rhs = self.parse_expr_bp_ctx(r_bp, no_arrow);
                     let delayed = Expression::new(
@@ -534,7 +554,26 @@ impl Parser {
                     continue;
                 }
 
-                let rhs = self.parse_expr_bp_ctx(r_bp, no_arrow);
+                let mut rhs = self.parse_expr_bp_ctx(r_bp, no_arrow);
+                // §16.12.12: `p until_with q` is `p until (p and q)` (and
+                // `s_until_with` likewise from `s_until`): `p` must also hold
+                // in the cycle `q` does. Boolean operands keep a Boolean
+                // `&&`; a temporal one takes the property `and`.
+                if until_with {
+                    let and = if Self::sva_temporal_ast(&lhs) || Self::sva_temporal_ast(&rhs) {
+                        BinaryOp::SvaAnd
+                    } else {
+                        BinaryOp::LogAnd
+                    };
+                    rhs = Expression::new(
+                        ExprKind::Binary {
+                            op: and,
+                            left: Box::new(lhs.clone()),
+                            right: Box::new(rhs),
+                        },
+                        self.span_from(start),
+                    );
+                }
                 lhs = Expression::new(
                     ExprKind::Binary {
                         op,
@@ -546,22 +585,15 @@ impl Parser {
                 continue;
             }
 
-            // §10.9.2 typed assignment pattern after a scoped type:
-            // `pkg::type_t'{...}`. The bare `type_t'{...}` form is folded in
-            // the primary. A package qualifier is applied here, afterwards,
-            // so the `'{` was left for the enclosing concatenation and the
-            // parse died on `expected RBrace`. The type prefix is dropped;
-            // member layout comes from the assignment context, same as the
-            // bare form. Only a scoped NAME can be a type: `f(x)'{...}` or
-            // `a[0]'{...}` stays an error, as for scoped casts.
+            // §10.9 typed assignment pattern after a scoped type:
+            // `pkg::type_t'{...}` (the bare `type_t'{...}` form is folded in
+            // the primary). Only a scoped NAME can be a type: `f(x)'{...}`
+            // or `a[0]'{...}` stays an error, as for scoped casts.
             if self.at(TokenKind::ApostropheLBrace) && Self::scoped_name_expr(&lhs) {
                 self.bump();
                 let items = self.parse_assignment_pattern_items();
                 self.expect(TokenKind::RBrace);
-                lhs = Expression::new(
-                    ExprKind::AssignmentPattern(items),
-                    self.span_from(start),
-                );
+                lhs = Self::typed_pattern(&lhs, items, self.span_from(start));
                 continue;
             }
 
@@ -708,6 +740,7 @@ impl Parser {
                 if self.at(TokenKind::Hash) && self.peek_kind() == TokenKind::LParen {
                     self.bump(); // #
                     self.bump(); // (
+                    self.check_param_list_form();
                     let mut depth = 1;
                     let mut text = String::new();
                     while depth > 0 && !self.at(TokenKind::Eof) {
@@ -807,7 +840,7 @@ impl Parser {
                                 signed: false,
                                 base: crate::ast::expr::NumberBase::Decimal,
                                 value: v.to_string(),
-                                cached_val: std::cell::Cell::new(None),
+                                cached_val: crate::ast::cache::LiteralCache::new(None),
                             }),
                             this.span_from(start),
                         )
@@ -958,7 +991,25 @@ impl Parser {
                 // survives (it was dropped, so `4'(8'hAB)` kept all 8 bits).
                 // Non-literal casting types (pkg::type'(v), id'(v)) stay a
                 // pass-through width/type hint as before.
-                if matches!(lhs.kind, ExprKind::Number(_)) {
+                // §6.24 casting_type includes a constant_primary, so the
+                // size may be parenthesized: `(9)'(x)`, `(WIDTH)'(x)`.
+                // The parens are only grouping. Peel them before classifying
+                // or the cast is dropped and `(9)'(cnt) + step` adds at the
+                // operand's width.
+                while let ExprKind::Paren(peeled) = lhs.kind {
+                    lhs = *peeled;
+                }
+                // Any other constant expression sizes the cast too:
+                // `(W+1)'(x)`, `$clog2(N)'(x)`, `(N > 4 ? 8 : 4)'(x)`.
+                if matches!(
+                    lhs.kind,
+                    ExprKind::Number(_)
+                        | ExprKind::Binary { .. }
+                        | ExprKind::Unary { .. }
+                        | ExprKind::Conditional { .. }
+                        | ExprKind::SystemCall { .. }
+                        | ExprKind::Call { .. }
+                ) {
                     lhs = Expression::new(
                         ExprKind::SystemCall {
                             name: "$__xz_size_cast".to_string(),
@@ -1005,11 +1056,10 @@ impl Parser {
                 continue;
             }
 
-            // §10.9.2 TYPED assignment pattern with a SCOPED type
+            // §10.9 TYPED assignment pattern with a SCOPED type
             // (`pkg::cfg_t'{XLEN: 64, ...}`). The bare-name form is handled
             // in the primary; the scoped name only exists here, as a member
-            // access chain. Same treatment: the prefix is dropped and the
-            // member layout comes from the assignment context.
+            // access chain.
             if self.at(TokenKind::ApostropheLBrace)
                 && matches!(lhs.kind, ExprKind::MemberAccess { .. })
                 && Self::scoped_name_expr(&lhs)
@@ -1017,7 +1067,7 @@ impl Parser {
                 self.bump();
                 let items = self.parse_assignment_pattern_items();
                 self.expect(TokenKind::RBrace);
-                lhs = Expression::new(ExprKind::AssignmentPattern(items), self.span_from(start));
+                lhs = Self::typed_pattern(&lhs, items, self.span_from(start));
                 continue;
             }
 
@@ -1039,6 +1089,59 @@ impl Parser {
             ExprKind::MemberAccess { expr, .. } => Self::scoped_name_expr(expr),
             _ => false,
         }
+    }
+
+    /// §10.9: `T'{...}` with `ty_expr` the scoped name `T`. The pattern
+    /// keeps `T` as its type (a `TypedPattern`); a name that is not a pure
+    /// scoped name leaves the plain pattern.
+    fn typed_pattern(
+        ty_expr: &Expression,
+        items: Vec<crate::ast::expr::AssignmentPatternItem>,
+        span: crate::ast::Span,
+    ) -> Expression {
+        use crate::ast::types::{DataType, TypeName, TypeScope};
+        let pattern = Expression::new(ExprKind::AssignmentPattern(items), span);
+        let mut links = Vec::new();
+        let mut cur = ty_expr;
+        loop {
+            match &cur.kind {
+                ExprKind::MemberAccess { expr, member } => {
+                    links.push(member.clone());
+                    cur = expr;
+                }
+                ExprKind::Ident(h) if h.path.len() == 1 && h.path[0].selects.is_empty() => {
+                    links.push(h.path[0].name.clone());
+                    break;
+                }
+                _ => return pattern,
+            }
+        }
+        links.reverse();
+        let name = links.pop().expect("a scoped name has a leaf");
+        let ty = DataType::TypeReference {
+            name: TypeName {
+                scopes: links
+                    .into_iter()
+                    .map(|name| TypeScope {
+                        name,
+                        type_args: Vec::new(),
+                    })
+                    .collect(),
+                name,
+                span: ty_expr.span,
+                bound: Default::default(),
+            },
+            dimensions: Vec::new(),
+            type_args: Vec::new(),
+            span: ty_expr.span,
+        };
+        Expression::new(
+            ExprKind::TypedPattern {
+                ty: Box::new(ty),
+                pattern: Box::new(pattern),
+            },
+            span,
+        )
     }
 
     /// The `DataType` a cast keyword denotes (`int'(x)`, `byte'(x)`, …).
@@ -1083,6 +1186,8 @@ impl Parser {
 
     /// Parse prefix / primary expression.
     pub(super) fn parse_prefix(&mut self) -> Expression {
+        // One primary only: a parenthesized count (`##(f(1))`) parses as usual.
+        let delay_count = std::mem::take(&mut self.sva_delay_count);
         let start = self.current().span.start;
 
         match self.current_kind() {
@@ -1116,6 +1221,14 @@ impl Parser {
                     }
                     clk = self.parse_expression();
                     self.expect(TokenKind::RParen);
+                } else if matches!(
+                    self.current_kind(),
+                    TokenKind::Identifier | TokenKind::EscapedIdentifier
+                ) {
+                    // §9.4.2, §16.9.3: `@clk` without parentheses names the
+                    // event, any change of it (#652).
+                    let hier = self.parse_hierarchical_identifier();
+                    clk = Expression::new(ExprKind::Ident(hier), self.span_from(start));
                 }
                 let span = self.span_from(start);
                 let edge_lit = Expression::new(
@@ -1124,7 +1237,7 @@ impl Parser {
                         signed: false,
                         base: crate::ast::expr::NumberBase::Decimal,
                         value: edge_code.to_string(),
-                        cached_val: std::cell::Cell::new(None),
+                        cached_val: crate::ast::cache::LiteralCache::new(None),
                     }),
                     span,
                 );
@@ -1363,7 +1476,7 @@ impl Parser {
                         signed: false,
                         base: NumberBase::Binary,
                         value: "0".to_string(),
-                        cached_val: std::cell::Cell::new(Some((0u64, 0u64, 1u32))),
+                        cached_val: crate::ast::cache::LiteralCache::new(Some((0u64, 0u64, 1u32))),
                     }),
                     self.span_from(start),
                 )
@@ -1502,10 +1615,11 @@ impl Parser {
                 self.bump(); // $unit
                 self.bump(); // ::
                 let mut hier = self.parse_hierarchical_identifier();
-                if !self.at(TokenKind::LParen) {
-                    if let Some(seg) = hier.path.first_mut() {
-                        seg.name.name = crate::unit_scope_name(&seg.name.name);
-                    }
+                if self.at(TokenKind::LParen) && hier.path.len() == 1 {
+                    // §3.12.1: no lexical lookup applies to this name.
+                    hier.bound = crate::ast::binding::Bound::NO_TARGET;
+                } else if let Some(seg) = hier.path.first_mut() {
+                    seg.name.name = crate::unit_scope_name(&seg.name.name);
                 }
                 Expression::new(ExprKind::Ident(hier), self.span_from(start))
             }
@@ -1575,8 +1689,9 @@ impl Parser {
                         selects: Vec::new(),
                     }],
                     span: self.span_from(start),
-                    cached_signal_id: std::cell::Cell::new(None),
-                    cached_resolved_name: std::cell::OnceCell::new(),
+                    cached_signal_id: crate::ast::cache::SignalCache::new(None),
+                    cached_resolved_name: crate::ast::cache::NameCache::new(),
+                    bound: crate::ast::binding::Bound::UNSET,
                 };
                 Expression::new(ExprKind::Ident(hier), self.span_from(start))
             }
@@ -1616,6 +1731,7 @@ impl Parser {
                 let mut spec_text: Option<String> = None;
                 if self.eat(TokenKind::Hash).is_some() {
                     if self.eat(TokenKind::LParen).is_some() {
+                        self.check_param_list_form();
                         let mut depth = 1;
                         let mut text = String::new();
                         while depth > 0 && !self.at(TokenKind::Eof) {
@@ -1635,6 +1751,11 @@ impl Parser {
                         spec_text = Some(text);
                     }
                 }
+                // §18.17.7: a production's value variable has no lexical target.
+                let bound = match self.rs_values.contains(&id.name) {
+                    true => crate::ast::binding::Bound::NO_TARGET,
+                    false => crate::ast::binding::Bound::UNSET,
+                };
                 let hier = HierarchicalIdentifier {
                     root: None,
                     path: vec![HierPathSegment {
@@ -1642,8 +1763,9 @@ impl Parser {
                         selects: Vec::new(),
                     }],
                     span: self.span_from(start),
-                    cached_signal_id: std::cell::Cell::new(None),
-                    cached_resolved_name: std::cell::OnceCell::new(),
+                    cached_signal_id: crate::ast::cache::SignalCache::new(None),
+                    cached_resolved_name: crate::ast::cache::NameCache::new(),
+                    bound,
                 };
                 let mut expr = Expression::new(ExprKind::Ident(hier), self.span_from(start));
                 if let Some(text) = spec_text {
@@ -1684,13 +1806,9 @@ impl Parser {
                         self.span_from(start),
                     );
                 }
-                // §10.9.2 TYPED assignment pattern: `some_t'{ a: ..., default: ... }`.
+                // §10.9 TYPED assignment pattern: `some_t'{ a: ..., default: ... }`.
                 // The lexer folds `'{` into one token, so the cast branch above
-                // never sees it. The pattern's member layout is resolved from the
-                // ASSIGNMENT CONTEXT downstream (same as the untyped form), so the
-                // type prefix is dropped here — correct whenever the prefix names
-                // the context's own type, which is what real code writes (the
-                // pulp-platform AXI sources use this on every W/AW/AR beat).
+                // never sees it.
                 if self.at(TokenKind::ApostropheLBrace)
                     && matches!(&expr.kind, ExprKind::Ident(h)
                         if h.path.len() == 1 && h.path[0].selects.is_empty())
@@ -1698,13 +1816,10 @@ impl Parser {
                     self.bump();
                     let items = self.parse_assignment_pattern_items();
                     self.expect(TokenKind::RBrace);
-                    return Expression::new(
-                        ExprKind::AssignmentPattern(items),
-                        self.span_from(start),
-                    );
+                    return Self::typed_pattern(&expr, items, self.span_from(start));
                 }
-                // Check for function call
-                if self.at(TokenKind::LParen) {
+                // Check for function call (not after `##`, see `sva_delay_count`)
+                if self.at(TokenKind::LParen) && !delay_count {
                     let args = self.parse_call_args();
                     let call = Expression::new(
                         ExprKind::Call {
@@ -1862,8 +1977,9 @@ impl Parser {
                         selects: Vec::new(),
                     }],
                     span: self.span_from(start),
-                    cached_signal_id: std::cell::Cell::new(None),
-                    cached_resolved_name: std::cell::OnceCell::new(),
+                    cached_signal_id: crate::ast::cache::SignalCache::new(None),
+                    cached_resolved_name: crate::ast::cache::NameCache::new(),
+                    bound: crate::ast::binding::Bound::UNSET,
                 };
                 let new_expr = Expression::new(ExprKind::Ident(hier), self.span_from(start));
                 // `new <expr>` shallow-copy constructor (SV 8.8, Syntax 8-2):
@@ -1900,7 +2016,22 @@ impl Parser {
             // LRM §16.12.6 strong temporal operators in property context.
             // Parse as a prefix unary expression: `s_eventually <expr>`,
             // `s_always <expr>`. The SVA executor treats these as
-            // future-cycle obligations.
+            // future-cycle obligations. A bracketed range takes
+            // `parse_sva_ranged_operator`.
+            TokenKind::KwS_eventually | TokenKind::KwEventually
+                if self.peek_kind() == TokenKind::LBracket =>
+            {
+                self.parse_sva_ranged_operator()
+            }
+            TokenKind::KwEventually => {
+                // §16.12.13: `eventually` is only the ranged weak form.
+                self.error(
+                    "`eventually` needs a bounded range, `eventually [m:n] p` (IEEE 1800-2017 §16.12.13)"
+                        .to_string(),
+                );
+                self.bump();
+                self.parse_expr_bp(3)
+            }
             TokenKind::KwS_eventually => {
                 let start = self.current().span.start;
                 self.bump();
@@ -1913,7 +2044,14 @@ impl Parser {
                     self.span_from(start),
                 )
             }
-            TokenKind::KwS_always => {
+            TokenKind::KwS_always | TokenKind::KwAlways
+                if self.peek_kind() == TokenKind::LBracket =>
+            {
+                self.parse_sva_ranged_operator()
+            }
+            // §16.12.11: `always p` shares the `s_always` node. An always
+            // block is parsed at item level and never reaches this arm.
+            TokenKind::KwS_always | TokenKind::KwAlways => {
                 let start = self.current().span.start;
                 self.bump();
                 let operand = self.parse_expr_bp(3);
@@ -1925,32 +2063,34 @@ impl Parser {
                     self.span_from(start),
                 )
             }
-            // LRM §16.12.5 — `nexttime <expr>` and `s_nexttime <expr>`.
-            // Desugar to `Binary{HashHash, 1, expr}` which the SVA
-            // executor already treats as a 1-cycle delay.
+            // LRM §16.12.10 — `nexttime [n] <expr>` and `s_nexttime [n]
+            // <expr>`, `n` defaulting to 1. Desugar to `Binary{HashHash, n,
+            // expr}`, which the SVA executor already treats as an n-cycle
+            // delay. `s_nexttime` of a sequence is the strong form, which
+            // fails when the clock stops before the n-th tick.
             TokenKind::KwNexttime | TokenKind::KwS_nexttime => {
                 let start = self.current().span.start;
+                let strong = self.at(TokenKind::KwS_nexttime);
                 self.bump();
+                let count = if self.eat(TokenKind::LBracket).is_some() {
+                    let n = self.parse_expr_bp(0);
+                    self.expect(TokenKind::RBracket);
+                    n
+                } else {
+                    Self::sva_int("1", self.span_from(start))
+                };
                 let operand = self.parse_expr_bp(3);
-                let one = Expression::new(
-                    ExprKind::Number(crate::ast::expr::NumberLiteral::Integer {
-                        size: None,
-                        signed: false,
-                        base: crate::ast::expr::NumberBase::Decimal,
-                        value: "1".to_string(),
-                        cached_val: std::cell::Cell::new(None),
-                    }),
-                    self.span_from(start),
-                );
-                Expression::new(
-                    ExprKind::Binary {
-                        op: BinaryOp::HashHash,
-                        left: Box::new(one),
-                        right: Box::new(operand),
-                    },
-                    self.span_from(start),
-                )
+                let span = self.span_from(start);
+                let strong = strong && !Self::sva_property_ast(&operand);
+                let delayed = Self::sva_bin(BinaryOp::HashHash, count, operand, span);
+                if strong {
+                    Self::sva_marker("$sva_strong", vec![delayed], span)
+                } else {
+                    delayed
+                }
             }
+            // §16.12.16: the property `case`.
+            TokenKind::KwCase if self.in_sva_seq => self.parse_sva_property_case(),
             // LRM §16.12.9 — `not property_expr`: the property holds iff the
             // operand does NOT. For a boolean property (the common assertion
             // form, e.g. `not (a && b)`) this is logical negation, so desugar to
@@ -1984,7 +2124,7 @@ impl Parser {
                             signed: false,
                             base: crate::ast::expr::NumberBase::Decimal,
                             value: "1".to_string(),
-                            cached_val: std::cell::Cell::new(None),
+                            cached_val: crate::ast::cache::LiteralCache::new(None),
                         }),
                         self.span_from(start),
                     );
@@ -2013,6 +2153,14 @@ impl Parser {
                 let _ = self.eat(TokenKind::RParen);
                 Self::sva_marker("$sva_first_match", vec![seq], self.span_from(start))
             }
+            // §16.12.14 abort properties: `accept_on (b) p`, `reject_on (b)
+            // p` and their `sync_` forms, kept as `$sva_<operator>(b, p)`
+            // for the assertion engine. Table 16-3: the lowest precedence,
+            // so `p` extends as far right as it can.
+            TokenKind::KwAccept_on
+            | TokenKind::KwReject_on
+            | TokenKind::KwSync_accept_on
+            | TokenKind::KwSync_reject_on => self.parse_sva_abort(),
             TokenKind::KwIf => {
                 // LRM §16.12.7 `if (expression_or_dist) property_expr
                 // [else property_expr]`. The LRM defines it by equivalence, so
@@ -2029,7 +2177,7 @@ impl Parser {
                             signed: false,
                             base: crate::ast::expr::NumberBase::Decimal,
                             value: "1".to_string(),
-                            cached_val: std::cell::Cell::new(None),
+                            cached_val: crate::ast::cache::LiteralCache::new(None),
                         }),
                         self.span_from(start),
                     );
@@ -2105,7 +2253,7 @@ impl Parser {
                 let cycles = if self.at(TokenKind::LBracket) {
                     self.parse_sva_delay_range(start)
                 } else {
-                    self.parse_prefix()
+                    self.parse_sva_delay_count()
                 };
                 // The next token is either another operand (a bare
                 // sequence) or end-of-expression. We greedily parse one
@@ -2300,7 +2448,7 @@ impl Parser {
                             signed: false,
                             base: NumberBase::Decimal,
                             value: w.to_string(),
-                            cached_val: std::cell::Cell::new(None),
+                            cached_val: crate::ast::cache::LiteralCache::new(None),
                         }),
                         self.span_from(start_s),
                     );
@@ -2449,8 +2597,9 @@ impl Parser {
                         selects: Vec::new(),
                     }],
                     span,
-                    cached_signal_id: std::cell::Cell::new(None),
-                    cached_resolved_name: std::cell::OnceCell::new(),
+                    cached_signal_id: crate::ast::cache::SignalCache::new(None),
+                    cached_resolved_name: crate::ast::cache::NameCache::new(),
+                    bound: crate::ast::binding::Bound::UNSET,
                 };
                 args.push(Expression::new(
                     ExprKind::Ident(ident),
@@ -2740,8 +2889,9 @@ impl Parser {
             root: None,
             path,
             span: self.span_from(start),
-            cached_signal_id: std::cell::Cell::new(None),
-            cached_resolved_name: std::cell::OnceCell::new(),
+            cached_signal_id: crate::ast::cache::SignalCache::new(None),
+            cached_resolved_name: crate::ast::cache::NameCache::new(),
+            bound: crate::ast::binding::Bound::UNSET,
         }
     }
     /// §A.2.2.3 `delay_value` after a bare `#`: a number, a time literal or an
@@ -2769,8 +2919,9 @@ impl Parser {
                         selects: Vec::new(),
                     }],
                     span: self.span_from(start),
-                    cached_signal_id: std::cell::Cell::new(None),
-                    cached_resolved_name: std::cell::OnceCell::new(),
+                    cached_signal_id: crate::ast::cache::SignalCache::new(None),
+                    cached_resolved_name: crate::ast::cache::NameCache::new(),
+                    bound: crate::ast::binding::Bound::UNSET,
                 };
                 Expression::new(ExprKind::Ident(hier), self.span_from(start))
             }
@@ -2789,8 +2940,9 @@ impl Parser {
                 selects: Vec::new(),
             }],
             span: self.span_from(start),
-            cached_signal_id: std::cell::Cell::new(None),
-            cached_resolved_name: std::cell::OnceCell::new(),
+            cached_signal_id: crate::ast::cache::SignalCache::new(None),
+            cached_resolved_name: crate::ast::cache::NameCache::new(),
+            bound: crate::ast::binding::Bound::UNSET,
         };
         let mut res = Expression::new(ExprKind::Ident(hier), self.span_from(start));
 
@@ -2836,6 +2988,35 @@ impl Parser {
     /// (= `[0:$]`), `[+]` (= `[1:$]`) or a single `[n]`. The opening `[` is
     /// current. Returns `Range(lo, hi)` (an unbounded `hi` is `Dollar`), or
     /// the bare count for `[n]`.
+    /// §16.7 `## constant_primary`: the delay count of `##N`. A name is the
+    /// count even when `(` follows (`##N (x)`, `##pkg::N (x)`): the
+    /// parenthesis starts the next sequence, not a call (#609).
+    fn parse_sva_delay_count(&mut self) -> Expression {
+        let start = self.current().span.start;
+        self.sva_delay_count = true;
+        let mut count = self.parse_prefix();
+        while matches!(
+            count.kind,
+            ExprKind::Ident(_) | ExprKind::MemberAccess { .. }
+        ) && self.at(TokenKind::DoubleColon)
+            && matches!(
+                self.peek_kind(),
+                TokenKind::Identifier | TokenKind::EscapedIdentifier
+            )
+        {
+            self.bump(); // ::
+            let member = self.parse_identifier();
+            count = Expression::new(
+                ExprKind::MemberAccess {
+                    expr: Box::new(count),
+                    member,
+                },
+                self.span_from(start),
+            );
+        }
+        count
+    }
+
     fn parse_sva_delay_range(&mut self, start: usize) -> Expression {
         let mk_num = |this: &Self, v: &str| {
             Expression::new(
@@ -2844,7 +3025,7 @@ impl Parser {
                     signed: false,
                     base: crate::ast::expr::NumberBase::Decimal,
                     value: v.to_string(),
-                    cached_val: std::cell::Cell::new(None),
+                    cached_val: crate::ast::cache::LiteralCache::new(None),
                 }),
                 this.span_from(start),
             )
@@ -2900,6 +3081,285 @@ impl Parser {
         events
     }
 
+    /// A decimal integer literal for a lowered SVA form.
+    fn sva_int(v: &str, span: Span) -> Expression {
+        Expression::new(
+            ExprKind::Number(crate::ast::expr::NumberLiteral::Integer {
+                size: None,
+                signed: false,
+                base: crate::ast::expr::NumberBase::Decimal,
+                value: v.to_string(),
+                cached_val: crate::ast::cache::LiteralCache::new(None),
+            }),
+            span,
+        )
+    }
+
+    fn sva_bin(op: BinaryOp, left: Expression, right: Expression, span: Span) -> Expression {
+        Expression::new(
+            ExprKind::Binary {
+                op,
+                left: Box::new(left),
+                right: Box::new(right),
+            },
+            span,
+        )
+    }
+
+    fn sva_not(operand: Expression, span: Span) -> Expression {
+        Expression::new(
+            ExprKind::Unary {
+                op: UnaryOp::LogNot,
+                operand: Box::new(operand),
+            },
+            span,
+        )
+    }
+
+    /// §16.12.11 / §16.12.13: `always [m:n] p`, `s_always [m:n] p`,
+    /// `eventually [m:n] p` and `s_eventually [m:n] p` (also `[m:$]` for
+    /// `always` and `s_eventually`), lowered onto forms the assertion engine
+    /// already runs:
+    ///
+    /// ```text
+    /// eventually [m:n] s    ==  weak(##[m:n] s)
+    /// s_eventually [m:n] s  ==  strong(##[m:n] s)
+    /// always [m:n] b        ==  weak(##m b[*n-m+1])
+    /// s_always [m:n] b      ==  strong(##m b[*n-m+1])
+    /// always [m:$] b        ==  (1 ##m 1) |-> always b
+    /// ```
+    ///
+    /// The `always` forms take a Boolean operand and the `eventually` forms a
+    /// sequence. Other operands are reported, not run with other semantics.
+    /// The keyword is current and `[` follows it.
+    fn parse_sva_ranged_operator(&mut self) -> Expression {
+        let start = self.current().span.start;
+        let kind = self.current_kind();
+        let word = match kind {
+            TokenKind::KwEventually => "eventually",
+            TokenKind::KwS_eventually => "s_eventually",
+            TokenKind::KwAlways => "always",
+            _ => "s_always",
+        };
+        self.bump();
+        self.bump(); // `[`
+        let lo = self.parse_expr_bp(0);
+        let hi = if self.eat(TokenKind::Colon).is_some() {
+            self.parse_expr_bp(0)
+        } else {
+            lo.clone()
+        };
+        self.expect(TokenKind::RBracket);
+        let unbounded = matches!(hi.kind, ExprKind::Dollar);
+        let operand = self.parse_expr_bp(3);
+        let span = self.span_from(start);
+        match kind {
+            TokenKind::KwEventually | TokenKind::KwS_eventually => {
+                if kind == TokenKind::KwEventually && unbounded {
+                    self.error(
+                        "`eventually` needs a bounded range, `eventually [m:n] p` (IEEE 1800-2017 §16.12.13)"
+                            .to_string(),
+                    );
+                }
+                if Self::sva_property_ast(&operand) {
+                    self.error(format!(
+                        "`{word} [m:n]` of a property is not supported; only of a sequence or Boolean (IEEE 1800-2017 §16.12.13)"
+                    ));
+                }
+                let range = Expression::new(ExprKind::Range(Box::new(lo), Box::new(hi)), span);
+                let delayed = Self::sva_bin(BinaryOp::HashHash, range, operand, span);
+                let marker = if kind == TokenKind::KwS_eventually {
+                    "$sva_strong"
+                } else {
+                    "$sva_weak"
+                };
+                Self::sva_marker(marker, vec![delayed], span)
+            }
+            _ => {
+                if Self::sva_temporal_ast(&operand) {
+                    self.error(format!(
+                        "`{word} [m:n]` of a sequence or property is not supported; only of a Boolean (IEEE 1800-2017 §16.12.11)"
+                    ));
+                }
+                if unbounded {
+                    if kind == TokenKind::KwS_always {
+                        self.error(
+                            "`s_always` needs a bounded range, `s_always [m:n] p` (IEEE 1800-2017 §16.12.11)"
+                                .to_string(),
+                        );
+                    }
+                    // The antecedent `1 ##m 1` ends at the m-th tick, where
+                    // `always b` starts.
+                    let tick =
+                        Self::sva_bin(BinaryOp::HashHash, lo, Self::sva_int("1", span), span);
+                    let ante =
+                        Self::sva_bin(BinaryOp::SeqAnd, Self::sva_int("1", span), tick, span);
+                    let always = Expression::new(
+                        ExprKind::Unary {
+                            op: UnaryOp::SAlways,
+                            operand: Box::new(operand),
+                        },
+                        span,
+                    );
+                    return Self::sva_bin(BinaryOp::OrMinusArrow, ante, always, span);
+                }
+                let width = Self::sva_bin(
+                    BinaryOp::Add,
+                    Self::sva_bin(BinaryOp::Sub, hi, lo.clone(), span),
+                    Self::sva_int("1", span),
+                    span,
+                );
+                let rep =
+                    Self::sva_marker("$sva_rep_consec", vec![operand, width.clone(), width], span);
+                let delayed = Self::sva_bin(BinaryOp::HashHash, lo, rep, span);
+                let marker = if kind == TokenKind::KwS_always {
+                    "$sva_strong"
+                } else {
+                    "$sva_weak"
+                };
+                Self::sva_marker(marker, vec![delayed], span)
+            }
+        }
+    }
+
+    /// §16.12.16 `case (e) item {, item} : p; ... [default [:] p;] endcase`,
+    /// lowered like the property `if`: each item's property is guarded by its
+    /// match and by no earlier item matching, and the arms are joined by the
+    /// property `and`:
+    ///
+    /// ```text
+    /// case (s) e1: p1; default: pd; endcase
+    ///     ==  (s === e1 |-> p1) and (!(s === e1) |-> pd)
+    /// ```
+    ///
+    /// With no item matching and no default, the property holds vacuously.
+    fn parse_sva_property_case(&mut self) -> Expression {
+        let start = self.current().span.start;
+        self.bump(); // `case`
+        self.expect(TokenKind::LParen);
+        let sel = self.parse_expr_bp(0);
+        self.expect(TokenKind::RParen);
+        let mut matched: Option<Expression> = None;
+        let mut arms: Vec<Expression> = Vec::new();
+        let mut default: Option<Expression> = None;
+        while !self.at(TokenKind::KwEndcase) && !self.at(TokenKind::Eof) {
+            if self.eat(TokenKind::KwDefault).is_some() {
+                let _ = self.eat(TokenKind::Colon);
+                let p = self.parse_expr_bp(0);
+                self.expect(TokenKind::Semicolon);
+                if default.is_some() {
+                    self.error(
+                        "a property case has more than one default item (IEEE 1800-2017 §16.12.16)"
+                            .to_string(),
+                    );
+                }
+                default = Some(p);
+                continue;
+            }
+            let mut cond: Option<Expression> = None;
+            loop {
+                let item = self.parse_expr_bp(0);
+                let span = self.span_from(start);
+                let eq = Self::sva_bin(BinaryOp::CaseEq, sel.clone(), item, span);
+                cond = Some(match cond {
+                    None => eq,
+                    Some(c) => Self::sva_bin(BinaryOp::LogOr, c, eq, span),
+                });
+                if self.eat(TokenKind::Comma).is_none() {
+                    break;
+                }
+            }
+            self.expect(TokenKind::Colon);
+            let p = self.parse_expr_bp(0);
+            self.expect(TokenKind::Semicolon);
+            let span = self.span_from(start);
+            let Some(cond) = cond else { break };
+            let guard = match &matched {
+                None => cond.clone(),
+                Some(m) => Self::sva_bin(
+                    BinaryOp::LogAnd,
+                    Self::sva_not(m.clone(), span),
+                    cond.clone(),
+                    span,
+                ),
+            };
+            arms.push(Self::sva_bin(BinaryOp::OrMinusArrow, guard, p, span));
+            matched = Some(match matched {
+                None => cond,
+                Some(m) => Self::sva_bin(BinaryOp::LogOr, m, cond, span),
+            });
+        }
+        self.expect(TokenKind::KwEndcase);
+        let span = self.span_from(start);
+        if let Some(p) = default {
+            arms.push(match matched {
+                None => p,
+                Some(m) => Self::sva_bin(BinaryOp::OrMinusArrow, Self::sva_not(m, span), p, span),
+            });
+        }
+        arms.into_iter()
+            .reduce(|a, b| Self::sva_bin(BinaryOp::SvaAnd, a, b, span))
+            .unwrap_or_else(|| Self::sva_int("1", span))
+    }
+
+    /// Whether an expression uses a property operator, not only sequence
+    /// operators: a lowering through `##[m:n]` cannot take it.
+    fn sva_property_ast(e: &Expression) -> bool {
+        match &e.kind {
+            ExprKind::Paren(x) => Self::sva_property_ast(x),
+            ExprKind::Binary { op, left, right } => {
+                matches!(
+                    op,
+                    BinaryOp::OrMinusArrow
+                        | BinaryOp::OrFatArrow
+                        | BinaryOp::Iff
+                        | BinaryOp::Until
+                        | BinaryOp::SUntil
+                ) || Self::sva_property_ast(left)
+                    || Self::sva_property_ast(right)
+            }
+            ExprKind::Unary { op, operand } => {
+                matches!(op, UnaryOp::SEventually | UnaryOp::SAlways)
+                    || (matches!(op, UnaryOp::LogNot) && Self::sva_temporal_ast(operand))
+                    || Self::sva_property_ast(operand)
+            }
+            ExprKind::SystemCall { name, .. } => matches!(
+                name.as_str(),
+                "$sva_follow_overlap"
+                    | "$sva_follow_nonoverlap"
+                    | "$sva_strong"
+                    | "$sva_weak"
+                    | "$sva_implies"
+                    | "$sva_accept_on"
+                    | "$sva_reject_on"
+                    | "$sva_sync_accept_on"
+                    | "$sva_sync_reject_on"
+            ),
+            _ => false,
+        }
+    }
+
+    /// §16.12.14 `accept_on (b) p` and its kin; the keyword is current.
+    fn parse_sva_abort(&mut self) -> Expression {
+        let start = self.current().span.start;
+        let (word, marker) = match self.current_kind() {
+            TokenKind::KwAccept_on => ("accept_on", "$sva_accept_on"),
+            TokenKind::KwReject_on => ("reject_on", "$sva_reject_on"),
+            TokenKind::KwSync_accept_on => ("sync_accept_on", "$sva_sync_accept_on"),
+            _ => ("sync_reject_on", "$sva_sync_reject_on"),
+        };
+        self.bump();
+        if self.eat(TokenKind::LParen).is_none() {
+            self.error(format!(
+                "`{word}` needs its abort condition in parentheses, `{word} (b) p` (IEEE 1800-2017 §16.12.14)"
+            ));
+        }
+        let cond = self.parse_expr_bp(0);
+        self.expect(TokenKind::RParen);
+        let body = self.parse_expr_bp(1);
+        Self::sva_marker(marker, vec![cond, body], self.span_from(start))
+    }
+
     /// Wrap a sequence in a marker the assertion engine recognises
     /// (`$sva_rep_consec(s, lo, hi)`, `$sva_first_match(s)`, ...).
     fn sva_marker(name: &str, args: Vec<Expression>, span: Span) -> Expression {
@@ -2910,6 +3370,39 @@ impl Parser {
             },
             span,
         )
+    }
+
+    /// Whether an expression uses a sequence or property operator, so an
+    /// `and` built over it must be the property `and` (§16.12.12).
+    fn sva_temporal_ast(e: &Expression) -> bool {
+        match &e.kind {
+            ExprKind::Binary { op, left, right } => {
+                matches!(
+                    op,
+                    BinaryOp::HashHash
+                        | BinaryOp::SeqAnd
+                        | BinaryOp::Throughout
+                        | BinaryOp::Within
+                        | BinaryOp::Until
+                        | BinaryOp::SUntil
+                        | BinaryOp::Intersect
+                        | BinaryOp::SvaAnd
+                        | BinaryOp::SeqOr
+                        | BinaryOp::OrMinusArrow
+                        | BinaryOp::OrFatArrow
+                ) || Self::sva_temporal_ast(left)
+                    || Self::sva_temporal_ast(right)
+            }
+            ExprKind::Unary { op, operand } => {
+                matches!(
+                    op,
+                    UnaryOp::HashHash | UnaryOp::SEventually | UnaryOp::SAlways
+                ) || Self::sva_temporal_ast(operand)
+            }
+            ExprKind::Paren(x) => Self::sva_temporal_ast(x),
+            ExprKind::SystemCall { name, .. } => name.starts_with("$sva_"),
+            _ => false,
+        }
     }
 
     fn infix_bp(&self, no_arrow: bool) -> Option<(BinaryOp, u8, u8)> {
@@ -2932,6 +3425,10 @@ impl Parser {
             TokenKind::KwWithin => Some((BinaryOp::Within, 2, 3)),
             TokenKind::KwUntil => Some((BinaryOp::Until, 2, 3)),
             TokenKind::KwS_until => Some((BinaryOp::SUntil, 2, 3)),
+            // §16.12.12 `until_with` / `s_until_with`: rewritten to
+            // `until` / `s_until` over `(left and right)` by the infix loop.
+            TokenKind::KwUntil_with => Some((BinaryOp::Until, 2, 3)),
+            TokenKind::KwS_until_with => Some((BinaryOp::SUntil, 2, 3)),
             TokenKind::KwIntersect => Some((BinaryOp::Intersect, 4, 5)),
             // §16.9 sequence `and`/`or` — only inside a property/sequence body
             // (the `in_sva_seq` flag), else `or` is an event-list separator and
@@ -3085,7 +3582,7 @@ fn parse_number_literal(text: &str) -> NumberLiteral {
             signed,
             base,
             value,
-            cached_val: Cell::new(None),
+            cached_val: crate::ast::cache::LiteralCache::new(None),
         };
     }
     // Plain decimal — signed per Verilog standard (LRM section 5.7.1)
@@ -3094,7 +3591,7 @@ fn parse_number_literal(text: &str) -> NumberLiteral {
         signed: true,
         base: NumberBase::Decimal,
         value: text.replace('_', ""),
-        cached_val: Cell::new(None),
+        cached_val: crate::ast::cache::LiteralCache::new(None),
     }
 }
 

@@ -64,7 +64,7 @@ pub fn member_is_qualified(name: &str) -> bool {
 /// What a package declares and imports, for owner lookups.
 #[derive(Default)]
 struct PkgInfo {
-    /// Typedef and class names declared directly in the package.
+    /// Typedef, nettype and class names declared directly in the package.
     types: HashSet<String>,
     /// Members of the package's own enum typedefs.
     members: HashSet<String>,
@@ -74,6 +74,8 @@ struct PkgInfo {
     /// Variable names declared directly in the package (a subset of
     /// `values`).
     vars: HashSet<String>,
+    /// Package-owned value parameters retain lexical binding in subroutines.
+    params: HashSet<String>,
     /// `import Q::name;` as (Q, name).
     explicit: Vec<(String, String)>,
     /// `import Q::*;`
@@ -100,6 +102,9 @@ struct Info {
     /// Type names (typedefs, nested classes) a class declares that are also
     /// declared in another class or any other scope (§8.3, §6.18).
     class_colliding: HashSet<String>,
+    /// §23.9: module-local classes whose names another lexical scope owns.
+    hiding: HashSet<String>,
+    repeated_module_classes: HashSet<String>,
     /// Every class by the name it carries after this pass: its own type
     /// names and the base class name as written.
     classes: HashMap<String, ClassInfo>,
@@ -111,6 +116,7 @@ struct Info {
 #[derive(Default)]
 struct ClassInfo {
     types: HashSet<String>,
+    values: HashSet<String>,
     base: Option<String>,
     /// Every typedef the class declares (class-naming ones included).
     typedefs: HashSet<String>,
@@ -208,6 +214,7 @@ fn record_class(
         ..ClassInfo::default()
     };
     class_param_typedefs(c, class_names, &mut ci);
+    class_value_names(c, &mut ci.values);
     for it in &c.items {
         match it {
             ClassItem::Typedef(td) if class_typedef_renamable(td, class_names) => {
@@ -397,7 +404,7 @@ fn merge_packed(mut rep: DataType, mut outer: Vec<PackedDimension>) -> Option<Da
                         signed: false,
                         base: crate::ast::expr::NumberBase::Decimal,
                         value: v.to_string(),
-                        cached_val: std::cell::Cell::new(None),
+                        cached_val: crate::ast::cache::LiteralCache::new(None),
                     }),
                     span,
                 ))
@@ -494,6 +501,7 @@ fn arg_type(e: &Expression) -> Option<DataType> {
                         span: e.span,
                     },
                     span: e.span,
+                    bound: Default::default(),
                 },
                 dimensions: Vec::new(),
                 type_args: Vec::new(),
@@ -604,24 +612,32 @@ fn bind_params(
 
 /// Every class declaration of the design with the package (if any) it is
 /// declared in.
-fn design_classes(descs: &[Description]) -> Vec<(Option<&str>, &ClassDeclaration)> {
+#[derive(Clone, Copy)]
+enum ClassScope<'a> {
+    Unit,
+    Package(&'a str),
+    Module(&'a str),
+}
+
+fn design_classes(descs: &[Description]) -> Vec<(ClassScope<'_>, &ClassDeclaration)> {
     fn module_classes<'a>(
         items: &'a [ModuleItem],
-        out: &mut Vec<(Option<&'a str>, &'a ClassDeclaration)>,
+        owner: &'a str,
+        out: &mut Vec<(ClassScope<'a>, &'a ClassDeclaration)>,
     ) {
         for it in items {
             match it {
-                ModuleItem::ClassDeclaration(c) => out.push((None, c)),
-                ModuleItem::GenerateRegion(g) => module_classes(&g.items, out),
+                ModuleItem::ClassDeclaration(c) => out.push((ClassScope::Module(owner), c)),
+                ModuleItem::GenerateRegion(g) => module_classes(&g.items, owner, out),
                 ModuleItem::GenerateIf(g) => {
                     for (_, b) in &g.branches {
-                        module_classes(b, out);
+                        module_classes(b, owner, out);
                     }
                 }
-                ModuleItem::GenerateFor(g) => module_classes(&g.items, out),
+                ModuleItem::GenerateFor(g) => module_classes(&g.items, owner, out),
                 ModuleItem::GenerateCase(g) => {
                     for a in &g.arms {
-                        module_classes(&a.items, out);
+                        module_classes(&a.items, owner, out);
                     }
                 }
                 _ => {}
@@ -634,16 +650,16 @@ fn design_classes(descs: &[Description]) -> Vec<(Option<&str>, &ClassDeclaration
             Description::Package(p) => {
                 for it in &p.items {
                     if let PackageItem::Class(c) = it {
-                        out.push((Some(p.name.name.as_str()), c));
+                        out.push((ClassScope::Package(p.name.name.as_str()), c));
                     }
                 }
             }
             Description::Class(c) | Description::PackageItem(PackageItem::Class(c)) => {
-                out.push((None, c))
+                out.push((ClassScope::Unit, c))
             }
-            Description::Module(m) => module_classes(&m.items, &mut out),
-            Description::Interface(m) => module_classes(&m.items, &mut out),
-            Description::Program(m) => module_classes(&m.items, &mut out),
+            Description::Module(m) => module_classes(&m.items, &m.name.name, &mut out),
+            Description::Interface(m) => module_classes(&m.items, &m.name.name, &mut out),
+            Description::Program(m) => module_classes(&m.items, &m.name.name, &mut out),
             _ => {}
         }
     }
@@ -651,6 +667,17 @@ fn design_classes(descs: &[Description]) -> Vec<(Option<&str>, &ClassDeclaration
 }
 
 impl Info {
+    fn module_class_name(&self, owner: &str, c: &ClassDeclaration) -> String {
+        let named = mangle(owner, &c.name.name);
+        if self.repeated_module_classes.contains(&named) {
+            mangle(
+                &format!("{owner}::__scope{}", c.name.span.start),
+                &c.name.name,
+            )
+        } else {
+            named
+        }
+    }
     /// The package whose declaration `Q::name` denotes: Q itself when it
     /// declares `name`, else the package it re-exports `name` from (§26.6).
     fn owner(&self, q: &str, name: &str, depth: u32) -> Option<String> {
@@ -719,6 +746,9 @@ fn mangle(pkg: &str, name: &str) -> String {
 struct Frame {
     /// Set on a package's own frame: its declarations resolve to `pkg::name`.
     pkg: Option<String>,
+    /// The enclosing module and the class bindings this lexical body owns.
+    module: Option<String>,
+    module_classes: HashMap<String, String>,
     /// Type names declared here (they shadow imports and outer scopes).
     types: HashSet<String>,
     /// Value names declared here — an identifier naming one of these is not
@@ -728,6 +758,11 @@ struct Frame {
     explicit: HashMap<String, String>,
     /// `import Q::*;`
     wild: Vec<String>,
+    /// §26.3: a name a reference found through exactly one wildcard import
+    /// here, with that import's package. The name is then locally visible,
+    /// so a later reference takes it like an explicit import, whatever
+    /// wildcard import of another package follows (#620).
+    bound: std::cell::RefCell<HashMap<String, String>>,
     /// A class scope with a base class: names it inherits are not tracked
     /// here, so value names are not resolved past it.
     inherits: bool,
@@ -861,6 +896,9 @@ fn collect(descs: &[Description]) -> Option<Info> {
                 let pi = pkgs.entry(p.name.name.clone()).or_default();
                 for it in &p.items {
                     package_item_values(it, &mut pi.values);
+                    if let PackageItem::Parameter(pd) = it {
+                        param_names(pd, &mut HashSet::default(), &mut pi.params);
+                    }
                     if let PackageItem::Data(dd) = it {
                         pi.vars
                             .extend(dd.declarators.iter().map(|v| v.name.name.clone()));
@@ -869,6 +907,11 @@ fn collect(descs: &[Description]) -> Option<Info> {
                         PackageItem::Typedef(td) => {
                             pi.types.insert(td.name.name.clone());
                             enum_members(&td.data_type, &mut pi.members);
+                        }
+                        // §6.6.7 / §26.3: nettypes retain their package identity
+                        // under the same import rules as other named types.
+                        PackageItem::Nettype(n) => {
+                            pi.types.insert(n.name.name.clone());
                         }
                         PackageItem::Class(c) => {
                             pi.types.insert(c.name.name.clone());
@@ -906,15 +949,40 @@ fn collect(descs: &[Description]) -> Option<Info> {
             Description::Class(c) | Description::PackageItem(PackageItem::Class(c)) => {
                 other.insert(c.name.name.clone());
             }
+            Description::PackageItem(PackageItem::Nettype(n)) => {
+                other.insert(n.name.name.clone());
+            }
             Description::PackageItem(PackageItem::Covergroup(cg)) => {
                 other.insert(cg.name.name.clone());
             }
             Description::PackageItem(pi) => package_item_values(pi, &mut other_values),
-            Description::Module(m) => module_level_types(&m.items, &mut other, &mut other_members),
-            Description::Interface(m) => {
-                module_level_types(&m.items, &mut other, &mut other_members)
+            Description::DPIImport(di) => {
+                other_values.insert(match &di.proto {
+                    DPIProto::Function(f) => f.name.name.name.clone(),
+                    DPIProto::Task(t) => t.name.name.name.clone(),
+                });
             }
-            Description::Program(m) => module_level_types(&m.items, &mut other, &mut other_members),
+            Description::Module(m) => {
+                for pd in &m.params {
+                    param_names(pd, &mut HashSet::default(), &mut other_values);
+                }
+                module_level_types(&m.items, &mut other, &mut other_members);
+                module_dpi_names(&m.items, &mut other_values);
+            }
+            Description::Interface(m) => {
+                for pd in &m.params {
+                    param_names(pd, &mut HashSet::default(), &mut other_values);
+                }
+                module_level_types(&m.items, &mut other, &mut other_members);
+                module_dpi_names(&m.items, &mut other_values);
+            }
+            Description::Program(m) => {
+                for pd in &m.params {
+                    param_names(pd, &mut HashSet::default(), &mut other_values);
+                }
+                module_level_types(&m.items, &mut other, &mut other_members);
+                module_dpi_names(&m.items, &mut other_values);
+            }
             _ => {}
         }
     }
@@ -984,6 +1052,36 @@ fn collect(descs: &[Description]) -> Option<Info> {
     // §8.3: a class is a scope of its own; a type name a class declares
     // collides when it is declared anywhere else as well.
     let all_classes = design_classes(descs);
+    let mut lexical_counts: HashMap<&str, usize> = HashMap::default();
+    for (scope, c) in &all_classes {
+        if !matches!(scope, ClassScope::Package(_)) {
+            *lexical_counts.entry(c.name.name.as_str()).or_default() += 1;
+        }
+    }
+    let hiding: HashSet<String> = all_classes
+        .iter()
+        .filter(|(s, c)| {
+            matches!(s, ClassScope::Module(_))
+                && lexical_counts
+                    .get(c.name.name.as_str())
+                    .is_some_and(|count| *count > 1)
+        })
+        .map(|(_, c)| c.name.name.clone())
+        .collect();
+    let mut module_counts: HashMap<String, usize> = HashMap::default();
+    for (scope, c) in &all_classes {
+        if let ClassScope::Module(owner) = scope
+            && hiding.contains(&c.name.name)
+        {
+            *module_counts
+                .entry(mangle(owner, &c.name.name))
+                .or_default() += 1;
+        }
+    }
+    let repeated_module_classes: HashSet<String> = module_counts
+        .into_iter()
+        .filter_map(|(n, count)| (count > 1).then_some(n))
+        .collect();
     let mut class_names: HashSet<String> = HashSet::default();
     for (_, c) in &all_classes {
         class_names_of(c, &mut class_names);
@@ -1001,9 +1099,17 @@ fn collect(descs: &[Description]) -> Option<Info> {
         .collect();
     let mut classes: HashMap<String, ClassInfo> = HashMap::default();
     let mut class_by_bare: HashMap<String, Vec<String>> = HashMap::default();
-    for (pkg, c) in &all_classes {
-        let named = match pkg {
-            Some(p) if colliding.contains(&c.name.name) => mangle(p, &c.name.name),
+    for (scope, c) in &all_classes {
+        let named = match scope {
+            ClassScope::Package(p) if colliding.contains(&c.name.name) => mangle(p, &c.name.name),
+            ClassScope::Module(m) if hiding.contains(&c.name.name) => {
+                let owner = if repeated_module_classes.contains(&mangle(m, &c.name.name)) {
+                    format!("{m}::__scope{}", c.name.span.start)
+                } else {
+                    m.to_string()
+                };
+                mangle(&owner, &c.name.name)
+            }
             _ => c.name.name.clone(),
         };
         record_class(
@@ -1019,6 +1125,7 @@ fn collect(descs: &[Description]) -> Option<Info> {
         && colliding_members.is_empty()
         && colliding_values.is_empty()
         && class_colliding.is_empty()
+        && hiding.is_empty()
         && classes.values().all(|ci| ci.inline.is_empty())
     {
         return None;
@@ -1030,6 +1137,8 @@ fn collect(descs: &[Description]) -> Option<Info> {
         colliding_values,
         mangled_vars,
         class_colliding,
+        hiding,
+        repeated_module_classes,
         classes,
         class_by_bare,
     })
@@ -1048,6 +1157,9 @@ fn module_level_types(
                 out.insert(td.name.name.clone());
                 enum_members(&td.data_type, members);
             }
+            ModuleItem::NettypeDeclaration(n) => {
+                out.insert(n.name.name.clone());
+            }
             ModuleItem::DataDeclaration(d) => enum_members(&d.data_type, members),
             ModuleItem::ClassDeclaration(c) => {
                 out.insert(c.name.name.clone());
@@ -1063,6 +1175,29 @@ fn module_level_types(
                 for a in &g.arms {
                     module_level_types(&a.items, out, members);
                 }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Module DPI declarations also shadow imported package subroutines.
+fn module_dpi_names(items: &[ModuleItem], out: &mut HashSet<String>) {
+    for item in items {
+        match item {
+            ModuleItem::DPIImport(di) => {
+                out.insert(match &di.proto {
+                    DPIProto::Function(f) => f.name.name.name.clone(),
+                    DPIProto::Task(t) => t.name.name.name.clone(),
+                });
+            }
+            ModuleItem::GenerateRegion(g) => module_dpi_names(&g.items, out),
+            ModuleItem::GenerateIf(g) => {
+                for (_, items) in &g.branches { module_dpi_names(items, out); }
+            }
+            ModuleItem::GenerateFor(g) => module_dpi_names(&g.items, out),
+            ModuleItem::GenerateCase(g) => {
+                for arm in &g.arms { module_dpi_names(&arm.items, out); }
             }
             _ => {}
         }
@@ -1094,10 +1229,19 @@ fn unit_frame(descs: &[Description]) -> Frame {
             Description::Class(c) | Description::PackageItem(PackageItem::Class(c)) => {
                 f.types.insert(c.name.name.clone());
             }
-            Description::ImportDecl(imp) | Description::PackageItem(PackageItem::Import(imp)) => {
-                f.add_imports(imp)
+            Description::PackageItem(PackageItem::Nettype(n)) => {
+                f.types.insert(n.name.name.clone());
             }
+            // §26.3: a `$unit` import counts from where it appears; the walk
+            // adds it then (`Rw::description`).
+            Description::ImportDecl(_) | Description::PackageItem(PackageItem::Import(_)) => {}
             Description::PackageItem(pi) => package_item_values(pi, &mut f.values),
+            Description::DPIImport(di) => {
+                f.values.insert(match &di.proto {
+                    DPIProto::Function(fd) => fd.name.name.name.clone(),
+                    DPIProto::Task(td) => td.name.name.name.clone(),
+                });
+            }
             _ => {}
         }
     }
@@ -1119,6 +1263,31 @@ fn param_names(
     }
 }
 
+fn class_value_names(c: &ClassDeclaration, out: &mut HashSet<String>) {
+    for pd in &c.params {
+        param_names(pd, &mut HashSet::default(), out);
+    }
+    for item in &c.items {
+        match item {
+            ClassItem::Property(p) => {
+                out.extend(p.declarators.iter().map(|d| d.name.name.clone()));
+                enum_members(&p.data_type, out);
+            }
+            ClassItem::Parameter(pd) => param_names(pd, &mut HashSet::default(), out),
+            ClassItem::Typedef(td) => enum_members(&td.data_type, out),
+            ClassItem::Method(m) => {
+                out.insert(match &m.kind {
+                    ClassMethodKind::Function(f)
+                    | ClassMethodKind::PureVirtual(f)
+                    | ClassMethodKind::Extern(f) => f.name.name.name.clone(),
+                    ClassMethodKind::Task(t) => t.name.name.name.clone(),
+                });
+            }
+            _ => {}
+        }
+    }
+}
+
 fn package_item_values(pi: &PackageItem, out: &mut HashSet<String>) {
     let mut sink = HashSet::default();
     match pi {
@@ -1131,6 +1300,12 @@ fn package_item_values(pi: &PackageItem, out: &mut HashSet<String>) {
         }
         PackageItem::Task(t) if t.name.scopes.is_empty() => {
             out.insert(t.name.name.name.clone());
+        }
+        PackageItem::DPIImport(di) => {
+            out.insert(match &di.proto {
+                DPIProto::Function(f) => f.name.name.name.clone(),
+                DPIProto::Task(t) => t.name.name.name.clone(),
+            });
         }
         PackageItem::Let(l) => {
             out.insert(l.name.name.clone());
@@ -1145,6 +1320,11 @@ fn package_item_values(pi: &PackageItem, out: &mut HashSet<String>) {
 fn stmt_locals(s: &Statement, f: &mut Frame) {
     match &s.kind {
         StatementKind::VarDecl {
+            data_type,
+            declarators,
+            ..
+        }
+        | StatementKind::ParamDecl {
             data_type,
             declarators,
             ..
@@ -1170,8 +1350,9 @@ fn ident_expr(name: String, span: crate::ast::Span) -> Expression {
                 selects: Vec::new(),
             }],
             span,
-            cached_signal_id: std::cell::Cell::new(None),
-            cached_resolved_name: std::cell::OnceCell::new(),
+            cached_signal_id: crate::ast::cache::SignalCache::new(None),
+            cached_resolved_name: crate::ast::cache::NameCache::new(),
+            bound: crate::ast::binding::Bound::UNSET,
         }),
         span,
     )
@@ -1204,13 +1385,27 @@ fn plain_ident(e: &Expression) -> Option<&str> {
 }
 
 impl Rw<'_> {
+    /// Record that a reference found `n` through the one wildcard import of
+    /// `f` whose package declares it (see `Frame::bound`).
+    fn bind_wild(f: &Frame, n: &str, declares: impl Fn(&str) -> bool) {
+        if let Some(q) = f.wild.iter().find(|q| declares(q)) {
+            f.bound
+                .borrow_mut()
+                .entry(n.to_string())
+                .or_insert_with(|| q.clone());
+        }
+    }
+
     fn resolve(&self, n: &str) -> Res {
         let pkg_col = self.info.colliding.contains(n);
         let cls_col = self.info.class_colliding.contains(n);
-        if !pkg_col && !cls_col {
+        if !pkg_col && !cls_col && !self.info.hiding.contains(n) {
             return Res::Keep;
         }
         for f in self.frames.iter().rev() {
+            if let Some(named) = f.module_classes.get(n) {
+                return Res::To(named.clone());
+            }
             // §8.3/§8.13: a class's own type names, then its base classes'.
             if let Some(c) = &f.cls {
                 for k in std::iter::once(c).chain(f.bases.iter()) {
@@ -1242,7 +1437,7 @@ impl Rw<'_> {
             if f.types.contains(n) {
                 return Res::Keep;
             }
-            if let Some(q) = f.explicit.get(n) {
+            if let Some(q) = f.explicit.get(n).or(f.bound.borrow().get(n)) {
                 return match self.info.owner(q, n, 0) {
                     Some(o) => Res::To(mangle(&o, n)),
                     None => Res::Keep,
@@ -1253,6 +1448,9 @@ impl Rw<'_> {
                 .iter()
                 .filter_map(|q| self.info.owner(q, n, 0))
                 .collect();
+            if cands.len() == 1 {
+                Self::bind_wild(f, n, |q| self.info.owner(q, n, 0).is_some());
+            }
             match cands.len() {
                 0 => {}
                 1 => return Res::To(mangle(cands.first().unwrap(), n)),
@@ -1282,7 +1480,7 @@ impl Rw<'_> {
             if f.values.contains(n) {
                 return None;
             }
-            if let Some(q) = f.explicit.get(n) {
+            if let Some(q) = f.explicit.get(n).or(f.bound.borrow().get(n)) {
                 return self.info.member_owner(q, n, 0);
             }
             let cands: BTreeSet<String> = f
@@ -1290,6 +1488,9 @@ impl Rw<'_> {
                 .iter()
                 .filter_map(|q| self.info.member_owner(q, n, 0))
                 .collect();
+            if cands.len() == 1 {
+                Self::bind_wild(f, n, |q| self.info.member_owner(q, n, 0).is_some());
+            }
             match cands.len() {
                 0 => {}
                 1 => return cands.into_iter().next(),
@@ -1317,17 +1518,24 @@ impl Rw<'_> {
                     .get(p)
                     .is_some_and(|pi| pi.values.contains(n))
                 {
-                    // The package's own declaration: its subroutines and
-                    // initializers already read their own package's entry
-                    // (including constant evaluation while it registers),
-                    // so the reference stays as written.
-                    return None;
+                    // §26.3: parameter references in package functions and
+                    // classes keep the package's value when a module owns
+                    // the same bare name in the flattened design.
+                    return self.info.pkgs[p].params.contains(n).then(|| p.clone());
                 }
             }
-            if f.values.contains(n) || f.inherits {
+            let inherited = f.inherits
+                && (f.bases.is_empty()
+                    || f.bases.iter().any(|base| {
+                        self.info
+                            .classes
+                            .get(base)
+                            .is_none_or(|ci| ci.values.contains(n))
+                    }));
+            if f.values.contains(n) || inherited {
                 return None;
             }
-            if let Some(q) = f.explicit.get(n) {
+            if let Some(q) = f.explicit.get(n).or(f.bound.borrow().get(n)) {
                 return self.info.value_owner(q, n, 0);
             }
             let cands: BTreeSet<String> = f
@@ -1335,6 +1543,9 @@ impl Rw<'_> {
                 .iter()
                 .filter_map(|q| self.info.value_owner(q, n, 0))
                 .collect();
+            if cands.len() == 1 {
+                Self::bind_wild(f, n, |q| self.info.value_owner(q, n, 0).is_some());
+            }
             match cands.len() {
                 0 => {}
                 1 => return cands.into_iter().next(),
@@ -1369,7 +1580,7 @@ impl Rw<'_> {
             if f.values.contains(n) || f.inherits {
                 return None;
             }
-            if let Some(q) = f.explicit.get(n) {
+            if let Some(q) = f.explicit.get(n).or(f.bound.borrow().get(n)) {
                 return self
                     .info
                     .value_owner(q, n, 0)
@@ -1381,6 +1592,9 @@ impl Rw<'_> {
                 .iter()
                 .filter_map(|q| self.info.value_owner(q, n, 0))
                 .collect();
+            if cands.len() == 1 {
+                Self::bind_wild(f, n, |q| self.info.value_owner(q, n, 0).is_some());
+            }
             match cands.len() {
                 0 => {}
                 1 => {
@@ -1781,14 +1995,65 @@ impl Rw<'_> {
                         self.expr(m);
                     }
                 }
-                UnpackedDimension::Associative { data_type, .. } => {
+                UnpackedDimension::Associative { data_type, span } => {
                     if let Some(t) = data_type {
+                        if let Some(size) = self.contested_size_name(t, *span) {
+                            *d = UnpackedDimension::Expression {
+                                expr: Box::new(size),
+                                span: *span,
+                            };
+                            continue;
+                        }
                         self.dtype(t);
                     }
                 }
                 UnpackedDimension::Unsized(_) => {}
             }
         }
+    }
+
+    /// §7.4.2 / §26.3: `x[N]` with a bare `N` parses as an associative
+    /// dimension keyed by the type `N`, and is a fixed size when `N` names a
+    /// constant. When two packages (or a package and `$unit`) declare the
+    /// value `N`, the one this scope sees is found by the §26.3 rules, like
+    /// any other reference to it: the explicit import `import q::N;` of a
+    /// module wins over the compilation unit's `import r::*;`. The size is
+    /// then spelled `q::N`, the qualified lookup — the elaborator's own
+    /// resolution of a bare size name read the flat table, where the
+    /// compilation unit's wildcard import had registered `r::N` (#895).
+    fn contested_size_name(&mut self, t: &DataType, span: crate::ast::Span) -> Option<Expression> {
+        let DataType::TypeReference {
+            name,
+            dimensions,
+            type_args,
+            ..
+        } = t
+        else {
+            return None;
+        };
+        if !name.scopes.is_empty() || !dimensions.is_empty() || !type_args.is_empty() {
+            return None;
+        }
+        let n = name.name.name.as_str();
+        // A type of that name in scope keeps the associative reading.
+        if !matches!(self.resolve(n), Res::Keep)
+            || self.frames.iter().any(|f| f.types.contains(n))
+            || !self.info.colliding_values.contains(n)
+        {
+            return None;
+        }
+        let pkg = self.resolve_value(n)?;
+        let member = crate::ast::Identifier {
+            name: n.to_string(),
+            span: name.name.span,
+        };
+        Some(Expression::new(
+            ExprKind::MemberAccess {
+                expr: Box::new(ident_expr(pkg, span)),
+                member,
+            },
+            span,
+        ))
     }
 
     fn opt(&mut self, e: &mut Option<Expression>) {
@@ -1848,6 +2113,15 @@ impl Rw<'_> {
                 self.expr(expr);
             }
             ExprKind::Ident(h) => {
+                if h.root.is_none() && h.path.len() > 1 {
+                    let n = &h.path[0].name.name;
+                    if self.info.hiding.contains(n)
+                        && !self.value_shadowed(n)
+                        && let Res::To(named) = self.resolve(n)
+                    {
+                        h.path[0].name.name = named;
+                    }
+                }
                 // A renamed package variable (see `mangled_vars`), as
                 // `Q::v...` or bare: spell it by its storage name and keep the
                 // selects and member path.
@@ -1897,7 +2171,9 @@ impl Rw<'_> {
                             return;
                         }
                     }
-                    if (self.info.colliding.contains(n) || self.info.class_colliding.contains(n))
+                    if (self.info.colliding.contains(n)
+                        || self.info.class_colliding.contains(n)
+                        || self.info.hiding.contains(n))
                         && !self.value_shadowed(n)
                     {
                         // Expression positions only rename; an ambiguous
@@ -2010,7 +2286,35 @@ impl Rw<'_> {
                 self.expr(expr);
                 self.pattern(pattern);
             }
-            ExprKind::Specialization { base, .. } => self.expr(base),
+            ExprKind::Specialization {
+                base,
+                type_args_text: args_text,
+            } => {
+                self.expr(base);
+                // §8.25: the parser retains specialization operands as
+                // tokens. Qualify lexical class references there as well,
+                // preserving strings, named formals and explicit scopes.
+                if !self.info.hiding.is_empty() {
+                    use crate::lexer::{Lexer, TokenKind};
+                    let tokens = Lexer::new(args_text).tokenize();
+                    let mut edits = Vec::new();
+                    for (i, token) in tokens.iter().enumerate() {
+                        if token.kind == TokenKind::Identifier
+                            && self.info.hiding.contains(&token.text)
+                            && !self.value_shadowed(&token.text)
+                            && !i.checked_sub(1).is_some_and(|p| {
+                                matches!(tokens[p].kind, TokenKind::Dot | TokenKind::DoubleColon)
+                            })
+                            && let Res::To(named) = self.resolve(&token.text)
+                        {
+                            edits.push((token.span, named));
+                        }
+                    }
+                    for (span, named) in edits.into_iter().rev() {
+                        args_text.replace_range(span.start..span.end, &named);
+                    }
+                }
+            }
             ExprKind::Index { expr, index } => {
                 self.expr(expr);
                 self.expr(index);
@@ -2056,6 +2360,10 @@ impl Rw<'_> {
                 self.expr(body);
             }
             ExprKind::ShallowCopy { source } => self.expr(source),
+            ExprKind::TypedPattern { ty, pattern } => {
+                self.dtype(ty);
+                self.expr(pattern);
+            }
             ExprKind::Number(_)
             | ExprKind::StringLiteral(_)
             | ExprKind::Dollar
@@ -2267,6 +2575,11 @@ impl Rw<'_> {
                 }
             },
             StatementKind::VarDecl {
+                data_type,
+                declarators,
+                ..
+            }
+            | StatementKind::ParamDecl {
                 data_type,
                 declarators,
                 ..
@@ -2732,11 +3045,19 @@ impl Rw<'_> {
 
     fn module_body(
         &mut self,
+        name: &str,
         params: &mut [ParameterDeclaration],
         ports: &mut PortList,
         items: &mut [ModuleItem],
     ) {
-        let f = Self::module_frame(params, ports, items);
+        // §23.2/§6.5: body classes are not visible in header defaults.
+        let mut f = Self::module_frame(params, ports, &[]);
+        f.module = Some(name.to_string());
+        for it in items.iter() {
+            if let ModuleItem::ImportDeclaration(imp) = it {
+                f.add_imports(imp);
+            }
+        }
         self.frames.push(f);
         params.iter_mut().for_each(|p| self.param_decl(p));
         if let PortList::Ansi(v) = ports {
@@ -2748,7 +3069,22 @@ impl Rw<'_> {
                 self.opt(&mut p.default);
             }
         }
+        let mut body = Frame::default();
+        // §23.2/§26.3: the header and body form one module scope.
+        // Body imports cannot capture names already declared in the header.
+        for pd in params.iter() {
+            param_names(pd, &mut body.types, &mut body.values);
+        }
+        match ports {
+            PortList::Ansi(v) => body.values.extend(v.iter().map(|p| p.name.name.clone())),
+            PortList::NonAnsi(v) => body.values.extend(v.iter().map(|p| p.name.clone())),
+            PortList::Empty => {}
+        }
+        self.module_class_bindings(items, &mut body);
+        module_item_names(items, &mut body);
+        self.frames.push(body);
         items.iter_mut().for_each(|i| self.module_item(i));
+        self.frames.pop();
         self.frames.pop();
     }
 
@@ -2776,6 +3112,12 @@ impl Rw<'_> {
                 self.param_decl(p)
             }
             ModuleItem::TypedefDeclaration(td) => {
+                if (td.forward || matches!(td.data_type, DataType::Void(_)))
+                    && self.info.hiding.contains(&td.name.name)
+                    && let Res::To(named) = self.resolve(&td.name.name)
+                {
+                    td.name.name = named;
+                }
                 self.dtype(&mut td.data_type);
                 self.unpacked(&mut td.dimensions);
             }
@@ -2834,7 +3176,17 @@ impl Rw<'_> {
             ModuleItem::FunctionDeclaration(f) => self.function(f),
             ModuleItem::TaskDeclaration(t) => self.task(t),
             ModuleItem::ImportDeclaration(imp) => self.import_decl(imp),
-            ModuleItem::ClassDeclaration(c) => self.class(c),
+            ModuleItem::ClassDeclaration(c) => {
+                if self.info.hiding.contains(&c.name.name)
+                    && let Res::To(named) = self.resolve(&c.name.name)
+                {
+                    c.name.name = named.clone();
+                    if let Some(end) = &mut c.endlabel {
+                        end.name = named;
+                    }
+                }
+                self.class(c)
+            }
             ModuleItem::AssertionItem(a) => self.assertion(a),
             ModuleItem::PropertyDeclaration(p) => {
                 p.items.iter_mut().for_each(|s| self.stmt(s));
@@ -2880,7 +3232,7 @@ impl Rw<'_> {
             }
             ModuleItem::NestedModule(m) => {
                 let m = &mut **m;
-                self.module_body(&mut m.params, &mut m.ports, &mut m.items);
+                self.module_body(&m.name.name, &mut m.params, &mut m.ports, &mut m.items);
             }
             ModuleItem::AliasDecl(v) => v.iter_mut().for_each(|x| self.expr(x)),
             ModuleItem::GenvarDeclaration(_)
@@ -2894,10 +3246,26 @@ impl Rw<'_> {
     /// §27: each generate block owns its declarations, not its parent.
     fn generate_body(&mut self, items: &mut [ModuleItem]) {
         let mut frame = Frame::default();
+        self.module_class_bindings(items, &mut frame);
         module_item_names(items, &mut frame);
         self.frames.push(frame);
         items.iter_mut().for_each(|item| self.module_item(item));
         self.frames.pop();
+    }
+
+    fn module_class_bindings(&self, items: &[ModuleItem], frame: &mut Frame) {
+        let Some(owner) = self.frames.iter().rev().find_map(|f| f.module.as_deref()) else {
+            return;
+        };
+        for item in items {
+            if let ModuleItem::ClassDeclaration(c) = item
+                && self.info.hiding.contains(&c.name.name)
+            {
+                frame
+                    .module_classes
+                    .insert(c.name.name.clone(), self.info.module_class_name(owner, c));
+            }
+        }
     }
 
     fn class_name_string(&mut self, s: &mut String) {
@@ -2969,7 +3337,12 @@ impl Rw<'_> {
                 self.frames.pop();
             }
             PackageItem::Let(l) => self.expr(&mut l.expr),
-            PackageItem::Nettype(n) => self.dtype(&mut n.data_type),
+            PackageItem::Nettype(n) => {
+                if let Some(m) = renamed(&n.name.name) {
+                    n.name.name = m;
+                }
+                self.dtype(&mut n.data_type);
+            }
             PackageItem::Property(p) => {
                 p.items.iter_mut().for_each(|s| self.stmt(s));
                 self.opt(&mut p.body);
@@ -2988,13 +3361,25 @@ impl Rw<'_> {
         }
     }
 
+    /// A `$unit` import, added to the compilation-unit frame where the walk
+    /// reaches it.
+    fn unit_import(&mut self, imp: &ImportDeclaration) {
+        if let Some(unit) = self.frames.first_mut() {
+            unit.add_imports(imp);
+        }
+    }
+
     fn description(&mut self, d: &mut Description) {
         match d {
-            Description::Module(m) => self.module_body(&mut m.params, &mut m.ports, &mut m.items),
-            Description::Interface(m) => {
-                self.module_body(&mut m.params, &mut m.ports, &mut m.items)
+            Description::Module(m) => {
+                self.module_body(&m.name.name, &mut m.params, &mut m.ports, &mut m.items)
             }
-            Description::Program(m) => self.module_body(&mut m.params, &mut m.ports, &mut m.items),
+            Description::Interface(m) => {
+                self.module_body(&m.name.name, &mut m.params, &mut m.ports, &mut m.items)
+            }
+            Description::Program(m) => {
+                self.module_body(&m.name.name, &mut m.params, &mut m.ports, &mut m.items)
+            }
             Description::Package(p) => {
                 // A package sees its own declarations and imports, not the
                 // compilation unit's imports.
@@ -3021,8 +3406,18 @@ impl Rw<'_> {
                 self.dtype(&mut td.data_type);
                 self.unpacked(&mut td.dimensions);
             }
-            Description::ImportDecl(imp) => self.import_decl(imp),
-            Description::PackageItem(pi) => self.package_item(None, pi),
+            Description::ImportDecl(imp) => {
+                // §26.3: keep the source spelling in the lexical frame before
+                // rewriting a colliding declaration to its qualified key.
+                self.unit_import(imp);
+                self.import_decl(imp);
+            }
+            Description::PackageItem(pi) => {
+                if let PackageItem::Import(imp) = pi {
+                    self.unit_import(imp);
+                }
+                self.package_item(None, pi);
+            }
             Description::DPIImport(di) => self.dpi(&mut di.proto),
             Description::DPIExport(de) => self.dpi(&mut de.proto),
             Description::Bind(b) => self.instantiation(&mut b.instantiation),
@@ -3061,6 +3456,9 @@ fn module_item_names(items: &[ModuleItem], f: &mut Frame) {
                 f.types.insert(td.name.name.clone());
                 enum_members(&td.data_type, &mut f.values);
             }
+            ModuleItem::NettypeDeclaration(n) => {
+                f.types.insert(n.name.name.clone());
+            }
             ModuleItem::ClassDeclaration(c) => {
                 f.types.insert(c.name.name.clone());
             }
@@ -3075,6 +3473,12 @@ fn module_item_names(items: &[ModuleItem], f: &mut Frame) {
             }
             ModuleItem::TaskDeclaration(td) => {
                 f.values.insert(td.name.name.name.clone());
+            }
+            ModuleItem::DPIImport(di) => {
+                f.values.insert(match &di.proto {
+                    DPIProto::Function(fd) => fd.name.name.name.clone(),
+                    DPIProto::Task(td) => td.name.name.name.clone(),
+                });
             }
             ModuleItem::LetDeclaration(l) => {
                 f.values.insert(l.name.name.clone());
@@ -3147,7 +3551,7 @@ endmodule
                     StatementKind::SeqBlock { stmts, .. } => stmts,
                     _ => panic!("expected a block"),
                 },
-                ModuleItem::FunctionDeclaration(f) => f.items,
+                ModuleItem::FunctionDeclaration(f) => f.items.into_vec(),
                 _ => continue,
             };
             assert_eq!(declared_type(&stmts[0]), "copper::word_t");
@@ -3237,4 +3641,65 @@ endmodule
             expected.map(|(name, ty)| (name.to_string(), ty.to_string()))
         );
     }
+
+    /// The packages each module's `mode_t` resolves to, in module order.
+    fn module_mode_owners(source: &str) -> Result<Vec<String>, String> {
+        let mut parsed = crate::parse(source);
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+        qualify_colliding_package_types(&mut parsed.source.descriptions)?;
+        Ok(parsed
+            .source
+            .descriptions
+            .iter()
+            .filter_map(|d| match d {
+                Description::Module(m) => {
+                    let text = format!("{:?}", m.items);
+                    Some(
+                        ["pkg_one", "pkg_two"]
+                            .into_iter()
+                            .find(|p| text.contains(&format!("\"{p}::mode_t\"")))
+                            .unwrap_or("none")
+                            .to_string(),
+                    )
+                }
+                _ => None,
+            })
+            .collect())
+    }
+
+    const MODE_PKGS: &str = "package pkg_one; typedef enum logic [1:0] { A1 } mode_t; endpackage\n\
+                             package pkg_two; typedef enum logic [3:0] { B1 } mode_t; endpackage\n";
+
+    /// §26.3 (#620): a `$unit` wildcard import counts from where it appears,
+    /// and the first reference that finds a name through one makes it locally
+    /// visible: a later wildcard import of another package declaring it does
+    /// not change it, and the order of the imports decides.
+    #[test]
+    fn unit_wildcard_binds_at_the_first_reference() {
+        let a = "import pkg_one::*;\nmodule probe_a; mode_t m; endmodule\n";
+        let b = "import pkg_two::*;\nmodule probe_b; mode_t m; endmodule\n";
+        let c = "module probe_c; mode_t m; endmodule\n";
+        assert_eq!(
+            module_mode_owners(&format!("{MODE_PKGS}{a}{b}{c}")).unwrap(),
+            ["pkg_one", "pkg_one", "pkg_one"]
+        );
+        assert_eq!(
+            module_mode_owners(&format!("{MODE_PKGS}{b}{a}{c}")).unwrap(),
+            ["pkg_two", "pkg_two", "pkg_two"]
+        );
+    }
+
+    /// §26.3: both wildcard imports before the first reference, in `$unit`
+    /// or in the module, still make the name ambiguous.
+    #[test]
+    fn two_wildcard_imports_before_a_reference_conflict() {
+        for src in [
+            "import pkg_one::*;\nimport pkg_two::*;\nmodule t; mode_t m; endmodule\n",
+            "module t; import pkg_one::*; import pkg_two::*; mode_t m; endmodule\n",
+        ] {
+            let err = module_mode_owners(&format!("{MODE_PKGS}{src}")).unwrap_err();
+            assert!(err.contains("more than one wildcard-imported package"), "{err}");
+        }
+    }
+
 }

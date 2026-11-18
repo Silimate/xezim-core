@@ -5,7 +5,6 @@ use crate::ast::expr::{BinaryOp, ExprKind, Expression, NumberBase, NumberLiteral
 use crate::ast::stmt::*;
 use crate::ast::types::{DataType, Lifetime, SimpleType};
 use crate::lexer::token::TokenKind;
-use std::cell::Cell;
 use std::collections::HashMap;
 
 impl Parser {
@@ -24,6 +23,7 @@ impl Parser {
             let stmt_starter = matches!(
                 after_colon,
                 TokenKind::KwAssert | TokenKind::KwAssume | TokenKind::KwCover
+                    | TokenKind::KwRestrict
                     | TokenKind::KwExpect | TokenKind::KwBegin | TokenKind::KwFork
                     | TokenKind::KwIf | TokenKind::KwCase | TokenKind::KwCasex
                     | TokenKind::KwCasez | TokenKind::KwFor | TokenKind::KwForeach
@@ -92,8 +92,7 @@ impl Parser {
                 self.parse_case_statement()
             }
             TokenKind::KwParameter | TokenKind::KwLocalparam => {
-                // Local `parameter`/`localparam` inside a procedural block is
-                // semantically equivalent to a const var decl with an init.
+                let is_local = self.at(TokenKind::KwLocalparam);
                 let decl = self.parse_parameter_decl_stmt();
                 let span = self.span_from(start);
                 if let crate::ast::decl::ParameterKind::Data {
@@ -101,64 +100,20 @@ impl Parser {
                     assignments,
                 } = decl.kind
                 {
-                    // §6.20.2: an UNTYPED local `localparam`/`parameter` is
-                    // SELF-DETERMINED from its initializer — NOT the 1-bit that
-                    // an implicit `logic` resolves to (which truncates
-                    // `localparam Q = 24;` to 0). Infer a concrete type from
-                    // the first init: a real literal → real, a string → string,
-                    // otherwise a 32-bit signed integer. (A genuine `var v =
-                    // 24;` keeps its 1-bit `logic` type — this only rewrites the
-                    // localparam/parameter path, where the identity is known.)
-                    let is_implicit_untyped = matches!(
-                        &data_type,
-                        crate::ast::types::DataType::Implicit { dimensions, .. }
-                            if dimensions.is_empty()
-                    );
-                    let data_type = if is_implicit_untyped {
-                        use crate::ast::expr::{ExprKind, NumberLiteral};
-                        let init0 = assignments.first().and_then(|a| a.init.as_ref());
-                        match init0.map(|e| &e.kind) {
-                            Some(ExprKind::Number(NumberLiteral::Real(_))) => {
-                                crate::ast::types::DataType::Real {
-                                    kind: crate::ast::types::RealType::Real,
-                                    span,
-                                }
-                            }
-                            Some(ExprKind::StringLiteral(_)) => {
-                                crate::ast::types::DataType::Simple {
-                                    kind: crate::ast::types::SimpleType::String,
-                                    span,
-                                }
-                            }
-                            _ => crate::ast::types::DataType::IntegerAtom {
-                                kind: crate::ast::types::IntegerAtomType::Int,
-                                signing: Some(crate::ast::types::Signing::Signed),
-                                span,
-                            },
-                        }
-                    } else {
-                        data_type
-                    };
                     let declarators: Vec<VarDeclarator> = assignments
                         .into_iter()
                         .map(|a| VarDeclarator {
+                            decl: crate::ast::binding::Bound::UNSET,
                             name: a.name,
                             dimensions: a.dimensions,
                             init: a.init,
                             span: a.span,
                         })
                         .collect();
-                    // §6.20.4: a block-scope localparam/parameter is a
-                    // CONSTANT — mark the lowered decl `static` so the §6.21
-                    // implicitly-static check (which targets variables with
-                    // initializers) does not fire on it. A localparam MUST
-                    // carry an initializer; the reference accepts it inside
-                    // static tasks (customer testbench task-body
-                    // `localparam int MIN = 24;` was wrongly rejected).
                     return Statement::new(
-                        StatementKind::VarDecl {
+                        StatementKind::ParamDecl {
+                            is_local,
                             data_type,
-                            lifetime: Some(crate::ast::types::Lifetime::Static),
                             declarators,
                         },
                         span,
@@ -291,6 +246,21 @@ impl Parser {
                         self.bump();
                     }
                 }
+                // XEZIM_RELAX_STATIC_CONST (#624): `static const int k = 3;`
+                // puts `const` after the lifetime, which A.2.1.3 does not
+                // allow; read it as `const static`, as other tools do.
+                if lifetime.is_some()
+                    && self.at(TokenKind::KwConst)
+                    && crate::RELAX_STATIC_CONST.get()
+                {
+                    let span = self.bump().span;
+                    self.diagnostics
+                        .push(crate::diagnostics::Diagnostic::warning(
+                            "`const` belongs before the lifetime; read as `const static` \
+                             (IEEE 1800-2023 §6.20.6, A.2.1.3, XEZIM_RELAX_STATIC_CONST)",
+                            span,
+                        ));
+                }
                 let data_type = if self.is_data_type_keyword() || self.at(TokenKind::Identifier) {
                     self.parse_data_type()
                 } else {
@@ -311,6 +281,7 @@ impl Parser {
                         None
                     };
                     declarators.push(VarDeclarator {
+                        decl: crate::ast::binding::Bound::UNSET,
                         name,
                         dimensions,
                         init,
@@ -340,16 +311,8 @@ impl Parser {
                     self.expect(TokenKind::Semicolon);
                     Statement::new(StatementKind::DisableFork, self.span_from(start))
                 } else {
-                    // §9.6.2: the disable target may be a HIERARCHICAL block or
-                    // task name (`disable top.be_name`). Runtime resolution is by
-                    // the block LABEL (the leaf), so consume the dotted path and
-                    // keep its last segment. Previously a `.` after the first
-                    // identifier errored ("expected Semicolon, found Dot").
-                    let mut name = self.parse_identifier();
-                    while self.at(TokenKind::Dot) {
-                        self.bump();
-                        name = self.parse_identifier();
-                    }
+                    // §9.6.2: a task or block name, possibly hierarchical.
+                    let name = self.parse_hierarchical_identifier();
                     self.expect(TokenKind::Semicolon);
                     Statement::new(StatementKind::Disable(name), self.span_from(start))
                 }
@@ -361,6 +324,12 @@ impl Parser {
                     Some(lowered) => lowered,
                     None => Statement::new(StatementKind::Assertion(a), span),
                 }
+            }
+            // §16.14.4: a restriction is for formal tools; a simulator
+            // reads it and checks nothing (#614).
+            TokenKind::KwRestrict => {
+                self.skip_restrict_property();
+                Statement::new(StatementKind::Null, self.span_from(start))
             }
             TokenKind::KwAssert | TokenKind::KwAssume | TokenKind::KwCover => {
                 let mut a = self.parse_assertion_statement();
@@ -779,6 +748,7 @@ impl Parser {
                         None
                     };
                     declarators.push(VarDeclarator {
+                        decl: crate::ast::binding::Bound::UNSET,
                         name,
                         dimensions,
                         init,
@@ -821,6 +791,7 @@ impl Parser {
                         None
                     };
                     declarators.push(VarDeclarator {
+                        decl: crate::ast::binding::Bound::UNSET,
                         name,
                         dimensions,
                         init,
@@ -865,6 +836,7 @@ impl Parser {
                         None
                     };
                     declarators.push(VarDeclarator {
+                        decl: crate::ast::binding::Bound::UNSET,
                         name,
                         dimensions,
                         init,
@@ -918,6 +890,7 @@ impl Parser {
                         None
                     };
                     declarators.push(VarDeclarator {
+                        decl: crate::ast::binding::Bound::UNSET,
                         name,
                         dimensions,
                         init,
@@ -998,6 +971,7 @@ impl Parser {
                         None
                     };
                     declarators.push(VarDeclarator {
+                        decl: crate::ast::binding::Bound::UNSET,
                         name,
                         dimensions,
                         init,
@@ -1258,6 +1232,7 @@ impl Parser {
             self.parse_block_item(&mut stmts);
         }
         self.pop_let_scope();
+        self.check_block_redeclarations(&mut stmts);
         self.expect(TokenKind::KwEnd);
         // §9.3.4: an end label must match the block name (if any).
         match name {
@@ -1298,6 +1273,7 @@ impl Parser {
             self.parse_block_item(&mut stmts);
         }
         self.pop_let_scope();
+        self.check_block_redeclarations(&mut stmts);
         let join_type = match self.current_kind() {
             TokenKind::KwJoin_any => {
                 self.bump();
@@ -1411,6 +1387,20 @@ impl Parser {
         self.expect(TokenKind::RParen);
         // Check for "inside" keyword
         let kind = if kind == CaseKind::Case && self.eat(TokenKind::KwInside).is_some() {
+            CaseKind::CaseInside
+        } else if matches!(kind, CaseKind::Casex | CaseKind::Casez)
+            && self.at(TokenKind::KwInside)
+            && crate::RELAX_CASEX_INSIDE.get()
+        {
+            // XEZIM_RELAX_CASEX_INSIDE (#626): only `case` takes `inside`
+            // (A.6.7); read `casex (e) inside` as `case (e) inside`.
+            let span = self.bump().span;
+            self.diagnostics
+                .push(crate::diagnostics::Diagnostic::warning(
+                    "`inside` follows only `case`; read as `case (...) inside` \
+                     (IEEE 1800-2023 §12.5.4, A.6.7, XEZIM_RELAX_CASEX_INSIDE)",
+                    span,
+                ));
             CaseKind::CaseInside
         } else {
             kind
@@ -1930,9 +1920,36 @@ impl Parser {
             let events = self.parse_event_expression_list();
             self.expect(TokenKind::RParen);
             EventControl::EventExpr(events)
+        } else if self.at(TokenKind::KwThis) && crate::RELAX_EVENT_THIS.get() {
+            // XEZIM_RELAX_EVENT_THIS (#625): a hierarchical identifier cannot
+            // start with `this` (A.6.5), so `@this.ev` needs parentheses;
+            // read it as `@(this.ev)`, as other tools do.
+            let span = self.current().span;
+            self.diagnostics
+                .push(crate::diagnostics::Diagnostic::warning(
+                    "an event control on `this.` needs parentheses; read as `@(this. ...)` \
+                     (IEEE 1800-2017 §9.4.2, A.6.5, XEZIM_RELAX_EVENT_THIS)",
+                    span,
+                ));
+            EventControl::EventExpr(self.parse_event_expression_term())
         } else {
+            let start = self.current().span.start;
             let expr = self.parse_hierarchical_identifier_expr();
-            EventControl::HierIdentifier(expr)
+            // §9.4.2: `@name` is `@(name)`. A plain identifier keeps the bare
+            // form; a member name (`@vif.cb`, `@h.ev`) takes the one-term
+            // event expression the parenthesized spelling builds, so it
+            // resolves through bound vifs and clocking blocks the same way.
+            // As a bare form `@vif.cb` had no sensitivity and returned at once.
+            if matches!(expr.kind, ExprKind::Ident(_)) {
+                EventControl::HierIdentifier(expr)
+            } else {
+                EventControl::EventExpr(vec![EventExpr {
+                    edge: None,
+                    expr,
+                    iff: None,
+                    span: self.span_from(start),
+                }])
+            }
         }
     }
 
@@ -2000,6 +2017,25 @@ impl Parser {
             iff,
             span: self.span_from(start),
         }]
+    }
+
+    /// §16.14.4 `restrict property ( property_spec ) ;`: a constraint for
+    /// formal tools, which a simulator does not check. Consumed whole.
+    pub(super) fn skip_restrict_property(&mut self) {
+        self.bump(); // restrict
+        self.expect(TokenKind::KwProperty);
+        if self.eat(TokenKind::LParen).is_some() {
+            let mut depth = 1usize;
+            while depth > 0 && !self.at(TokenKind::Eof) {
+                match self.current_kind() {
+                    TokenKind::LParen => depth += 1,
+                    TokenKind::RParen => depth -= 1,
+                    _ => {}
+                }
+                self.bump();
+            }
+        }
+        self.expect(TokenKind::Semicolon);
     }
 
     pub(super) fn parse_assertion_statement(&mut self) -> AssertionStatement {
@@ -2178,7 +2214,7 @@ impl Parser {
                         signed: false,
                         base: NumberBase::Decimal,
                         value: delay.to_string(),
-                        cached_val: Cell::new(None),
+                        cached_val: crate::ast::cache::LiteralCache::new(None),
                     }),
                     span,
                 );
@@ -2410,7 +2446,7 @@ impl Parser {
                 signed: true,
                 base: NumberBase::Decimal,
                 value: "1".into(),
-                cached_val: Cell::new(None),
+                cached_val: crate::ast::cache::LiteralCache::new(None),
             }),
             span,
         );
@@ -2447,6 +2483,7 @@ impl Parser {
 
     fn parse_rs_seq(&mut self) -> RsSeq {
         let mut items = Vec::new();
+        let mark = self.rs_values.len();
         loop {
             match self.current_kind() {
                 TokenKind::BitOr
@@ -2461,8 +2498,12 @@ impl Parser {
                 _ => {}
             }
             let item = self.parse_rs_prod();
+            if let RsProd::Ref(name, _) = &item {
+                self.rs_values.push(name.clone());
+            }
             items.push(item);
         }
+        self.rs_values.truncate(mark);
         RsSeq { items }
     }
 
@@ -2690,7 +2731,7 @@ fn expand_alt(prods: &ProdMap, alt: &RsAlt, depth: &mut u32, span: crate::ast::S
                 signed: true,
                 base: NumberBase::Decimal,
                 value: "1".into(),
-                cached_val: Cell::new(None),
+                cached_val: crate::ast::cache::LiteralCache::new(None),
             }),
             sp,
         )
@@ -2735,6 +2776,7 @@ fn expand_prod(prods: &ProdMap, p: &RsProd, depth: &mut u32, span: crate::ast::S
             let mut stmts: Vec<Statement> = Vec::new();
             for ((dt, pname), arg) in params.iter().zip(args.iter()) {
                 let declarator = VarDeclarator {
+                    decl: crate::ast::binding::Bound::UNSET,
                     name: crate::ast::Identifier {
                         name: pname.clone(),
                         span,

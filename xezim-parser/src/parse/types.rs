@@ -59,6 +59,19 @@ impl Parser {
         )
     }
 
+    /// The identifier spelling of a `virtual <iface>` type argument
+    /// (`virtual mem_if#(8,8)`) from the tokens that follow `virtual`.
+    pub(super) fn virtual_type_arg_text(toks: &[String]) -> String {
+        let compact = toks
+            .join(" ")
+            .replace(" # ", "#")
+            .replace("# (", "#(")
+            .replace("( ", "(")
+            .replace(" )", ")")
+            .replace(" ,", ",");
+        format!("virtual {}", compact)
+    }
+
     pub(super) fn parse_data_type(&mut self) -> DataType {
         let start = self.current().span.start;
         match self.current_kind() {
@@ -228,6 +241,7 @@ impl Parser {
                             scopes: Vec::new(),
                             name: crate::ast::Identifier { name: cls, span },
                             span,
+                            bound: Default::default(),
                         };
                         return DataType::TypeReference {
                             name,
@@ -315,6 +329,7 @@ impl Parser {
         let mut type_args: Vec<crate::ast::expr::Expression> = Vec::new();
         if self.eat(TokenKind::Hash).is_some() {
             if self.eat(TokenKind::LParen).is_some() {
+                self.check_param_list_form();
                 if !self.at(TokenKind::RParen) {
                     loop {
                         if self.eat(TokenKind::Dot).is_some() {
@@ -376,14 +391,7 @@ impl Parser {
                             if toks.is_empty() {
                                 toks.push(tok_text.clone());
                             }
-                            let raw = toks.join(" ");
-                            let compact = raw
-                                .replace(" # ", "#")
-                                .replace("# (", "#(")
-                                .replace("( ", "(")
-                                .replace(" )", ")")
-                                .replace(" ,", ",");
-                            let full_name = format!("virtual {}", compact);
+                            let full_name = Self::virtual_type_arg_text(&toks);
                             let sp = self.span_from(start);
                             let id = crate::ast::Identifier {
                                 name: full_name,
@@ -399,8 +407,9 @@ impl Parser {
                                     selects: Vec::new(),
                                 }],
                                 span: sp,
-                                cached_signal_id: std::cell::Cell::new(None),
-                                cached_resolved_name: std::cell::OnceCell::new(),
+                                cached_signal_id: crate::ast::cache::SignalCache::new(None),
+                                cached_resolved_name: crate::ast::cache::NameCache::new(),
+                                bound: crate::ast::binding::Bound::UNSET,
                             };
                             type_args.push(crate::ast::expr::Expression::new(
                                 crate::ast::expr::ExprKind::Ident(hier),
@@ -471,8 +480,9 @@ impl Parser {
                 selects: Vec::new(),
             }],
             span: sp,
-            cached_signal_id: std::cell::Cell::new(None),
-            cached_resolved_name: std::cell::OnceCell::new(),
+            cached_signal_id: crate::ast::cache::SignalCache::new(None),
+            cached_resolved_name: crate::ast::cache::NameCache::new(),
+            bound: crate::ast::binding::Bound::UNSET,
         };
         crate::ast::expr::Expression::new(crate::ast::expr::ExprKind::Ident(hier), sp)
     }
@@ -524,6 +534,7 @@ impl Parser {
             scopes,
             name,
             span: self.span_from(start),
+            bound: Default::default(),
         }
     }
 
@@ -663,7 +674,7 @@ impl Parser {
                                     signed: false,
                                     base: crate::ast::expr::NumberBase::Decimal,
                                     value: v.to_string(),
-                                    cached_val: std::cell::Cell::new(None),
+                                    cached_val: crate::ast::cache::LiteralCache::new(None),
                                 },
                             ),
                             span,
@@ -817,7 +828,26 @@ impl Parser {
                 span: self.span_from(start),
             });
         }
-        let base_type = if self.is_data_type_keyword() || self.at(TokenKind::Identifier) {
+        // XEZIM_RELAX_ENUM_NO_BASE (#623): `enum [1:0] {...}` has a packed
+        // dimension and no base type, which §6.19's enum_base_type does not
+        // allow; read it as `enum bit [1:0]`, as other tools do.
+        let base_type = if self.at(TokenKind::LBracket) && crate::RELAX_ENUM_NO_BASE.get() {
+            let bstart = self.current().span.start;
+            let dimensions = self.parse_packed_dimensions();
+            let span = self.span_from(bstart);
+            self.diagnostics
+                .push(crate::diagnostics::Diagnostic::warning(
+                    "an enum with a packed dimension needs a base type; read as `bit` \
+                     (IEEE 1800-2023 §6.19, XEZIM_RELAX_ENUM_NO_BASE)",
+                    span,
+                ));
+            Some(Box::new(DataType::IntegerVector {
+                kind: crate::ast::types::IntegerVectorType::Bit,
+                signing: None,
+                dimensions,
+                span,
+            }))
+        } else if self.is_data_type_keyword() || self.at(TokenKind::Identifier) {
             // §6.19.1 (grammar A.2.2.1): `enum_base_type` may be a
             // `type_identifier`, and there is NO enum name between `enum` and `{`.
             // An identifier here was being discarded as a supposed "enum name", so
@@ -880,7 +910,7 @@ impl Parser {
                                 signed: false,
                                 base: crate::ast::expr::NumberBase::Decimal,
                                 value: "0".to_string(),
-                                cached_val: std::cell::Cell::new(None),
+                                cached_val: crate::ast::cache::LiteralCache::new(None),
                             },
                         ),
                         sp,
@@ -892,7 +922,7 @@ impl Parser {
                                 signed: false,
                                 base: crate::ast::expr::NumberBase::Decimal,
                                 value: "1".to_string(),
-                                cached_val: std::cell::Cell::new(None),
+                                cached_val: crate::ast::cache::LiteralCache::new(None),
                             },
                         ),
                         sp,

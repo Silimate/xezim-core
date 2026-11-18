@@ -29,6 +29,18 @@ pub(crate) enum ConstraintPos {
 }
 
 impl Parser {
+    /// The `edge_identifier` that may open a §14.3 `clocking_skew`.
+    fn parse_clocking_skew_edge(&mut self) -> Option<crate::ast::stmt::Edge> {
+        let edge = match self.current_kind() {
+            TokenKind::KwPosedge => crate::ast::stmt::Edge::Posedge,
+            TokenKind::KwNegedge => crate::ast::stmt::Edge::Negedge,
+            TokenKind::KwEdge => crate::ast::stmt::Edge::Edge,
+            _ => return None,
+        };
+        self.bump();
+        Some(edge)
+    }
+
     /// IEEE 1800-2023 §14.4 clocking skew value after the `#`: `1step`, a
     /// number or time literal, a parameter name, or a parenthesized
     /// expression. `1step` lexes as the integer `1` followed by the
@@ -58,8 +70,9 @@ impl Parser {
                         selects: Vec::new(),
                     }],
                     span: sp,
-                    cached_signal_id: std::cell::Cell::new(None),
-                    cached_resolved_name: std::cell::OnceCell::new(),
+                    cached_signal_id: crate::ast::cache::SignalCache::new(None),
+                    cached_resolved_name: crate::ast::cache::NameCache::new(),
+                    bound: crate::ast::binding::Bound::UNSET,
                 };
                 return Some(Expression::new(ExprKind::Ident(hier), sp));
             }
@@ -86,8 +99,9 @@ impl Parser {
                     selects: Vec::new(),
                 }],
                 span: sp,
-                cached_signal_id: std::cell::Cell::new(None),
-                cached_resolved_name: std::cell::OnceCell::new(),
+                cached_signal_id: crate::ast::cache::SignalCache::new(None),
+                cached_resolved_name: crate::ast::cache::NameCache::new(),
+                bound: crate::ast::binding::Bound::UNSET,
             };
             return Some(Expression::new(ExprKind::Ident(hier), sp));
         }
@@ -144,8 +158,18 @@ impl Parser {
             loop {
                 let name = self.parse_identifier();
                 let span = name.span;
+                // A.2.4 / §16.10: `variable_identifier { variable_dimension }`:
+                // a local may be an unpacked array (`bit flags[3:0];`). It was
+                // a parse error (#618). Its element selects read as the packed
+                // equivalent's, so the dimensions fold into the type.
+                let dims = if self.at(TokenKind::LBracket) {
+                    self.parse_unpacked_dimensions()
+                } else {
+                    Vec::new()
+                };
+                let local_type = self.sva_local_array_type(&data_type, &name, dims);
                 let mut args = vec![
-                    Expression::new(ExprKind::TypeLiteral(Box::new(data_type.clone())), span),
+                    Expression::new(ExprKind::TypeLiteral(Box::new(local_type)), span),
                     Self::sva_ident(name),
                 ];
                 if self.eat(TokenKind::Assign).is_some() {
@@ -163,6 +187,125 @@ impl Parser {
                 }
             }
             self.expect(TokenKind::Semicolon);
+        }
+    }
+
+    /// An assertion local declared with unpacked dimensions, as the packed
+    /// type that selects the same elements: each fixed unpacked dimension
+    /// (`[3:0]`, `[N]` as `[0:N-1]`) outside the element's own packed ones,
+    /// an integer atom element as its sized vector. Any other element type,
+    /// or a dynamic dimension, is an error rather than a silently scalar local.
+    fn sva_local_array_type(
+        &mut self,
+        dt: &DataType,
+        name: &Identifier,
+        dims: Vec<UnpackedDimension>,
+    ) -> DataType {
+        if dims.is_empty() {
+            return dt.clone();
+        }
+        let unsupported = |this: &mut Self, what: &str| {
+            this.diagnostics.push(crate::diagnostics::Diagnostic::error(
+                format!(
+                    "unpacked dimensions on assertion local '{}' {what} are not supported \
+                     (IEEE 1800-2023 §16.10)",
+                    name.name
+                ),
+                name.span,
+            ));
+            dt.clone()
+        };
+        let int = |v: i64, span: crate::ast::Span| {
+            Expression::new(
+                ExprKind::Number(crate::ast::expr::NumberLiteral::Integer {
+                    size: None,
+                    signed: false,
+                    base: crate::ast::expr::NumberBase::Decimal,
+                    value: v.to_string(),
+                    cached_val: crate::ast::cache::LiteralCache::new(None),
+                }),
+                span,
+            )
+        };
+        let mut outer = Vec::new();
+        for d in dims {
+            match d {
+                UnpackedDimension::Range { left, right, span } => {
+                    outer.push(PackedDimension::Range { left, right, span });
+                }
+                UnpackedDimension::Expression { expr, span } => {
+                    let hi = Expression::new(
+                        ExprKind::Binary {
+                            op: crate::ast::expr::BinaryOp::Sub,
+                            left: expr,
+                            right: Box::new(int(1, span)),
+                        },
+                        span,
+                    );
+                    outer.push(PackedDimension::Range {
+                        left: Box::new(int(0, span)),
+                        right: Box::new(hi),
+                        span,
+                    });
+                }
+                _ => return unsupported(self, "that are not fixed-size"),
+            }
+        }
+        let (kind, signing, inner, span) = match dt {
+            DataType::IntegerVector {
+                kind,
+                signing,
+                dimensions,
+                span,
+            } => (*kind, *signing, dimensions.clone(), *span),
+            DataType::IntegerAtom {
+                kind,
+                signing,
+                span,
+            } => {
+                use crate::ast::types::IntegerAtomType as A;
+                let (w, four, signed) = match kind {
+                    A::Byte => (8, false, true),
+                    A::ShortInt => (16, false, true),
+                    A::Int => (32, false, true),
+                    A::LongInt => (64, false, true),
+                    A::Integer => (32, true, true),
+                    A::Time => (64, true, false),
+                };
+                let sign = signing.or(signed.then_some(crate::ast::types::Signing::Signed));
+                let elem = PackedDimension::Range {
+                    left: Box::new(int(w - 1, *span)),
+                    right: Box::new(int(0, *span)),
+                    span: *span,
+                };
+                let k = if four {
+                    crate::ast::types::IntegerVectorType::Logic
+                } else {
+                    crate::ast::types::IntegerVectorType::Bit
+                };
+                (k, sign, vec![elem], *span)
+            }
+            _ => return unsupported(self, "of this element type"),
+        };
+        // §11.8.1: a select of a packed array is unsigned, so a signed
+        // element (`int counts[4]`) reads back unsigned.
+        if signing == Some(crate::ast::types::Signing::Signed) {
+            self.diagnostics
+                .push(crate::diagnostics::Diagnostic::warning(
+                    format!(
+                        "element selects of assertion local '{}' read unsigned: its unpacked \
+                         dimensions fold into a packed array (IEEE 1800-2023 §16.10, §11.8.1)",
+                        name.name
+                    ),
+                    name.span,
+                ));
+        }
+        outer.extend(inner);
+        DataType::IntegerVector {
+            kind,
+            signing,
+            dimensions: outer,
+            span,
         }
     }
 
@@ -619,8 +762,9 @@ impl Parser {
                     selects: Vec::new(),
                 }],
                 span,
-                cached_signal_id: std::cell::Cell::new(None),
-                cached_resolved_name: std::cell::OnceCell::new(),
+                cached_signal_id: crate::ast::cache::SignalCache::new(None),
+                cached_resolved_name: crate::ast::cache::NameCache::new(),
+                bound: crate::ast::binding::Bound::UNSET,
             }),
             span,
         )
@@ -979,6 +1123,87 @@ impl Parser {
         (ports, local_ports)
     }
 
+    /// Whether the bracket groups starting `n` tokens ahead are followed by
+    /// an identifier: `my_t [3:0] x` (a type, packed dimensions, a name), not
+    /// `a [4]` (a name and its unpacked dimensions, §7.4.2, #657).
+    fn dims_then_identifier(&self, mut n: usize) -> bool {
+        while self.peek_kind_n(n) == TokenKind::LBracket {
+            let mut depth = 0usize;
+            loop {
+                match self.peek_kind_n(n) {
+                    TokenKind::LBracket => depth += 1,
+                    TokenKind::RBracket => {
+                        depth -= 1;
+                        if depth == 0 {
+                            n += 1;
+                            break;
+                        }
+                    }
+                    TokenKind::Eof | TokenKind::Semicolon => return false,
+                    _ => {}
+                }
+                n += 1;
+            }
+        }
+        matches!(
+            self.peek_kind_n(n),
+            TokenKind::Identifier | TokenKind::EscapedIdentifier
+        )
+    }
+
+    /// §18.5.1, A.1.11: `constraint C::name { ... }` in a package defines the
+    /// body of the `extern constraint name;` its class `C` of the same package
+    /// declares; the body is put on that prototype (#654).
+    fn parse_package_ooc_constraint(&mut self, items: &mut [PackageItem]) {
+        let start = self.current().span.start;
+        self.expect(TokenKind::KwConstraint);
+        let hid = self.parse_hierarchical_identifier();
+        let mut body = Vec::new();
+        if self.at(TokenKind::LBrace) {
+            self.bump();
+            while !self.at(TokenKind::RBrace) && !self.at(TokenKind::Eof) {
+                body.push(self.parse_constraint_item(ConstraintPos::BlockItem));
+            }
+            self.expect(TokenKind::RBrace);
+        }
+        self.eat(TokenKind::Semicolon);
+        let [.., class, name] = hid.path.as_slice() else {
+            self.diagnostics.push(crate::diagnostics::Diagnostic::error(
+                "an out-of-block constraint names its class: `constraint C::name { ... }` \
+                 (IEEE 1800-2023 §18.5.1)",
+                self.span_from(start),
+            ));
+            return;
+        };
+        let prototype = items.iter_mut().find_map(|it| match it {
+            PackageItem::Class(c) if c.name.name == class.name.name => {
+                c.items.iter_mut().find_map(|ci| match ci {
+                    crate::ast::decl::ClassItem::Constraint(k)
+                        if k.name.name == name.name.name && !k.has_body =>
+                    {
+                        Some(k)
+                    }
+                    _ => None,
+                })
+            }
+            _ => None,
+        });
+        match prototype {
+            Some(k) => {
+                k.items = body;
+                k.has_body = true;
+            }
+            None => self.diagnostics.push(crate::diagnostics::Diagnostic::error(
+                format!(
+                    "class '{}' of this package declares no `extern constraint {};` \
+                     (IEEE 1800-2023 §18.5.1)",
+                    class.name.name, name.name.name
+                ),
+                self.span_from(start),
+            )),
+        }
+    }
+
     pub(super) fn parse_package_declaration(&mut self) -> PackageDeclaration {
         let start = self.current().span.start;
         self.expect(TokenKind::KwPackage);
@@ -989,6 +1214,10 @@ impl Parser {
         let mut items = Vec::new();
         self.push_let_scope();
         while !self.at(TokenKind::KwEndpackage) && !self.at(TokenKind::Eof) {
+            if self.at(TokenKind::KwConstraint) {
+                self.parse_package_ooc_constraint(&mut items);
+                continue;
+            }
             if let Some(item) = self.parse_package_item() {
                 items.push(item);
             } else {
@@ -1087,6 +1316,11 @@ impl Parser {
         if self.is_port_direction() || self.is_data_type_keyword() || self.at(TokenKind::KwVar)
             // §6.6.8 — `interconnect p` opens an ANSI port list too.
             || self.at(TokenKind::KwInterconnect)
+            // §23.2.2.3 — a port kind or an implicit data type, `(wire x)`,
+            // `([5:0] x, wire y)`: the first port gives one, so the list is
+            // ANSI. No non-ANSI port starts with either.
+            || self.is_net_type_keyword()
+            || self.at(TokenKind::LBracket)
             || (self.at(TokenKind::Identifier) && self.peek_kind() == TokenKind::Dot)
             || (self.at(TokenKind::Identifier) && matches!(self.peek_kind(), TokenKind::Identifier | TokenKind::DoubleColon | TokenKind::Hash))
             // LRM §25.9 — `virtual <iface_t> <name>` port form.
@@ -1096,43 +1330,35 @@ impl Parser {
             // LRM §25.3.2 — generic interface port `interface [.mp] <name>`.
             || self.at(TokenKind::KwInterface)
         {
-            let mut ports = Vec::new();
-            let mut last_direction: Option<PortDirection> = None;
-            let mut last_data_type: Option<DataType> = None;
-            let mut last_net_type: Option<NetType> = None;
-            let mut last_var_kw = false;
+            let mut ports: Vec<AnsiPort> = Vec::new();
             loop {
                 if self.at(TokenKind::RParen) || self.at(TokenKind::Eof) {
                     break;
                 }
                 let mut port = self.parse_ansi_port();
-                let direction_was_explicit = port.direction.is_some();
-                if port.direction.is_none() && last_direction.is_some() {
-                    port.direction = last_direction;
+                // §23.2.2.3: a later port that omits its direction, port kind
+                // and data type all three takes all three from the previous
+                // port, as that port ended up (`output var a, b`: b is a
+                // variable too). One that gives any of them takes only an
+                // omitted direction; an omitted kind follows the first-port
+                // rules and an omitted data type is `logic`. So in
+                // `input logic [7:0] d, input clk, rst_n` the port `rst_n` is
+                // a scalar like `clk`, and `wire y` after `inout [5:0] x` is
+                // one bit.
+                if let Some(prev) = ports.last() {
+                    if port.direction.is_none()
+                        && port.net_type.is_none()
+                        && !port.var_kw
+                        && port.data_type.is_none()
+                    {
+                        port.direction = prev.direction;
+                        port.net_type = prev.net_type;
+                        port.var_kw = prev.var_kw;
+                        port.data_type = prev.data_type.clone();
+                    } else if port.direction.is_none() {
+                        port.direction = prev.direction;
+                    }
                 }
-                if port.data_type.is_none() && last_data_type.is_some() && !direction_was_explicit {
-                    port.data_type = last_data_type.clone();
-                }
-                if port.net_type.is_none() && last_net_type.is_some() && !direction_was_explicit {
-                    port.net_type = last_net_type;
-                }
-                // §23.2.2.3: `output var a, b` — b continues the SAME port
-                // declaration and is a variable too. `var` carried across the
-                // comma like the data type; without this b registered as an
-                // untyped default net.
-                if !port.var_kw && last_var_kw && !direction_was_explicit {
-                    port.var_kw = true;
-                }
-                if port.direction.is_some() {
-                    last_direction = port.direction;
-                }
-                if port.data_type.is_some() {
-                    last_data_type = port.data_type.clone();
-                }
-                if port.net_type.is_some() {
-                    last_net_type = port.net_type;
-                }
-                last_var_kw = port.var_kw;
                 // §23.2.2.4: only an input port takes a default value; an
                 // inout is a net.
                 if crate::strict_checks()
@@ -1279,7 +1505,7 @@ impl Parser {
                     signed: true,
                     base: NumberBase::Decimal,
                     value: v.to_string(),
-                    cached_val: std::cell::Cell::new(None),
+                    cached_val: crate::ast::cache::LiteralCache::new(None),
                 }),
                 span,
             )
@@ -1458,6 +1684,7 @@ impl Parser {
                 at + 1,
                 if is_var {
                     ModuleItem::DataDeclaration(DataDeclaration {
+                        net_type: None,
                         const_kw: false,
                         var_kw: false,
                         lifetime: None,
@@ -1474,6 +1701,7 @@ impl Parser {
                         delay_fall: None,
                         delay_off: None,
                         declarators: vec![NetDeclarator {
+                            decl: crate::ast::binding::Bound::UNSET,
                             name: v.name,
                             dimensions: v.dimensions,
                             init: None,
@@ -1504,8 +1732,9 @@ impl Parser {
                     selects: Vec::new(),
                 }],
                 span,
-                cached_signal_id: std::cell::Cell::new(None),
-                cached_resolved_name: std::cell::OnceCell::new(),
+                cached_signal_id: crate::ast::cache::SignalCache::new(None),
+                cached_resolved_name: crate::ast::cache::NameCache::new(),
+                bound: crate::ast::binding::Bound::UNSET,
             }),
             span,
         );
@@ -1524,6 +1753,7 @@ impl Parser {
                     span,
                 },
                 declarators: vec![crate::ast::stmt::VarDeclarator {
+                    decl: crate::ast::binding::Bound::UNSET,
                     name: port.clone(),
                     dimensions: Vec::new(),
                     init: None,
@@ -1862,13 +2092,11 @@ impl Parser {
                 {
                     self.parse_data_type()
                 } else if self.at(TokenKind::Identifier)
-                    && matches!(
+                    && (matches!(
                         self.peek_kind(),
-                        TokenKind::Identifier
-                            | TokenKind::DoubleColon
-                            | TokenKind::Hash
-                            | TokenKind::LBracket
-                    )
+                        TokenKind::Identifier | TokenKind::DoubleColon | TokenKind::Hash
+                    ) || (self.peek_kind() == TokenKind::LBracket
+                        && self.dims_then_identifier(1)))
                 {
                     self.parse_data_type()
                 } else if self.at(TokenKind::LBracket) {
@@ -2267,6 +2495,7 @@ impl Parser {
                     // of defaulting to input (which mis-marked outputs as inputs,
                     // wrongly rejecting writes — veer-el2 / rsd).
                     let mut last_dir = PortDirection::Input;
+                    let mut tf_ports = false;
                     loop {
                         if self.at(TokenKind::RParen) || self.at(TokenKind::Eof) {
                             break;
@@ -2278,6 +2507,7 @@ impl Parser {
                         // block; downstream consumers that don't understand
                         // clocking still see *something* there.
                         if self.eat(TokenKind::KwClocking).is_some() {
+                            tf_ports = false;
                             let cb_name = self.parse_identifier();
                             ports.push(ModportPort {
                                 direction: PortDirection::Input,
@@ -2285,30 +2515,99 @@ impl Parser {
                                 span: self.span_from(pstart),
                                 expr: None,
                             });
-                        } else if self.at(TokenKind::KwImport) || self.at(TokenKind::KwExport) {
-                            // §25.5 modport import/export of a task/function.
-                            // Record the imported NAME as a synthetic Input port
-                            // (so it parses and stays reachable via the interface),
-                            // then skip any method prototype up to the separator.
-                            self.bump(); // import / export
-                            if self.at(TokenKind::Identifier) {
-                                let name = self.parse_identifier();
+                        } else if self.at(TokenKind::KwImport)
+                            || self.at(TokenKind::KwExport)
+                            || (tf_ports
+                                && matches!(
+                                    self.current_kind(),
+                                    TokenKind::KwTask | TokenKind::KwFunction
+                                ))
+                        {
+                            // IEEE 1800-2023 §25.3 Syntax 25-1, §25.7: each
+                            // import/export member is a name or method prototype.
+                            // Keep the callable name in the existing synthetic
+                            // Input port; the interface owns its declaration.
+                            if self.at(TokenKind::KwImport) || self.at(TokenKind::KwExport) {
+                                self.bump();
+                            }
+                            tf_ports = true;
+                            let prototype = matches!(
+                                self.current_kind(),
+                                TokenKind::KwTask | TokenKind::KwFunction
+                            );
+                            if prototype {
+                                let function = self.bump().kind == TokenKind::KwFunction;
+                                // Annex A footnote 25 excludes method specifiers here.
+                                if self.parse_optional_method_specifier().is_some() {
+                                    self.error(
+                                        "method specifier is not allowed in a modport prototype",
+                                    );
+                                }
+                                self.parse_optional_lifetime();
+                                if function {
+                                    self.parse_data_type();
+                                }
+                            }
+                            let callable = if prototype
+                                || matches!(
+                                    self.current_kind(),
+                                    TokenKind::Identifier | TokenKind::EscapedIdentifier
+                                ) {
+                                Some(self.parse_identifier())
+                            } else {
+                                None
+                            };
+                            if prototype {
+                                // §25.7: parse exactly one optional tf_port_list.
+                                // Reuse the port reader, including unnamed formals;
+                                // it stops at a missing ')' rather than scanning to EOF.
+                                let saved = std::mem::replace(&mut self.prototype_ports, true);
+                                let args = self.parse_function_ports();
+                                self.prototype_ports = saved;
+                                for arg in args {
+                                    if arg.default.is_some() {
+                                        // §25.7 / §13.5.3: prototype defaults require
+                                        // call metadata we do not retain. Keep an error.
+                                        self.diagnostics.push(crate::diagnostics::Diagnostic::error(
+                                            format!(
+                                                "default argument '{}' in modport '{}' subroutine '{}' prototype is not supported",
+                                                arg.name.name, name.name, callable.as_ref().unwrap().name
+                                            ),
+                                            arg.span,
+                                        ));
+                                    }
+                                }
+                                if !matches!(
+                                    self.current_kind(),
+                                    TokenKind::Comma | TokenKind::RParen
+                                ) {
+                                    self.error("expected ',' or ')' after modport prototype");
+                                }
+                            } else {
+                                // Preserve the existing name-only import/export path.
+                                while !matches!(
+                                    self.current_kind(),
+                                    TokenKind::Comma
+                                        | TokenKind::RParen
+                                        | TokenKind::Semicolon
+                                        | TokenKind::KwEndinterface
+                                        | TokenKind::Eof
+                                ) {
+                                    self.bump();
+                                }
+                            }
+                            if let Some(callable) = callable {
                                 ports.push(ModportPort {
                                     direction: PortDirection::Input,
-                                    name,
+                                    name: callable,
                                     span: self.span_from(pstart),
                                     expr: None,
                                 });
                             }
-                            while !self.at(TokenKind::Comma)
-                                && !self.at(TokenKind::RParen)
-                                && !self.at(TokenKind::Eof)
-                            {
-                                self.bump();
-                            }
                         } else {
                             if let Some(d) = self.parse_optional_direction() {
                                 last_dir = d;
+                                tf_ports = false;
                             }
                             // §25.5.4 modport expression: `.b(word[7:0])` —
                             // the member `b` stands for an expression over
@@ -2413,6 +2712,7 @@ impl Parser {
                 let mut signals: Vec<ClockingSignal> = Vec::new();
                 let mut default_input_skew: Option<crate::ast::expr::Expression> = None;
                 let mut default_output_skew: Option<crate::ast::expr::Expression> = None;
+                let mut default_output_edge: Option<crate::ast::stmt::Edge> = None;
                 while !self.at(TokenKind::KwEndclocking) && !self.at(TokenKind::Eof) {
                     // `default input #d output #d;` (§14.4) — capture the skew
                     // expressions; anything unrecognized is skipped to the `;`
@@ -2427,11 +2727,9 @@ impl Parser {
                             }
                             self.bump();
                             // `clocking_skew ::= edge_identifier [delay_control]`
-                            if matches!(
-                                self.current_kind(),
-                                TokenKind::KwNegedge | TokenKind::KwPosedge | TokenKind::KwEdge
-                            ) {
-                                self.bump();
+                            let edge = self.parse_clocking_skew_edge();
+                            if dir_out {
+                                default_output_edge = edge;
                             }
                             if self.at(TokenKind::Hash) {
                                 self.bump();
@@ -2464,12 +2762,7 @@ impl Parser {
                             // captured per-signal; `#1step`/opaque forms → None.
                             let mut sig_skew: Option<crate::ast::expr::Expression> = None;
                             // `clocking_skew ::= edge_identifier [delay_control]`
-                            if matches!(
-                                self.current_kind(),
-                                TokenKind::KwNegedge | TokenKind::KwPosedge | TokenKind::KwEdge
-                            ) {
-                                self.bump();
-                            }
+                            let sig_edge = self.parse_clocking_skew_edge();
                             if self.at(TokenKind::Hash) {
                                 self.bump();
                                 sig_skew = self.parse_clocking_skew_value();
@@ -2493,6 +2786,7 @@ impl Parser {
                                         direction,
                                         name: id,
                                         skew: sig_skew.clone(),
+                                        skew_edge: sig_edge,
                                         bound_to,
                                         span: self.span_from(sstart),
                                     });
@@ -2527,15 +2821,24 @@ impl Parser {
                 Some(ModuleItem::ClockingDeclaration(ClockingDeclaration {
                     name: id,
                     clock_signal: clock_signal_id,
+                    clock_bound: Default::default(),
                     clock_edge,
                     default_input_skew,
                     default_output_skew,
+                    default_output_edge,
                     is_default: false,
                     signals,
                     items,
                     endlabel,
                     span: self.span_from(start),
                 }))
+            }
+            // §16.14.4: read and set aside, as a simulator checks no
+            // restriction; it was a parse error that lost the rest of the
+            // module (#614).
+            TokenKind::KwRestrict if self.peek_kind() == TokenKind::KwProperty => {
+                self.skip_restrict_property();
+                Some(ModuleItem::Null)
             }
             TokenKind::KwAssert | TokenKind::KwAssume | TokenKind::KwCover => {
                 Some(ModuleItem::AssertionItem(self.parse_assertion_statement()))
@@ -2641,6 +2944,7 @@ impl Parser {
                     body: body_expr,
                     endlabel,
                     span: self.span_from(start),
+                    decl: Default::default(),
                 }))
             }
             TokenKind::KwSequence => {
@@ -2716,6 +3020,7 @@ impl Parser {
                     body: body_expr,
                     endlabel,
                     span: self.span_from(start),
+                    decl: Default::default(),
                 }))
             }
             TokenKind::KwCovergroup => Some(ModuleItem::CovergroupDeclaration(
@@ -2742,9 +3047,11 @@ impl Parser {
                         return Some(ModuleItem::ClockingDeclaration(ClockingDeclaration {
                             name,
                             clock_signal: None,
+                            clock_bound: Default::default(),
                             clock_edge: None,
                             default_input_skew: None,
                             default_output_skew: None,
+                            default_output_edge: None,
                             is_default: true,
                             signals: Vec::new(),
                             items: Vec::new(),
@@ -3025,7 +3332,7 @@ impl Parser {
                     }
                 };
                 self.expect(TokenKind::RParen);
-                let (items, name) = self.parse_generate_branch_items_named();
+                let (items, name, _) = self.parse_generate_branch_items_named();
                 Some(ModuleItem::GenerateFor(GenerateFor {
                     var: var_name,
                     init_val,
@@ -3034,6 +3341,8 @@ impl Parser {
                     incr,
                     items,
                     name,
+                    name_decl: Default::default(),
+                    implicit_name: String::new(),
                     span: self.span_from(s),
                 }))
             }
@@ -3308,6 +3617,7 @@ impl Parser {
                 None
             };
             decls.push(NetDeclarator {
+                decl: crate::ast::binding::Bound::UNSET,
                 name,
                 dimensions,
                 init,
@@ -3437,32 +3747,39 @@ impl Parser {
     fn parse_generate_if(&mut self, start: usize) -> ModuleItem {
         let mut branches = Vec::new();
         let mut branch_labels = Vec::new();
+        let mut branch_direct = Vec::new();
         self.bump();
         self.expect(TokenKind::LParen);
         let cond = self.parse_expression();
         self.expect(TokenKind::RParen);
-        let (items, label) = self.parse_generate_branch_items_named();
+        let (items, label, direct) = self.parse_generate_branch_items_named();
         branches.push((Some(cond), items));
         branch_labels.push(label);
+        branch_direct.push(direct);
         while self.eat(TokenKind::KwElse).is_some() {
             if self.at(TokenKind::KwIf) {
                 self.bump();
                 self.expect(TokenKind::LParen);
                 let c = self.parse_expression();
                 self.expect(TokenKind::RParen);
-                let (items, label) = self.parse_generate_branch_items_named();
+                let (items, label, direct) = self.parse_generate_branch_items_named();
                 branches.push((Some(c), items));
                 branch_labels.push(label);
+                branch_direct.push(direct);
             } else {
-                let (items, label) = self.parse_generate_branch_items_named();
+                let (items, label, direct) = self.parse_generate_branch_items_named();
                 branches.push((None, items));
                 branch_labels.push(label);
+                branch_direct.push(direct);
                 break;
             }
         }
         ModuleItem::GenerateIf(GenerateIf {
             branches,
             branch_labels,
+            branch_label_decls: Vec::new(),
+            branch_direct,
+            implicit_name: String::new(),
             span: self.span_from(start),
         })
     }
@@ -3488,17 +3805,20 @@ impl Parser {
                 }
                 self.expect(TokenKind::Colon);
             }
-            let (items, label) = self.parse_generate_branch_items_named();
+            let (items, label, direct) = self.parse_generate_branch_items_named();
             arms.push(GenerateCaseArm {
                 values,
                 items,
                 label,
+                label_decl: Default::default(),
+                direct,
             });
         }
         self.expect(TokenKind::KwEndcase);
         ModuleItem::GenerateCase(GenerateCase {
             selector,
             arms,
+            implicit_name: String::new(),
             span: self.span_from(start),
         })
     }
@@ -4008,7 +4328,7 @@ impl Parser {
 
     /// Like `parse_generate_branch_items` but also returns the optional
     /// `begin : <label>` block name (needed to namespace generate-for renames).
-    fn parse_generate_branch_items_named(&mut self) -> (Vec<ModuleItem>, Option<String>) {
+    fn parse_generate_branch_items_named(&mut self) -> (Vec<ModuleItem>, Option<String>, bool) {
         self.generate_depth += 1;
         // §27.5: a generate block is a scope, for lets too (§11.13).
         self.push_let_scope();
@@ -4023,9 +4343,15 @@ impl Parser {
             {
                 self.unnamed_block_end_label(&l);
             }
-            (items, label)
+            (items, label, false)
         } else {
-            (self.parse_module_item().into_iter().collect(), None)
+            let items: Vec<ModuleItem> = self.parse_module_item().into_iter().collect();
+            // §27.5: without `begin`, a lone conditional generate is directly nested.
+            let direct = matches!(
+                items.as_slice(),
+                [ModuleItem::GenerateIf(_) | ModuleItem::GenerateCase(_)]
+            );
+            (items, None, direct)
         };
         self.pop_let_scope();
         self.generate_depth -= 1;
@@ -4132,6 +4458,21 @@ impl Parser {
                     kind: crate::ast::types::SimpleType::String,
                     span,
                 } => ("string".to_string(), *span),
+                // §25.9: `C #(virtual bus_if) x;` — the same identifier
+                // `parse_type_args_hash` builds for a procedural declaration.
+                // Dropped, the module-scope variable was built as the
+                // default specialization, so its type-parameter property was
+                // no virtual interface.
+                DataType::Interface { span, .. } => {
+                    let toks: Vec<String> = self
+                        .tokens
+                        .iter()
+                        .filter(|t| t.span.start >= span.start && t.span.end <= span.end)
+                        .skip_while(|t| t.kind == TokenKind::KwVirtual)
+                        .map(|t| t.text.clone())
+                        .collect();
+                    (Self::virtual_type_arg_text(&toks), *span)
+                }
                 // §6.12: `C #(real) x;` — dropping the argument built the
                 // object as the default specialization.
                 DataType::Real { kind, span } => (
@@ -4153,14 +4494,15 @@ impl Parser {
                 selects: Vec::new(),
             }],
             span,
-            cached_signal_id: std::cell::Cell::new(None),
-            cached_resolved_name: std::cell::OnceCell::new(),
+            cached_signal_id: crate::ast::cache::SignalCache::new(None),
+            cached_resolved_name: crate::ast::cache::NameCache::new(),
+            bound: crate::ast::binding::Bound::UNSET,
         };
         Some(Expression::new(ExprKind::Ident(hier), span))
     }
 
     /// The optional `#(...)` parameter value assignment of an instantiation
-    /// (`mod #(.P(v), 3) u (...)`), shared by module items and `bind`
+    /// (`mod #(.P(v), .Q(3)) u (...)`), shared by module items and `bind`
     /// directives. `None` when no `#` follows.
     pub(super) fn parse_instantiation_params(&mut self) -> Option<Vec<ParamConnection>> {
         if !self.at(TokenKind::Hash) {
@@ -4168,6 +4510,7 @@ impl Parser {
         }
         self.bump();
         if self.eat(TokenKind::LParen).is_some() {
+            self.check_param_list_form();
             let mut p = Vec::new();
             while !self.at(TokenKind::RParen) && !self.at(TokenKind::Eof) {
                 if self.at(TokenKind::Dot) {
@@ -4275,6 +4618,7 @@ impl Parser {
                     scopes,
                     name: second_name,
                     span: self.span_from(start),
+                    bound: Default::default(),
                 },
                 dimensions,
                 type_args,
@@ -4283,6 +4627,7 @@ impl Parser {
             let decls = self.parse_var_declarator_list();
             self.expect(TokenKind::Semicolon);
             return ModuleItem::DataDeclaration(DataDeclaration {
+                net_type: None,
                 const_kw: false,
                 var_kw: false,
                 lifetime: None,
@@ -4320,6 +4665,7 @@ impl Parser {
             let decls = self.parse_var_declarator_list();
             self.expect(TokenKind::Semicolon);
             return ModuleItem::DataDeclaration(DataDeclaration {
+                net_type: None,
                 const_kw: false,
                 var_kw: false,
                 lifetime: None,
@@ -4389,6 +4735,7 @@ impl Parser {
                     scopes,
                     name: tn_name,
                     span: self.span_from(start),
+                    bound: Default::default(),
                 },
                 dimensions,
                 type_args: Vec::new(),
@@ -4397,6 +4744,7 @@ impl Parser {
             let decls = self.parse_var_declarator_list();
             self.expect(TokenKind::Semicolon);
             return ModuleItem::DataDeclaration(DataDeclaration {
+                net_type: None,
                 const_kw: false,
                 var_kw: false,
                 lifetime: None,
@@ -4424,6 +4772,7 @@ impl Parser {
                     scopes: Vec::new(),
                     name: first_name,
                     span: self.span_from(start),
+                    bound: Default::default(),
                 },
                 dimensions,
                 type_args,
@@ -4432,6 +4781,7 @@ impl Parser {
             let decls = self.parse_var_declarator_list();
             self.expect(TokenKind::Semicolon);
             return ModuleItem::DataDeclaration(DataDeclaration {
+                net_type: None,
                 const_kw: false,
                 var_kw: false,
                 lifetime: None,
@@ -4458,9 +4808,11 @@ impl Parser {
                 let dims = self.parse_unpacked_dimensions();
                 let conns = self.parse_port_connections();
                 instances.push(HierarchicalInstance {
+                    decl: crate::ast::binding::Bound::UNSET,
                     name,
                     dimensions: dims,
                     connections: conns,
+                    gen_indices: Vec::new(),
                     span: self.span_from(inst_start),
                 });
                 if self.eat(TokenKind::Comma).is_none() {
@@ -4472,6 +4824,7 @@ impl Parser {
                 module_name: first_name,
                 params,
                 instances,
+                scope: None,
                 span: self.span_from(start),
             });
         }
@@ -4496,9 +4849,11 @@ impl Parser {
                 let dims = self.parse_unpacked_dimensions();
                 let conns = self.parse_port_connections();
                 instances.push(HierarchicalInstance {
+                    decl: crate::ast::binding::Bound::UNSET,
                     name: iname,
                     dimensions: dims,
                     connections: conns,
+                    gen_indices: Vec::new(),
                     span: self.span_from(inst_start),
                 });
                 if self.eat(TokenKind::Comma).is_none() {
@@ -4519,6 +4874,7 @@ impl Parser {
                         scopes: Vec::new(),
                         name: first_name,
                         span: self.span_from(start),
+                        bound: Default::default(),
                     },
                     dimensions: Vec::new(),
                     type_args,
@@ -4527,6 +4883,7 @@ impl Parser {
                 let decls = self.parse_var_declarator_list();
                 self.expect(TokenKind::Semicolon);
                 ModuleItem::DataDeclaration(DataDeclaration {
+                    net_type: None,
                     const_kw: false,
                     var_kw: false,
                     lifetime: None,
@@ -4540,6 +4897,7 @@ impl Parser {
                     module_name: first_name,
                     params,
                     instances,
+                    scope: None,
                     span: self.span_from(start),
                 })
             }
@@ -4549,6 +4907,7 @@ impl Parser {
                     scopes: Vec::new(),
                     name: first_name,
                     span: self.span_from(start),
+                    bound: Default::default(),
                 },
                 dimensions: Vec::new(),
                 type_args: Vec::new(),
@@ -4557,6 +4916,7 @@ impl Parser {
             let decls = self.parse_var_declarator_list();
             self.expect(TokenKind::Semicolon);
             ModuleItem::DataDeclaration(DataDeclaration {
+                net_type: None,
                 const_kw: false,
                 var_kw: false,
                 lifetime: None,
@@ -4806,6 +5166,7 @@ impl Parser {
                 span: self.span_from(ext_start),
                 scopes: base_scopes,
                 default_args: ext_default_args,
+                bound: Default::default(),
             })
         } else {
             None
@@ -5262,6 +5623,119 @@ impl Parser {
     }
 
     /// §19.6.1 select_expression, `||` level.
+    /// §19.6.1.4: a cross bin given as a list of value tuples,
+    /// `'{'{1,2}, '{3,4}}`, one value per crossed item in order: the product
+    /// bins holding one of the tuples, i.e. the `||` over the tuples of the
+    /// `&&` of `binsof(item) intersect {value}` (#651).
+    fn cross_tuple_select(
+        &mut self,
+        set: &Expression,
+        items: &[Identifier],
+    ) -> crate::ast::decl::CrossSelect {
+        use crate::ast::decl::{ConstraintRange, CrossSelect};
+        let tuples: Option<Vec<Vec<Expression>>> = match &set.kind {
+            ExprKind::AssignmentPattern(list) => list
+                .iter()
+                .map(|t| match t {
+                    AssignmentPatternItem::Ordered(e) => match &e.kind {
+                        ExprKind::AssignmentPattern(vals) => vals
+                            .iter()
+                            .map(|v| match v {
+                                AssignmentPatternItem::Ordered(x) => Some(x.clone()),
+                                _ => None,
+                            })
+                            .collect(),
+                        _ => None,
+                    },
+                    _ => None,
+                })
+                .collect(),
+            _ => None,
+        };
+        let Some(tuples) = tuples else {
+            self.diagnostics.push(crate::diagnostics::Diagnostic::error(
+                "a cross bin's tuple list is an ordered list of ordered tuples, \
+                 '{'{v1, v2}, ...} (IEEE 1800-2023 §19.6.1.4)",
+                set.span,
+            ));
+            return CrossSelect::All;
+        };
+        let mut any: Option<CrossSelect> = None;
+        for t in tuples {
+            if t.len() != items.len() {
+                self.diagnostics.push(crate::diagnostics::Diagnostic::error(
+                    format!(
+                        "a tuple of {} values for a cross of {} items (IEEE 1800-2023 §19.6.1.4)",
+                        t.len(),
+                        items.len()
+                    ),
+                    set.span,
+                ));
+                continue;
+            }
+            let mut all: Option<CrossSelect> = None;
+            for (cp, v) in items.iter().zip(t) {
+                let term = CrossSelect::Binsof {
+                    cp: cp.clone(),
+                    bin: None,
+                    intersect: Some(vec![ConstraintRange::Value(v)]),
+                };
+                all = Some(match all {
+                    Some(a) => CrossSelect::And(Box::new(a), Box::new(term)),
+                    None => term,
+                });
+            }
+            if let Some(all) = all {
+                any = Some(match any {
+                    Some(a) => CrossSelect::Or(Box::new(a), Box::new(all)),
+                    None => all,
+                });
+            }
+        }
+        // An empty list selects no product bin.
+        any.unwrap_or_else(|| CrossSelect::Not(Box::new(CrossSelect::All)))
+    }
+
+    /// §19.6.1 `bins_expression`: `cp` or `cp.bin`. With the cross
+    /// hierarchical item relaxation, a dotted name that the standard form
+    /// can't read and that is one of the cross's items names that item, and
+    /// one whose prefix is one of them names that item and a bin.
+    fn parse_binsof_bins_expression(
+        &mut self,
+    ) -> (crate::ast::Identifier, Option<crate::ast::Identifier>) {
+        let mut cp = self.parse_identifier();
+        let mut segs = Vec::new();
+        while self.eat(TokenKind::Dot).is_some() {
+            segs.push(self.parse_identifier());
+            if !crate::RELAX_CROSS_HIER_ITEM.get() {
+                break;
+            }
+        }
+        let path = |segs: &[crate::ast::Identifier]| {
+            segs.iter()
+                .fold(cp.name.clone(), |n, s| format!("{n}.{}", s.name))
+        };
+        let is_item = |n: String| self.cross_items.contains(&n);
+        // `cp.bin` keeps its standard meaning whenever `cp` is a cross item.
+        let bin = match segs.len() {
+            0 => None,
+            1 if !crate::RELAX_CROSS_HIER_ITEM.get()
+                || is_item(cp.name.clone())
+                || !is_item(path(&segs)) =>
+            {
+                segs.pop()
+            }
+            n if n > 1 && !is_item(path(&segs)) && is_item(path(&segs[..n - 1])) => segs.pop(),
+            _ => None,
+        };
+        if let Some(last) = segs.last() {
+            let name = path(&segs);
+            cp.name = name;
+            cp.span = crate::ast::Span::new(cp.span.start, last.span.end);
+        }
+        (cp, bin)
+    }
+
     fn parse_cross_select_or(&mut self) -> crate::ast::decl::CrossSelect {
         let mut l = self.parse_cross_select_and();
         while self.eat(TokenKind::LogOr).is_some() {
@@ -5306,12 +5780,7 @@ impl Parser {
         }
         if self.eat(TokenKind::KwBinsof).is_some() {
             self.expect(TokenKind::LParen);
-            let cp = self.parse_identifier();
-            let bin = if self.eat(TokenKind::Dot).is_some() {
-                Some(self.parse_identifier())
-            } else {
-                None
-            };
+            let (cp, bin) = self.parse_binsof_bins_expression();
             self.expect(TokenKind::RParen);
             let intersect = if self.eat(TokenKind::KwIntersect).is_some() {
                 self.expect(TokenKind::LBrace);
@@ -5549,7 +6018,31 @@ impl Parser {
                                     // the terminating `;` (depth-aware).
                                     self.skip_bin_body_to_semicolon();
                                 }
+                                // §19.5.1.1: `with (expr)` filters the bin's
+                                // values; it comes before any `iff` (#611).
+                                let with_filter = if self.eat(TokenKind::KwWith).is_some() {
+                                    self.expect(TokenKind::LParen);
+                                    let f = self.parse_expression();
+                                    self.expect(TokenKind::RParen);
+                                    Some(f)
+                                } else {
+                                    None
+                                };
+                                // §19.5: `iff (expr)` after the bin's values.
+                                // Unparsed, its tokens were skipped one by one
+                                // and the guard was lost, or tripped the
+                                // covergroup parser on an `inside` (#605).
+                                let iff_guard = if self.eat(TokenKind::KwIff).is_some() {
+                                    self.expect(TokenKind::LParen);
+                                    let g = self.parse_expression();
+                                    self.expect(TokenKind::RParen);
+                                    Some(g)
+                                } else {
+                                    None
+                                };
                                 bins.push(crate::ast::decl::CoverBin {
+                                    iff_guard,
+                                    with_filter,
                                     name: bin_name,
                                     kind: bin_kind,
                                     values,
@@ -5606,7 +6099,33 @@ impl Parser {
                 self.bump();
                 let mut ids = Vec::new();
                 loop {
-                    ids.push(self.parse_identifier());
+                    let mut id = self.parse_identifier();
+                    // XEZIM_RELAX_CROSS_HIER_ITEM (#629): a cross item is a
+                    // coverpoint label or a variable (A.2.11); read a
+                    // hierarchical reference (`vif.mode`) as a variable too,
+                    // kept as its dotted name for an implicit coverpoint.
+                    if self.at(TokenKind::Dot)
+                        && self.peek_kind() == TokenKind::Identifier
+                        && crate::RELAX_CROSS_HIER_ITEM.get()
+                    {
+                        while self.at(TokenKind::Dot) && self.peek_kind() == TokenKind::Identifier {
+                            self.bump();
+                            let next = self.parse_identifier();
+                            id.name = format!("{}.{}", id.name, next.name);
+                            id.span = crate::ast::Span::new(id.span.start, next.span.end);
+                        }
+                        self.diagnostics
+                            .push(crate::diagnostics::Diagnostic::warning(
+                                format!(
+                                    "a cross item is a coverpoint or a variable; '{}' gets an \
+                                     implicit coverpoint (IEEE 1800-2017 §19.6, A.2.11, \
+                                     XEZIM_RELAX_CROSS_HIER_ITEM)",
+                                    id.name
+                                ),
+                                id.span,
+                            ));
+                    }
+                    ids.push(id);
                     if !self.at(TokenKind::Comma) {
                         break;
                     }
@@ -5661,7 +6180,16 @@ impl Parser {
                             }
                             let bin_name = self.parse_identifier();
                             self.expect(TokenKind::Assign);
-                            let select = self.parse_cross_select_or();
+                            let select = if self.at(TokenKind::ApostropheLBrace) {
+                                let set = self.parse_expression();
+                                self.cross_tuple_select(&set, &ids)
+                            } else {
+                                let names = ids.iter().map(|i| i.name.clone()).collect();
+                                let saved = std::mem::replace(&mut self.cross_items, names);
+                                let select = self.parse_cross_select_or();
+                                self.cross_items = saved;
+                                select
+                            };
                             let mut iff_guard = None;
                             if self.eat(TokenKind::KwIff).is_some() {
                                 self.expect(TokenKind::LParen);
@@ -5787,17 +6315,52 @@ impl Parser {
                 break;
             }
         }
+        // §18.5.10: `constraint_primary` ends in an optional `( )`, which
+        // orders an array's size: `solve sel before arr.size();`. It is the
+        // call `arr.size()` the constraints themselves read.
+        let call =
+            self.at(TokenKind::LParen) && self.peek_kind() == TokenKind::RParen && path.len() > 1;
+        if call {
+            self.bump();
+            self.bump();
+        }
         let span = self.span_from(start);
-        let e = Expression::new(
-            ExprKind::Ident(crate::ast::expr::HierarchicalIdentifier {
-                root: None,
-                path,
+        let ident = |path: Vec<crate::ast::expr::HierPathSegment>, span: crate::ast::Span| {
+            Expression::new(
+                ExprKind::Ident(crate::ast::expr::HierarchicalIdentifier {
+                    root: None,
+                    path,
+                    span,
+                    cached_signal_id: crate::ast::cache::SignalCache::new(None),
+                    cached_resolved_name: crate::ast::cache::NameCache::new(),
+                    bound: crate::ast::binding::Bound::UNSET,
+                }),
                 span,
-                cached_signal_id: std::cell::Cell::new(None),
-                cached_resolved_name: std::cell::OnceCell::new(),
-            }),
-            span,
-        );
+            )
+        };
+        let e = if call {
+            let method = path.pop().expect("a path of two segments or more").name;
+            let receiver_span = crate::ast::Span {
+                start,
+                end: method.span.start.saturating_sub(1).max(start),
+            };
+            let func = Expression::new(
+                ExprKind::MemberAccess {
+                    expr: Box::new(ident(path, receiver_span)),
+                    member: method,
+                },
+                span,
+            );
+            Expression::new(
+                ExprKind::Call {
+                    func: Box::new(func),
+                    args: Vec::new(),
+                },
+                span,
+            )
+        } else {
+            ident(path, span)
+        };
         (root, e)
     }
 

@@ -21,12 +21,137 @@ pub struct Lexer<'a> {
     /// identifiers, and in a set without configurations so do `instance`,
     /// `cell`, ….
     kw_stack: Vec<KwRegion>,
+    /// The set outside every region, read once (`default_region` locks).
+    default_kw: KwRegion,
 }
 
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy)]
 struct KwRegion {
-    verilog: bool,
+    /// The version whose keywords are reserved, an index into
+    /// `KEYWORD_VERSIONS`: the words a later version added are names.
+    version: u8,
+    /// `-noconfig`: the configuration keywords are names too.
     no_config: bool,
+}
+
+/// `KEYWORD_VERSIONS` indices of the versions that added keywords.
+const V1364_2001: u8 = 1;
+const V1364_2005: u8 = 2;
+const V1800_2005: u8 = 3;
+const V1800_2009: u8 = 4;
+const V1800_2012: u8 = 5;
+const V_LATEST: u8 = KEYWORD_VERSIONS.len() as u8 - 1;
+
+impl Default for KwRegion {
+    fn default() -> Self {
+        KwRegion {
+            version: V_LATEST,
+            no_config: false,
+        }
+    }
+}
+
+impl KwRegion {
+    /// The keyword set of a §22.14 version specifier, `None` for an unknown
+    /// one. A `-noconfig` suffix on any version leaves the configuration
+    /// keywords out, as 1364-2001-noconfig does.
+    fn of_version(ver: &str) -> Option<Self> {
+        let (base, no_config) = match ver.strip_suffix("-noconfig") {
+            Some(b) => (b, true),
+            None => (ver, false),
+        };
+        let version = KEYWORD_VERSIONS.iter().position(|v| *v == base)? as u8;
+        Some(KwRegion { version, no_config })
+    }
+
+    /// §22.14, Table 22-2: whether a reserved word is a name in this set —
+    /// a word a later version added, or a configuration keyword in a
+    /// `-noconfig` set or before 1364-2001 brought them.
+    fn frees(self, s: &str) -> bool {
+        let before = |v: u8| self.version < v;
+        ((self.no_config || before(V1364_2001)) && is_config_keyword(s))
+            || (before(V1364_2001) && is_1364_2001_keyword(s))
+            || (before(V1364_2005) && s == "uwire")
+            || (before(V1800_2005) && is_sv_only_keyword(s))
+            || (before(V1800_2009) && is_1800_2009_keyword(s))
+            || (before(V1800_2012) && is_1800_2012_keyword(s))
+    }
+}
+
+/// The §22.14 version specifiers.
+pub const KEYWORD_VERSIONS: &[&str] = &[
+    "1364-1995",
+    "1364-2001",
+    "1364-2005",
+    "1800-2005",
+    "1800-2009",
+    "1800-2012",
+    "1800-2017",
+    "1800-2023",
+];
+
+/// The keyword set outside every `begin_keywords` region (#608): set by
+/// `set_default_keywords` / `set_no_config_keywords`, else from
+/// `XEZIM_KEYWORDS` / `XEZIM_NO_CONFIG_KEYWORDS=1`, else the full set.
+static DEFAULT_KEYWORDS: std::sync::Mutex<Option<KwRegion>> = std::sync::Mutex::new(None);
+
+fn default_region() -> KwRegion {
+    DEFAULT_KEYWORDS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .unwrap_or_else(env_region)
+}
+
+/// The default set the environment chooses. A setter starts from it, so
+/// `XEZIM_KEYWORDS` survives `set_no_config_keywords` and
+/// `XEZIM_NO_CONFIG_KEYWORDS=1` survives `set_default_keywords`.
+fn env_region() -> KwRegion {
+    static ENV: std::sync::OnceLock<KwRegion> = std::sync::OnceLock::new();
+    *ENV.get_or_init(|| {
+        let mut r = std::env::var("XEZIM_KEYWORDS")
+            .ok()
+            .and_then(|v| KwRegion::of_version(v.trim()))
+            .unwrap_or_default();
+        r.no_config |= std::env::var("XEZIM_NO_CONFIG_KEYWORDS").ok().as_deref() == Some("1");
+        r
+    })
+}
+
+/// §22.14 leaves the keyword set outside `begin_keywords` regions to the
+/// implementation: choose it by version specifier (`1364-1995`, ...,
+/// `1800-2023`, each also with `-noconfig`). An unknown one is an error that
+/// lists the valid ones.
+pub fn set_default_keywords(version: &str) -> Result<(), String> {
+    let r = KwRegion::of_version(version).ok_or_else(|| {
+        format!(
+            "unknown keyword set '{version}'; one of {} (each also with -noconfig) \
+             (IEEE 1800-2023 §22.14)",
+            KEYWORD_VERSIONS.join(", ")
+        )
+    })?;
+    let mut d = DEFAULT_KEYWORDS.lock().unwrap_or_else(|e| e.into_inner());
+    let keep = d.unwrap_or_else(env_region).no_config;
+    *d = Some(KwRegion {
+        no_config: r.no_config || keep,
+        ..r
+    });
+    Ok(())
+}
+
+/// Outside `begin_keywords` regions, read the ten configuration keywords
+/// (`instance`, `cell`, `use`, ...) as names (#608).
+pub fn set_no_config_keywords(on: bool) {
+    let mut d = DEFAULT_KEYWORDS.lock().unwrap_or_else(|e| e.into_inner());
+    let mut r = d.unwrap_or_else(env_region);
+    r.no_config = on;
+    *d = Some(r);
+}
+
+/// The default keyword set, for cache keys: how many versions back it is
+/// (0 for the full set), with bit 4 for `-noconfig`.
+pub fn default_keywords_key() -> u8 {
+    let r = default_region();
+    (V_LATEST - r.version) | (r.no_config as u8) << 4
 }
 
 impl<'a> Lexer<'a> {
@@ -35,6 +160,7 @@ impl<'a> Lexer<'a> {
             input: source.as_bytes(),
             pos: 0,
             kw_stack: Vec::new(),
+            default_kw: default_region(),
         }
     }
 
@@ -75,6 +201,7 @@ impl<'a> Lexer<'a> {
             }
             tokens.push(self.scan_token());
         }
+        tokens.shrink_to_fit();
         tokens
     }
 
@@ -690,12 +817,15 @@ impl<'a> Lexer<'a> {
                 if self.pos < self.input.len() {
                     self.pos += 1;
                 } // closing quote
-                self.kw_stack.push(KwRegion {
-                    verilog: ver.starts_with("1364"),
-                    // Config keywords arrived in 1364-2001, and the
-                    // "-noconfig" set leaves them out (§22.14).
-                    no_config: ver == "1364-1995" || ver.ends_with("-noconfig"),
-                });
+                self.kw_stack
+                    .push(KwRegion::of_version(&ver).unwrap_or(KwRegion {
+                        version: if ver.starts_with("1364") {
+                            V1364_2005
+                        } else {
+                            V_LATEST
+                        },
+                        no_config: ver.ends_with("-noconfig"),
+                    }));
             } else {
                 // Malformed (no version) — keep the stack balanced anyway.
                 self.pos = save;
@@ -753,10 +883,8 @@ impl<'a> Lexer<'a> {
         // §22.14: inside a `begin_keywords "1364-*"` region, a SystemVerilog-
         // only keyword is a legal identifier (e.g. `reg logic;` declares a reg
         // named `logic` in Verilog-2001).
-        let region = self.kw_stack.last().copied().unwrap_or_default();
-        if (region.verilog && is_sv_only_keyword(&text))
-            || (region.no_config && is_config_keyword(&text))
-        {
+        let region = self.kw_stack.last().copied().unwrap_or(self.default_kw);
+        if region.frees(&text) {
             kind = TokenKind::Identifier;
         }
         Token::new(kind, text, Span::new(start, self.pos))
@@ -999,6 +1127,60 @@ fn is_config_keyword(s: &str) -> bool {
             | "liblist"
             | "library"
             | "use"
+    )
+}
+
+/// §22.14, Table 22-2: a keyword 1800-2009 added over 1800-2005.
+fn is_1800_2009_keyword(s: &str) -> bool {
+    matches!(
+        s,
+        "accept_on"
+            | "checker"
+            | "endchecker"
+            | "eventually"
+            | "global"
+            | "implies"
+            | "let"
+            | "nexttime"
+            | "reject_on"
+            | "restrict"
+            | "s_always"
+            | "s_eventually"
+            | "s_nexttime"
+            | "s_until"
+            | "s_until_with"
+            | "strong"
+            | "sync_accept_on"
+            | "sync_reject_on"
+            | "unique0"
+            | "until"
+            | "until_with"
+            | "untyped"
+            | "weak"
+    )
+}
+
+/// §22.14, Table 22-2: a keyword 1800-2012 added over 1800-2009.
+fn is_1800_2012_keyword(s: &str) -> bool {
+    matches!(s, "implements" | "interconnect" | "nettype" | "soft")
+}
+
+/// §22.14 Table 22-2: a keyword 1364-2001 added over 1364-1995, other than
+/// the configuration keywords.
+fn is_1364_2001_keyword(s: &str) -> bool {
+    matches!(
+        s,
+        "automatic"
+            | "endgenerate"
+            | "generate"
+            | "genvar"
+            | "localparam"
+            | "noshowcancelled"
+            | "pulsestyle_ondetect"
+            | "pulsestyle_onevent"
+            | "showcancelled"
+            | "signed"
+            | "unsigned"
     )
 }
 

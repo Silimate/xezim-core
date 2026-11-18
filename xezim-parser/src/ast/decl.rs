@@ -441,6 +441,7 @@ fn let_subst(e: &mut Expression, map: &std::collections::HashMap<String, Express
             let_subst(body, map);
         }
         ExprKind::ShallowCopy { source } => let_subst(source, map),
+        ExprKind::TypedPattern { pattern, .. } => let_subst(pattern, map),
         ExprKind::Number(_)
         | ExprKind::StringLiteral(_)
         | ExprKind::TypeLiteral(_)
@@ -574,6 +575,9 @@ pub struct ClockingDeclaration {
     /// was declared without an event — implementation-defined behavior.
     #[cfg_attr(feature = "serde", serde(default))]
     pub clock_signal: Option<Identifier>,
+    /// §23.9: the binding of `clock_signal`.
+    #[cfg_attr(feature = "serde", serde(skip))]
+    pub clock_bound: super::binding::Bound,
     /// LRM §14.3: the clock event's EDGE (`posedge`/`negedge`/`edge`). `None`
     /// when unspecified — the simulator defaults to posedge. Without this the
     /// block would always sync on posedge even for `@(negedge clk)`.
@@ -585,6 +589,9 @@ pub struct ClockingDeclaration {
     /// §14.4 `default output #d` skew expression, if declared.
     #[cfg_attr(feature = "serde", serde(default))]
     pub default_output_skew: Option<super::expr::Expression>,
+    /// §14.3 edge of a `default output negedge` skew, if declared.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub default_output_edge: Option<super::stmt::Edge>,
     /// LRM §14.11: true when declared `default clocking ...` — the block
     /// that procedural cycle delays (`##N`) synchronize to.
     #[cfg_attr(feature = "serde", serde(default))]
@@ -608,6 +615,9 @@ pub struct ClockingSignal {
     /// §14.4 per-signal skew (`output #0 sig;`). None = use the block default.
     #[cfg_attr(feature = "serde", serde(default))]
     pub skew: Option<super::expr::Expression>,
+    /// §14.3 edge of a per-signal skew (`output negedge sig;`).
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub skew_edge: Option<super::stmt::Edge>,
     /// §14.3 signal RENAMING: `input alias = actual_expr;` binds the clocking
     /// name to a different signal. None = the clocking name IS the signal.
     #[cfg_attr(feature = "serde", serde(default))]
@@ -765,6 +775,14 @@ pub struct CoverBin {
     #[cfg_attr(feature = "serde", serde(default))]
     pub transitions: Vec<Vec<TransStep>>,
     pub span: Span,
+    /// LRM §19.5 `bins b = {..} iff (expr);` — the bin is not incremented
+    /// while the guard is false.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub iff_guard: Option<Expression>,
+    /// LRM §19.5.1.1 `bins b[] = {..} with (expr);` — only the values for
+    /// which `expr` holds, with `item` bound to the value, are in the bin.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub with_filter: Option<Expression>,
 }
 
 /// One step of a §19.5.2 transition: a value set (`1, [3:4]`) with an
@@ -896,6 +914,9 @@ pub struct PropertyDeclaration {
     pub body: Option<super::expr::Expression>,
     pub endlabel: Option<Identifier>,
     pub span: Span,
+    /// The declaration's id in its definition's tree, from the binder (§23.9).
+    #[cfg_attr(feature = "serde", serde(skip))]
+    pub decl: super::binding::Bound,
 }
 
 #[derive(Debug, Clone)]
@@ -914,6 +935,9 @@ pub struct SequenceDeclaration {
     pub body: Option<super::expr::Expression>,
     pub endlabel: Option<Identifier>,
     pub span: Span,
+    /// The declaration's id in its definition's tree, from the binder (§23.9).
+    #[cfg_attr(feature = "serde", serde(skip))]
+    pub decl: super::binding::Bound,
 }
 
 #[derive(Debug, Clone)]
@@ -1040,6 +1064,10 @@ pub struct NetDeclarator {
     pub name: Identifier,
     pub dimensions: Vec<UnpackedDimension>,
     pub init: Option<Expression>,
+    /// The declaration's own id in its definition's tree (`Bound::decl`);
+    /// `UNSET` when not bound. Written by the lexical binder (§23.9).
+    #[cfg_attr(feature = "serde", serde(skip))]
+    pub decl: super::binding::Bound,
     pub span: Span,
 }
 
@@ -1052,6 +1080,11 @@ pub struct DataDeclaration {
     pub data_type: DataType,
     pub declarators: Vec<VarDeclarator>,
     pub span: Span,
+    /// §26.2: a net declared in a package (`wire`, `supply1`, `wand`, ...),
+    /// kept as package data with its net kind so elaboration registers it
+    /// as a net (supply value, wired resolution).
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub net_type: Option<NetType>,
 }
 
 #[derive(Debug, Clone)]
@@ -1086,6 +1119,10 @@ pub struct ParamAssignment {
     pub name: Identifier,
     pub dimensions: Vec<UnpackedDimension>,
     pub init: Option<Expression>,
+    /// The declaration's own id in its definition's tree (`Bound::decl`);
+    /// `UNSET` when not bound. Written by the lexical binder (§23.9).
+    #[cfg_attr(feature = "serde", serde(skip))]
+    pub decl: super::binding::Bound,
     pub span: Span,
 }
 
@@ -1112,6 +1149,9 @@ pub struct TypedefDeclaration {
     /// full typedef in the same scope; elaboration errors otherwise.
     #[cfg_attr(feature = "serde", serde(default))]
     pub forward: bool,
+    /// The declaration's id in its definition's tree, from the binder (§23.9).
+    #[cfg_attr(feature = "serde", serde(skip))]
+    pub decl: super::binding::Bound,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1173,6 +1213,10 @@ pub struct ModuleInstantiation {
     pub module_name: Identifier,
     pub params: Option<Vec<ParamConnection>>,
     pub instances: Vec<HierarchicalInstance>,
+    /// The scope of its definition's tree that holds it; `None` when not
+    /// bound. Written by the lexical binder (§23.8.1).
+    #[cfg_attr(feature = "serde", serde(skip))]
+    pub scope: Option<super::binding::ScopeId>,
     pub span: Span,
 }
 
@@ -1199,6 +1243,14 @@ pub struct HierarchicalInstance {
     pub name: Identifier,
     pub dimensions: Vec<UnpackedDimension>,
     pub connections: Vec<PortConnection>,
+    /// §27.4: the loop index of each generate-for block around it in its
+    /// definition, outermost first. Written by generate expansion.
+    #[cfg_attr(feature = "serde", serde(skip))]
+    pub gen_indices: Vec<i64>,
+    /// The declaration's own id in its definition's tree (`Bound::decl`);
+    /// `UNSET` when not bound. Written by the lexical binder (§23.9).
+    #[cfg_attr(feature = "serde", serde(skip))]
+    pub decl: super::binding::Bound,
     pub span: Span,
 }
 
@@ -1235,6 +1287,18 @@ pub struct GenerateIf {
     /// Empty (older cached ASTs) means all branches are unnamed.
     #[cfg_attr(feature = "serde", serde(default))]
     pub branch_labels: Vec<Option<String>>,
+    /// Each branch label's declaration in its definition's tree (parallel to
+    /// `branch_labels`), from the binder (§23.9, §27.6); `UNSET` when unnamed
+    /// or not bound.
+    #[cfg_attr(feature = "serde", serde(skip))]
+    pub branch_label_decls: Vec<super::binding::Bound>,
+    /// §27.5 per branch (parallel to `branches`): no `begin`, and the one item
+    /// is a conditional generate, so the branch is not a scope.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub branch_direct: Vec<bool>,
+    /// §27.6 name of an unnamed block of this construct, from the scope tree.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub implicit_name: String,
     pub span: Span,
 }
 
@@ -1250,6 +1314,14 @@ pub struct GenerateCaseArm {
     /// §27.6 `begin : label` block name for this arm.
     #[cfg_attr(feature = "serde", serde(default))]
     pub label: Option<String>,
+    /// The label's declaration in its definition's tree, from the binder
+    /// (§23.9, §27.6).
+    #[cfg_attr(feature = "serde", serde(skip))]
+    pub label_decl: super::binding::Bound,
+    /// §27.5: no `begin`, and the one item is a conditional generate, so the
+    /// arm is not a scope.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub direct: bool,
 }
 
 /// A generate-case construct: case (selector) <arm>* endcase
@@ -1258,6 +1330,9 @@ pub struct GenerateCaseArm {
 pub struct GenerateCase {
     pub selector: super::expr::Expression,
     pub arms: Vec<GenerateCaseArm>,
+    /// §27.6 name of an unnamed block of this construct, from the scope tree.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub implicit_name: String,
     pub span: Span,
 }
 
@@ -1286,6 +1361,13 @@ pub struct GenerateFor {
     /// don't collide on `sig__gf_i_<n>_`.
     #[cfg_attr(feature = "serde", serde(default))]
     pub name: Option<String>,
+    /// The label's declaration in its definition's tree, from the binder
+    /// (§23.9, §27.6).
+    #[cfg_attr(feature = "serde", serde(skip))]
+    pub name_decl: super::binding::Bound,
+    /// §27.6 name of the block when unnamed, from the scope tree.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub implicit_name: String,
     pub span: Span,
 }
 
@@ -1306,7 +1388,7 @@ pub struct FunctionDeclaration {
     pub return_type: DataType,
     pub name: TypeName,
     pub ports: Vec<FunctionPort>,
-    pub items: Vec<super::stmt::Statement>,
+    pub items: super::shared_vec::SharedVec<super::stmt::Statement>,
     pub endlabel: Option<Identifier>,
     /// Non-ANSI body port declarations (`function f; input int x; …`). The
     /// main parser otherwise discards these (they parse to a `Null` stmt);
@@ -1319,6 +1401,10 @@ pub struct FunctionDeclaration {
     /// it. The elaborator fills `ports` in from the base chain.
     #[cfg_attr(feature = "serde", serde(default))]
     pub default_args: bool,
+    /// The declaration's own id in its definition's tree (`Bound::decl`);
+    /// `UNSET` when not bound. Written by the lexical binder (§23.9).
+    #[cfg_attr(feature = "serde", serde(skip))]
+    pub decl: super::binding::Bound,
     pub span: Span,
 }
 
@@ -1331,12 +1417,16 @@ pub struct TaskDeclaration {
     pub specifier: Option<MethodSpecifier>,
     pub name: TypeName,
     pub ports: Vec<FunctionPort>,
-    pub items: Vec<super::stmt::Statement>,
+    pub items: super::shared_vec::SharedVec<super::stmt::Statement>,
     pub endlabel: Option<Identifier>,
     /// Non-ANSI body port declarations (`task t; input int x; …`); retained
     /// only for the strict-check pass. Not consumed by elaboration.
     #[cfg_attr(feature = "serde", serde(default))]
     pub strict_body_ports: Vec<Identifier>,
+    /// The declaration's own id in its definition's tree (`Bound::decl`);
+    /// `UNSET` when not bound. Written by the lexical binder (§23.9).
+    #[cfg_attr(feature = "serde", serde(skip))]
+    pub decl: super::binding::Bound,
     pub span: Span,
 }
 
@@ -1411,6 +1501,10 @@ pub struct ClassExtends {
     /// constructor's arguments are forwarded to the superclass constructor.
     #[cfg_attr(feature = "serde", serde(default))]
     pub default_args: bool,
+    /// §6.18, §8.13: the binding of an unscoped base's name (a typedef may
+    /// name the class).
+    #[cfg_attr(feature = "serde", serde(skip))]
+    pub bound: super::binding::Bound,
 }
 
 /// Items that can appear inside a class body.

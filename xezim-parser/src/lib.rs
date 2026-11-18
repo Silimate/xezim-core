@@ -104,6 +104,30 @@ impl std::hash::Hasher for CensusHasher {
 pub type CensusSet = std::collections::HashSet<String, std::hash::BuildHasherDefault<CensusHasher>>;
 
 static REFERENCE_CENSUS: std::sync::Mutex<Option<ReferenceCensus>> = std::sync::Mutex::new(None);
+static CENSUS_ACTIVE_SESSIONS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// RAII guard for scoping the lifetime of [`ReferenceCensus`].
+/// When all session guards are dropped, the process-wide census is cleared.
+/// Sessions that overlap (compilations on several threads) share one census
+/// until the last of them ends: a name another compilation spelled only makes
+/// the elaborator keep a port net it could have dropped, while a census
+/// cleared under a running compilation would let it drop one still in use.
+pub struct CensusSession;
+
+impl Drop for CensusSession {
+    fn drop(&mut self) {
+        if CENSUS_ACTIVE_SESSIONS.fetch_sub(1, std::sync::atomic::Ordering::SeqCst) == 1 {
+            clear_reference_census();
+        }
+    }
+}
+
+/// Begin a compilation or parse session with an explicit lifetime.
+pub fn census_session() -> CensusSession {
+    CENSUS_ACTIVE_SESSIONS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    CensusSession
+}
 
 /// Add one token stream to the process-wide [`ReferenceCensus`]. Called for
 /// every stream the parser is built over, so nothing parsed escapes it.
@@ -242,6 +266,12 @@ pub fn reference_census() -> ReferenceCensus {
         .unwrap_or_default()
 }
 
+/// Reset the process-wide [`ReferenceCensus`], releasing any retained identifiers.
+pub fn clear_reference_census() {
+    let mut guard = REFERENCE_CENSUS.lock().unwrap_or_else(|e| e.into_inner());
+    *guard = None;
+}
+
 /// Reserved storage name for a compilation-unit (`$unit`) declaration that a
 /// module SHADOWS with a declaration of its own (§3.12.1). The two are
 /// distinct objects, but the elaborated namespace is flat, so the $unit copy
@@ -281,6 +311,132 @@ pub fn set_strict_checks(enabled: bool) {
 /// Whether strict negative-test diagnostics are currently enabled (default true).
 pub fn strict_checks() -> bool {
     STRICT_CHECKS_ENABLED.load(Ordering::Relaxed)
+}
+
+/// An opt-in relaxation of a strict rule, for sources written against
+/// tools that accept the construct: off unless `set` turns it on or its
+/// environment variable is `1`. A `set` call wins over the environment.
+/// Each accepted construct is warned about, naming the clause it breaks.
+pub struct RelaxFlag {
+    /// The command-line spelling's suffix, `--relax-<name>`.
+    pub name: &'static str,
+    /// The environment variable that enables it.
+    pub env: &'static str,
+    /// What it accepts, for `--help`.
+    pub help: &'static str,
+    /// 0: not set; 1: off; 2: on.
+    set: std::sync::atomic::AtomicU8,
+    env_on: std::sync::OnceLock<bool>,
+}
+
+impl RelaxFlag {
+    pub const fn new(name: &'static str, env: &'static str, help: &'static str) -> Self {
+        Self {
+            name,
+            env,
+            help,
+            set: std::sync::atomic::AtomicU8::new(0),
+            env_on: std::sync::OnceLock::new(),
+        }
+    }
+
+    pub fn set(&self, on: bool) {
+        self.set.store(if on { 2 } else { 1 }, Ordering::Relaxed);
+    }
+
+    pub fn get(&self) -> bool {
+        match self.set.load(Ordering::Relaxed) {
+            1 => false,
+            2 => true,
+            _ => *self
+                .env_on
+                .get_or_init(|| std::env::var(self.env).ok().as_deref() == Some("1")),
+        }
+    }
+}
+
+/// §3.13: a second declaration of a name in a subroutine or block is ignored.
+pub static RELAX_DUPLICATE_DECLS: RelaxFlag = RelaxFlag::new(
+    "duplicate-decls",
+    "XEZIM_RELAX_DUPLICATE_DECLS",
+    "ignore a second declaration of a name in a task, function or block (§3.13)",
+);
+/// §6.19: `enum [N:0] {...}` reads as `enum bit [N:0] {...}`.
+pub static RELAX_ENUM_NO_BASE: RelaxFlag = RelaxFlag::new(
+    "enum-no-base",
+    "XEZIM_RELAX_ENUM_NO_BASE",
+    "read `enum [N:0] {...}`, a packed dimension with no base type, as `enum bit [N:0]` (§6.19)",
+);
+/// §6.20.6: `static const` reads as `const static`.
+pub static RELAX_STATIC_CONST: RelaxFlag = RelaxFlag::new(
+    "static-const",
+    "XEZIM_RELAX_STATIC_CONST",
+    "read `static const`/`automatic const` in a procedural declaration as `const static` (§6.20.6)",
+);
+/// §9.4.2: `@this.ev;` reads as `@(this.ev)`.
+pub static RELAX_EVENT_THIS: RelaxFlag = RelaxFlag::new(
+    "event-this",
+    "XEZIM_RELAX_EVENT_THIS",
+    "read `@this.ev` without parentheses as `@(this.ev)` (§9.4.2)",
+);
+/// §12.5.4: `casex (e) inside` / `casez (e) inside` read as `case (e) inside`.
+pub static RELAX_CASEX_INSIDE: RelaxFlag = RelaxFlag::new(
+    "casex-inside",
+    "XEZIM_RELAX_CASEX_INSIDE",
+    "read `casex (e) inside` and `casez (e) inside` as `case (e) inside` (§12.5.4)",
+);
+/// §22.5.1: `` ` NAME `` reads as `` `NAME ``.
+pub static RELAX_MACRO_SPACE: RelaxFlag = RelaxFlag::new(
+    "macro-space",
+    "XEZIM_RELAX_MACRO_SPACE",
+    "read white space between a backtick and a macro or directive name as none (§22.5.1)",
+);
+/// §5.3: a NUL byte reads as white space.
+pub static RELAX_NUL_BYTES: RelaxFlag = RelaxFlag::new(
+    "nul-bytes",
+    "XEZIM_RELAX_NUL_BYTES",
+    "read a NUL byte in the source as white space (§5.3)",
+);
+/// §19.6: a hierarchical cross item gets an implicit coverpoint, and a
+/// `binsof` of the cross's bin selects may name it (§19.6.1).
+pub static RELAX_CROSS_HIER_ITEM: RelaxFlag = RelaxFlag::new(
+    "cross-hier-item",
+    "XEZIM_RELAX_CROSS_HIER_ITEM",
+    "accept a hierarchical reference as a cross item, with an implicit coverpoint, and in \
+     binsof() (§19.6, §19.6.1)",
+);
+
+/// §6.5: a module net or variable used ahead of its declaration (checked
+/// at elaboration; the flag lives here with the others).
+pub static RELAX_USE_BEFORE_DECL: RelaxFlag = RelaxFlag::new(
+    "use-before-decl",
+    "XEZIM_RELAX_USE_BEFORE_DECL",
+    "accept a net or variable that a module reads or writes ahead of its declaration (§6.5)",
+);
+
+/// A `-v` library file's packages are compiled (a library file otherwise
+/// supplies only modules, interfaces, programs and primitives; checked when
+/// the design is parsed, the flag lives here with the others).
+pub static RELAX_LIBRARY_PACKAGES: RelaxFlag = RelaxFlag::new(
+    "library-packages",
+    "XEZIM_RELAX_LIBRARY_PACKAGES",
+    "compile the packages a -v library file declares, as if the file were also a source file",
+);
+
+/// Every parser relaxation, for command-line options and cache keys.
+pub fn relax_flags() -> [&'static RelaxFlag; 10] {
+    [
+        &RELAX_DUPLICATE_DECLS,
+        &RELAX_ENUM_NO_BASE,
+        &RELAX_STATIC_CONST,
+        &RELAX_EVENT_THIS,
+        &RELAX_CASEX_INSIDE,
+        &RELAX_MACRO_SPACE,
+        &RELAX_NUL_BYTES,
+        &RELAX_CROSS_HIER_ITEM,
+        &RELAX_USE_BEFORE_DECL,
+        &RELAX_LIBRARY_PACKAGES,
+    ]
 }
 
 thread_local! {
