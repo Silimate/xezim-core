@@ -4796,10 +4796,17 @@ impl<'a> Definition<'a> {
 /// declarations and continuous assignments to internal nets (the dead enable
 /// logic). Such an instance behaves as a direct assignment of its
 /// connections; anything else (a latch, an `always` block, an instance,
-/// another output) is a real cell and must be elaborated as written.
+/// another output) is a real cell and must be elaborated as written. So is a
+/// cell whose `clk_in` or `clk_out` net has a delay (§6.7.1, §28.16), a drive
+/// strength, or a net type that resolves or holds a value (§6.6): the direct
+/// assignment would drop it, and clock edges would arrive early or differ.
 fn is_clock_passthrough_cell(def: &Definition) -> bool {
     let Definition::Module(_) = def else {
         return false;
+    };
+    let clock_port = |n: &str| n == "clk_in" || n == "clk_out";
+    let plain_net = |t: Option<&NetType>| {
+        matches!(t, None | Some(NetType::Wire | NetType::Tri | NetType::Uwire))
     };
     let mut dirs: HashMap<&str, PortDirection> = HashMap::default();
     if let PortList::Ansi(ports) = def.ports() {
@@ -4808,6 +4815,9 @@ fn is_clock_passthrough_cell(def: &Definition) -> bool {
         for p in ports {
             if let Some(d) = p.direction {
                 last = d;
+            }
+            if clock_port(&p.name.name) && !plain_net(p.net_type.as_ref()) {
+                return false;
             }
             dirs.insert(p.name.name.as_str(), last);
         }
@@ -4825,17 +4835,24 @@ fn is_clock_passthrough_cell(def: &Definition) -> bool {
         match item {
             ModuleItem::PortDeclaration(pd) => {
                 for d in &pd.declarators {
-                    if d.init.is_some() {
+                    if d.init.is_some()
+                        || (clock_port(&d.name.name) && !plain_net(pd.net_type.as_ref()))
+                    {
                         return false;
                     }
                     dirs.insert(d.name.name.as_str(), pd.direction);
                 }
             }
             ModuleItem::NetDeclaration(nd) => {
+                let shaped = nd.delay.is_some()
+                    || nd.delay_fall.is_some()
+                    || nd.delay_off.is_some()
+                    || nd.strength.is_some()
+                    || !plain_net(Some(&nd.net_type));
                 if nd
                     .declarators
                     .iter()
-                    .any(|d| d.name.name == "clk_out" && d.init.is_some())
+                    .any(|d| clock_port(&d.name.name) && (shaped || d.init.is_some()))
                 {
                     return false;
                 }
@@ -4844,7 +4861,7 @@ fn is_clock_passthrough_cell(def: &Definition) -> bool {
                 if dd
                     .declarators
                     .iter()
-                    .any(|d| d.name.name == "clk_out" && d.init.is_some())
+                    .any(|d| clock_port(&d.name.name) && d.init.is_some())
                 {
                     return false;
                 }

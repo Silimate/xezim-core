@@ -1,8 +1,13 @@
-//! An instance of a module named `gated_clk_cell` is replaced by a direct
-//! assignment of its clock only when the module's body is the OpenC910
-//! pass-through (`assign clk_out = clk_in;` plus dead enable logic). Another
-//! design's `gated_clk_cell` that really gates its clock (Wujian100 latches
-//! the enable) is elaborated as written, with its signals and sub-instances.
+//! §23.3.2, §23.3.3: an instance is elaborated from its module's body, and
+//! its ports connect as continuous assignments (§10.3). xezim-core replaces an
+//! instance of a module named `gated_clk_cell` by a direct assignment of its
+//! clock, an optimization that is only equivalent when the module's body is
+//! the OpenC910 pass-through (`assign clk_out = clk_in;` plus dead enable
+//! logic). Another design's `gated_clk_cell` that really gates its clock
+//! (Wujian100 latches the enable) is elaborated as written, with its signals
+//! and sub-instances, reachable by hierarchical name (§23.6). So is a
+//! pass-through whose clock net has a delay (§6.7.1, §28.16), a strength or a
+//! resolving net type (§6.6), since the direct assignment would drop it.
 
 fn elaborate(src: &str, top: &str) -> xezim_core::ElaboratedModule {
     xezim_core::parse_and_elaborate_multi(
@@ -78,4 +83,45 @@ endmodule
         m.signals.contains_key("u.x_lat.q"),
         "its sub-instance exists for hierarchical references"
     );
+}
+
+/// The body is `assign clk_out = clk_in;`, but the clock net shapes what the
+/// connection sees: a net delay holds each edge back (§6.7.1, §28.16), and a
+/// `tri0`/`tri1` net pulls a floating clock to a value (§6.6.5). These cells
+/// are elaborated as written, so their delay or net type stays in effect.
+#[test]
+fn passthrough_with_a_shaped_clock_net_is_elaborated() {
+    let cells = [
+        ("net delay", "output clk_out; wire #5 clk_out;"),
+        ("rise and fall delays", "output clk_out; wire #(2, 3) clk_out;"),
+        ("pulled net", "output clk_out; tri1 clk_out;"),
+        ("pulled port", "output tri0 clk_out;"),
+        ("delayed input", "output clk_out; wire #1 clk_in;"),
+    ];
+    for (what, decl) in cells {
+        let m = elaborate(
+            &format!(
+                r#"
+module gated_clk_cell(clk_in, en, clk_out);
+  input clk_in;
+  input en;
+  {decl}
+  wire en_q;
+  assign en_q = en;
+  assign clk_out = clk_in;
+endmodule
+module top;
+  reg clk = 0;
+  wire gclk;
+  gated_clk_cell u (.clk_in(clk), .en(1'b1), .clk_out(gclk));
+endmodule
+"#
+            ),
+            "top",
+        );
+        assert!(
+            m.signals.contains_key("u.en_q"),
+            "{what}: the cell is elaborated as written"
+        );
+    }
 }
