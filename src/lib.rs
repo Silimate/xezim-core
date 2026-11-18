@@ -843,81 +843,36 @@ pub fn adopted_lib_files() -> Vec<(std::path::PathBuf, Vec<String>)> {
         .unwrap_or_default()
 }
 
-/// The preprocessing context `-v`/`-y` indexing ran under: the include dirs
-/// and the macro snapshot taken AFTER the primary sources (so a library file
-/// sees defines from the design, exactly as `index_library_file` did).
-/// Recorded once per run by `resolve_library_modules`; consumed by
-/// `preprocess_adopted_lib` so `--dump-merged-sv` can append library text
-/// with includes/macros resolved instead of raw bytes (raw text broke
-/// standalone re-compiles of the merged file the moment it left the original
-/// directory).
-static ADOPTED_LIB_PP_CONTEXT: std::sync::OnceLock<
-    std::sync::Mutex<Option<(Vec<String>, Vec<(String, preprocessor::MacroDef)>)>>,
-> = std::sync::OnceLock::new();
-
-fn adopted_lib_pp_context_cell()
--> &'static std::sync::Mutex<Option<(Vec<String>, Vec<(String, preprocessor::MacroDef)>)>> {
-    ADOPTED_LIB_PP_CONTEXT.get_or_init(|| std::sync::Mutex::new(None))
-}
-
-/// The macros each indexed library file started from (§22.5.1: the design's,
-/// and those of every library file read before it), for
-/// `preprocess_adopted_lib`.
-static LIB_FILE_DEFINES: std::sync::OnceLock<
+/// The text each adopted library file's definitions were parsed from, as
+/// `-v`/`-y` indexing preprocessed it (§22.5.1: from the design's macros and
+/// those of the library files read before it), or `None` when that
+/// preprocessing reported errors. Only adopted files are kept, the first
+/// read of a file named twice; recorded by `resolve_library_modules` and
+/// consumed by `preprocess_adopted_lib`, so `--dump-merged-sv` can append
+/// library text with includes and macros resolved instead of raw bytes (raw
+/// text broke standalone re-compiles of the merged file the moment it left
+/// the original directory).
+static ADOPTED_LIB_TEXTS: std::sync::OnceLock<
     std::sync::Mutex<
-        std::collections::HashMap<std::path::PathBuf, Vec<(String, preprocessor::MacroDef)>>,
+        std::collections::HashMap<std::path::PathBuf, Option<std::sync::Arc<str>>>,
     >,
 > = std::sync::OnceLock::new();
 
-fn lib_file_defines_cell() -> &'static std::sync::Mutex<
-    std::collections::HashMap<std::path::PathBuf, Vec<(String, preprocessor::MacroDef)>>,
+fn adopted_lib_texts_cell() -> &'static std::sync::Mutex<
+    std::collections::HashMap<std::path::PathBuf, Option<std::sync::Arc<str>>>,
 > {
-    LIB_FILE_DEFINES.get_or_init(Default::default)
+    ADOPTED_LIB_TEXTS.get_or_init(Default::default)
 }
 
-pub(crate) fn record_adopted_lib_pp_context(
-    include_dirs: &[String],
-    lib_defines: &std::collections::HashMap<String, preprocessor::MacroDef>,
-) {
-    if let Ok(mut g) = lib_file_defines_cell().lock() {
-        g.clear();
-    }
-    if let Ok(mut g) = adopted_lib_pp_context_cell().lock() {
-        *g = Some((
-            include_dirs.to_vec(),
-            lib_defines
-                .iter()
-                .map(|(k, v)| (k.clone(), v.clone()))
-                .collect(),
-        ));
-    }
-}
-
-/// Preprocess one adopted library file exactly as the `-v`/`-y` indexing pass
-/// did: a FRESH preprocessor per file with the recorded include dirs and the
-/// macros that file started from, resolving includes relative to the file
-/// itself. Returns None when no context was recorded (no library pass
-/// ran) or when preprocessing reports errors — callers fall back to the raw
-/// bytes so the merged dump still contains the file either way.
+/// One adopted library file's text exactly as the `-v`/`-y` indexing pass
+/// preprocessed it: includes resolved relative to the file, the recorded
+/// include dirs, and the macros that file started from. Returns None for a
+/// file no library pass adopted or whose preprocessing reported errors —
+/// callers fall back to the raw bytes so the merged dump still contains the
+/// file either way.
 pub fn preprocess_adopted_lib(path: &std::path::Path) -> Option<String> {
-    let ctx = adopted_lib_pp_context_cell().lock().ok()?.clone()?;
-    let source = read_library_file(path).ok()?;
-    let mut pp = preprocessor::Preprocessor::new();
-    for dir in &ctx.0 {
-        pp.add_include_dir(std::path::PathBuf::from(dir));
-    }
-    let own = lib_file_defines_cell()
-        .lock()
-        .ok()
-        .and_then(|g| g.get(path).cloned());
-    for (name, def) in own.as_ref().unwrap_or(&ctx.1) {
-        pp.define(name.clone(), def.clone());
-    }
-    let text = pp.preprocess_file(&source, Some(path));
-    if !pp.errors().is_empty() {
-        return None;
-    }
-    Some(text)
+    let texts = adopted_lib_texts_cell().lock().ok()?;
+    texts.get(path)?.as_deref().map(str::to_string)
 }
 
 static MODULE_TIMESCALE_CLI: std::sync::OnceLock<std::sync::Mutex<ModuleTimescaleCli>> =
@@ -1445,6 +1400,13 @@ pub fn parse_and_elaborate_multi_preprocessed(
                 _ => None,
             })
             .collect();
+        // §22.5.1: the module pass (`resolve_library_modules`) reads the
+        // `-v` files in this order, each from the macros the design and the
+        // files before it left. Read them the same way here, files without
+        // packages included, so a `` `define `` in one library file picks
+        // the same `` `ifdef `` branch of a later one in both passes: the
+        // package compiled here is then the one the adopted module imports.
+        let mut lib_macros = lib_defines.clone();
         for file in lib_files {
             let path = std::path::PathBuf::from(&file);
             // An unreadable file is reported when the library is indexed.
@@ -1455,10 +1417,11 @@ pub fn parse_and_elaborate_multi_preprocessed(
             for dir in include_dirs {
                 lpp.add_include_dir(std::path::PathBuf::from(dir));
             }
-            for (name, def) in &lib_defines {
+            for (name, def) in &lib_macros {
                 lpp.define(name.clone(), def.clone());
             }
             let preprocessed = lpp.preprocess_file(&text, Some(&path));
+            lib_macros = lpp.snapshot_defines();
             let line_map = lpp.take_line_map();
             let result = sv_parser::parse(&preprocessed);
             let line_map = line_map.filter(|_| result.source_text == preprocessed);
@@ -4201,9 +4164,6 @@ fn resolve_library_modules(
     lib_cli: &LibraryCli,
     unit_binds: &[ast::decl::BindDirective],
 ) -> Result<(), String> {
-    // Remember this pass's preprocessing context so --dump-merged-sv can
-    // re-preprocess ADOPTED files identically (see preprocess_adopted_lib).
-    record_adopted_lib_pp_context(include_dirs, lib_defines);
     fn collect_sv_files(
         dir: &std::path::Path,
         exts: &[String],
@@ -4285,6 +4245,9 @@ fn resolve_library_modules(
     // name), so a diagnostic inside an ADOPTED definition names its own file;
     // and the packages library files declared, which are never compiled.
     let mut lib_sources = elaborate::LibrarySources::default();
+    // Per entry of `lib_sources.files`: its file, and whether it preprocessed
+    // without errors (see `preprocess_adopted_lib`).
+    let mut indexed: Vec<(std::path::PathBuf, bool)> = Vec::new();
     // The macros defined so far: the design's, then each library file's as
     // it is read (see `index_library_file`).
     let mut lib_macros = lib_defines.clone();
@@ -4301,6 +4264,7 @@ fn resolve_library_modules(
         parse_issue_files: &mut Vec<std::path::PathBuf>,
         lib_origins: &mut crate::hasher::HashMap<String, (std::path::PathBuf, bool, &'static str)>,
         lib_sources: &mut elaborate::LibrarySources,
+        indexed: &mut Vec<(std::path::PathBuf, bool)>,
     ) {
         let source = match read_library_file(&path) {
             Ok(s) => s,
@@ -4321,15 +4285,6 @@ fn resolve_library_modules(
         for (name, def) in lib_defines.iter() {
             pp.define(name.clone(), def.clone());
         }
-        if let Ok(mut g) = lib_file_defines_cell().lock() {
-            g.insert(
-                path.clone(),
-                lib_defines
-                    .iter()
-                    .map(|(k, v)| (k.clone(), v.clone()))
-                    .collect(),
-            );
-        }
         let preprocessed = pp.preprocess_file(&source, Some(&path));
         // §22.5.1, §3.12.1: a library file is read as part of the one
         // compilation, so a macro it defines (or an `include` of the
@@ -4345,6 +4300,7 @@ fn resolve_library_modules(
         for e in pp.errors() {
             eprintln!("{}", e);
         }
+        let preprocessed_cleanly = pp.errors().is_empty();
         let result = sv_parser::parse(&preprocessed);
         // Spans index the re-parsed text; it is the preprocessed text again
         // (nothing is left to expand), so the map applies to it.
@@ -4523,7 +4479,8 @@ fn resolve_library_modules(
             }
             lib_sources
                 .files
-                .push((file_label, result.source_text, line_map));
+                .push((file_label, result.source_text.into(), line_map));
+            indexed.push((path, preprocessed_cleanly));
         }
     }
 
@@ -4540,6 +4497,7 @@ fn resolve_library_modules(
             &mut parse_issue_files,
             &mut lib_origins,
             &mut lib_sources,
+            &mut indexed,
         );
     }
 
@@ -4621,6 +4579,7 @@ fn resolve_library_modules(
                     &mut parse_issue_files,
                     &mut lib_origins,
                     &mut lib_sources,
+                    &mut indexed,
                 );
             }
             if !lib.contains_key(&name) && !full_scan_done {
@@ -4638,6 +4597,7 @@ fn resolve_library_modules(
                         &mut parse_issue_files,
                         &mut lib_origins,
                         &mut lib_sources,
+                        &mut indexed,
                     );
                 }
             }
@@ -4789,6 +4749,7 @@ fn resolve_library_modules(
                 &mut parse_issue_files,
                 &mut lib_origins,
                 &mut lib_sources,
+                &mut indexed,
             );
         }
     }
@@ -4802,13 +4763,20 @@ fn resolve_library_modules(
         }
     }
     // Publish only the files an adopted definition came from.
-    let mut slots: Vec<Option<(String, String, Option<sv_parser::source_map::LineMap>)>> =
-        std::mem::take(&mut lib_sources.files)
-            .into_iter()
-            .map(Some)
-            .collect();
+    #[allow(clippy::type_complexity)]
+    let mut slots: Vec<
+        Option<(String, std::sync::Arc<str>, Option<sv_parser::source_map::LineMap>)>,
+    > = std::mem::take(&mut lib_sources.files)
+        .into_iter()
+        .map(Some)
+        .collect();
     let mut renumber: crate::hasher::HashMap<u32, u32> = Default::default();
     let mut def_file: crate::hasher::HashMap<String, u32> = Default::default();
+    #[allow(clippy::type_complexity)]
+    let mut adopted_texts: std::collections::HashMap<
+        std::path::PathBuf,
+        (u32, Option<std::sync::Arc<str>>),
+    > = Default::default();
     for (name, i) in std::mem::take(&mut lib_sources.def_file) {
         if !adopted.contains(&name) {
             continue;
@@ -4819,6 +4787,21 @@ fn resolve_library_modules(
                 let Some(file) = slots.get_mut(i as usize).and_then(Option::take) else {
                     continue;
                 };
+                // `preprocess_adopted_lib`'s text: of the first read that an
+                // adopted definition came from, for a file named twice.
+                if let Some((path, clean)) = indexed.get(i as usize) {
+                    let text = clean.then(|| file.1.clone());
+                    match adopted_texts.entry(path.clone()) {
+                        std::collections::hash_map::Entry::Occupied(mut e) => {
+                            if i < e.get().0 {
+                                e.insert((i, text));
+                            }
+                        }
+                        std::collections::hash_map::Entry::Vacant(e) => {
+                            e.insert((i, text));
+                        }
+                    }
+                }
                 let j = lib_sources.files.len() as u32;
                 lib_sources.files.push(file);
                 renumber.insert(i, j);
@@ -4828,6 +4811,9 @@ fn resolve_library_modules(
         def_file.insert(name, j);
     }
     lib_sources.def_file = def_file;
+    if let Ok(mut g) = adopted_lib_texts_cell().lock() {
+        g.extend(adopted_texts.into_iter().map(|(p, (_, t))| (p, t)));
+    }
     elaborate::set_elab_library_sources(lib_sources);
     Ok(())
 }
