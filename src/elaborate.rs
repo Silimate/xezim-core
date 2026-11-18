@@ -53485,6 +53485,30 @@ fn query_of_bound_type_param(name: &str, args: &[Expression]) -> Option<i64> {
     })
 }
 
+/// §6.20.3, §7.4.1: `T [1:0] tmp;` with `T` bound to `bound` declares a packed
+/// array of `bound`: its own packed dimensions stay innermost and `dims` go
+/// outside them (`logic [7:0]` becomes `logic [1:0][7:0]`). `None` for a
+/// type that cannot carry packed dimensions here (an atom such as `int`, an
+/// unpacked aggregate, a class), which keeps the declaration as written.
+fn with_outer_packed_dims(bound: &DataType, dims: &[PackedDimension]) -> Option<DataType> {
+    if dims.is_empty() {
+        return Some(bound.clone());
+    }
+    let mut out = bound.clone();
+    let inner = match &mut out {
+        DataType::IntegerVector { dimensions, .. }
+        | DataType::Implicit { dimensions, .. }
+        | DataType::TypeReference { dimensions, .. } => dimensions,
+        DataType::Struct(su) if su.packed => &mut su.dimensions,
+        DataType::Enum(e) => &mut e.dimensions,
+        _ => return None,
+    };
+    let mut all = dims.to_vec();
+    all.append(inner);
+    *inner = all;
+    Some(out)
+}
+
 /// `substitute_type_params_stmt` over a subroutine body.
 fn substitute_type_params_stmts(
     stmts: Vec<Statement>,
@@ -53523,12 +53547,12 @@ fn substitute_type_params_stmt(stmt: Statement, binds: &HashMap<String, DataType
                     dimensions,
                     type_args,
                     ..
-                } if dimensions.is_empty()
-                    && type_args.is_empty()
+                } if type_args.is_empty()
                     && name.scopes.is_empty()
                     && binds.contains_key(&name.name.name) =>
                 {
-                    binds[&name.name.name].clone()
+                    with_outer_packed_dims(&binds[&name.name.name], dimensions)
+                        .unwrap_or_else(|| data_type.clone())
                 }
                 _ => data_type,
             };
