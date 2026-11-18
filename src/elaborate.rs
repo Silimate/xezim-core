@@ -31334,6 +31334,20 @@ fn eval_const_expr_val_inner(
                     {
                         return ev.clone();
                     }
+                    // §26.3: an element of a PACKAGE array parameter read in
+                    // an instance's scope (`V[k]` after `import p::*`, or
+                    // `p::V[k]`). The scope's map holds the instance's own
+                    // parameters only; the package's elements are in the
+                    // package/$unit snapshot, as its scalars are for the
+                    // Ident arm. An array of the scope's own takes precedence.
+                    let prefix = format!("{k}[");
+                    if !params.contains_key(k)
+                        && !params.keys().any(|name| name.starts_with(&prefix))
+                        && let Some(ev) =
+                            signed_index.and_then(|i| param_fallback_get(&format!("{k}[{i}]")))
+                    {
+                        return ev;
+                    }
                     // §7.4.6: an invalid array index reads the element's
                     // default; it must not select an unrelated bare name.
                     if let Some(value) = array_params::default_value(k) {
@@ -34386,6 +34400,15 @@ fn inline_instantiations_inner(
                                 );
                                 let is_implicit = matches!(data_type, DataType::Implicit { dimensions, .. } if dimensions.is_empty());
                                 for assign in assignments {
+                                    // §6.20.2: an unpacked-array parameter was
+                                    // registered element by element in the
+                                    // passes above. `eval_param_value` reads
+                                    // the data type alone, without the
+                                    // declarator's dimensions, so folding it
+                                    // here wrote the bare name as 0.
+                                    if !assign.dimensions.is_empty() {
+                                        continue;
+                                    }
                                     // Implicit-typed param: use the sized-
                                     // literal width from the initializer when
                                     // present, instead of defaulting to 32.
