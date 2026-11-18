@@ -1,7 +1,9 @@
 //! §25.3, §23.3.3: an interface port is connected to an interface instance
 //! or to an interface port of the parent; an instance that leaves one
 //! unconnected (absent from a named list, `.p()`, or an empty ordered slot)
-//! is an error. `--relax-unconnected-interface-port`
+//! is an error, as is a `.*` port with no interface of its name in the
+//! parent, declared there or added by a `bind`.
+//! `--relax-unconnected-interface-port`
 //! (`RELAX_UNCONNECTED_INTERFACE_PORT`) elaborates it, with a warning. One
 //! test, since the switch is process-wide.
 
@@ -66,6 +68,24 @@ fn an_unconnected_interface_port_is_an_error_unless_relaxed() {
     xezim_core::parse_and_elaborate_multi(&[src], None, &[], &["top.sv".into()], &[])
         .map(|_| ())
         .expect("an automatically found top keeps its interface port");
+
+    // §23.11: an interface a `bind` adds to the target fills a `.*` port
+    // of an instance bound there too; without it the port is unconnected.
+    let bound = |with_bus: bool| {
+        let src = format!(
+            "interface mem_if; logic rq; endinterface\n\
+             module gen (interface bus, output logic o); assign o = bus.rq; endmodule\n\
+             module tgt; logic o; endmodule\n\
+             module top; tgt u (); endmodule\n\
+             {}bind tgt gen g (.*);\n",
+            if with_bus { "bind tgt mem_if bus ();\n" } else { "" }
+        );
+        xezim_core::parse_and_elaborate_multi(&[src], Some("top"), &[], &["top.sv".into()], &[])
+            .map(|_| ())
+    };
+    bound(true).expect("a bound interface fills the bound instance's .* port");
+    let err = bound(false).expect_err("no interface named bus in the target");
+    assert!(err.contains("interface port 'bus'"), "{err}");
 
     xezim_core::sv_parser::RELAX_UNCONNECTED_INTERFACE_PORT.set(true);
     elaborate("dut u (.clk(clk), .q(q));").expect("elaborated with the switch");

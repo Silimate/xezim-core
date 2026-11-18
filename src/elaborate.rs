@@ -36706,9 +36706,11 @@ fn collect_effective_items(
 /// interface named `name` for a `.*` connection to an interface port: an
 /// interface port of its own (bound for this instance in `interface_map`,
 /// or in its header; a non-ANSI header names it without a type), or an
-/// interface instance anywhere in its items.
+/// interface instance anywhere in its items or in `items`, the items this
+/// instance elaborates, which include instances a `bind` adds (§23.11).
 fn parent_declares_interface(
     def: Definition,
+    items: &[ModuleItem],
     definitions: &HashMap<String, Definition>,
     interface_map: &HashMap<String, String>,
     name: &str,
@@ -36759,7 +36761,7 @@ fn parent_declares_interface(
         }
         PortList::Empty => {}
     }
-    instantiates(def.items(), definitions, name)
+    instantiates(items, definitions, name) || instantiates(def.items(), definitions, name)
 }
 
 fn is_interface_type(dt: &DataType, definitions: &HashMap<String, Definition>) -> bool {
@@ -40219,6 +40221,7 @@ fn inline_module_items(
                                 if is_if_port {
                                     if !parent_declares_interface(
                                         source_def,
+                                        &prepared_source.effective_items,
                                         definitions,
                                         interface_map,
                                         &name,
