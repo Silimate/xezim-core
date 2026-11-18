@@ -21963,12 +21963,42 @@ fn lsdd_may_fold_type(dt: &DataType) -> bool {
 
 /// Match `lsdd_expr`: literal and name-free endpoints are already immutable.
 fn lsdd_may_fold_expr(expr: &Expression) -> bool {
-    if matches!(expr.kind, ExprKind::Number(_)) {
-        return false;
-    }
+    !matches!(expr.kind, ExprKind::Number(_)) && lsdd_names_value(expr)
+}
+
+/// Whether a dimension endpoint names a value the fold can bind. §20.8,
+/// §20.9: the argument of a value system function (`$clog2(P)`,
+/// `$signed(P)`, a cast) is such a name too; `[$clog2(P)-1:0]` in an
+/// instance otherwise kept its bare `P`, which the design-wide map holds only
+/// as `u.P`, and the local was one bit wide. §20.6, §20.7: a query of a
+/// declaration (`$bits(v)`, `$size(a)`) is left to the run time, where a
+/// block local shadows the module's names.
+fn lsdd_names_value(expr: &Expression) -> bool {
     let mut names = Vec::new();
     collect_ident_names(expr, &mut names);
-    !names.is_empty()
+    if !names.is_empty() {
+        return true;
+    }
+    let mut found = false;
+    for_each_sub_expr(expr, &mut |e| {
+        if let ExprKind::SystemCall { name, args } = &e.kind {
+            found |= !matches!(
+                name.as_str(),
+                "$bits"
+                    | "$size"
+                    | "$left"
+                    | "$right"
+                    | "$low"
+                    | "$high"
+                    | "$increment"
+                    | "$dimensions"
+                    | "$unpacked_dimensions"
+                    | "$isunbounded"
+                    | "$typename"
+            ) && args.iter().any(lsdd_names_value);
+        }
+    });
+    found
 }
 
 /// One subroutine/process body. The fold runs against a lexically scoped
@@ -22156,9 +22186,7 @@ fn lsdd_expr(e: &mut Expression, env: &HashMap<String, Value>) {
         return;
     }
     // Nothing to gain on a name-free expression.
-    let mut names: Vec<String> = Vec::new();
-    collect_ident_names(e, &mut names);
-    if names.is_empty() {
+    if !lsdd_names_value(e) {
         return;
     }
     let Some(v) = const_eval_i64_with_params(e, Some(env)) else {
