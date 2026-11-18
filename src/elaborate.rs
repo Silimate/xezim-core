@@ -40852,13 +40852,33 @@ fn inline_module_items(
                                                 } else {
                                                     None
                                                 };
+                                                // §6.20.2, §7.2.1: the element type may be
+                                                // a typedef of this body (not bound yet),
+                                                // and the generate constructs read
+                                                // `Info[k].variant`: inline the instance's
+                                                // types, as the scalar arm below does, and
+                                                // register the element layout under the
+                                                // array's name.
+                                                let inlined = inline_instance_typedefs(data_type);
+                                                let elem_dt = inlined.as_ref().unwrap_or(data_type);
+                                                if let Some(fields) = packed_struct_field_layout(
+                                                    elem_dt,
+                                                    local_map,
+                                                    &elab_ro.typedefs,
+                                                    &elab_ro.typedef_types,
+                                                ) {
+                                                    tls_register_struct_layout(
+                                                        &assign.name.name,
+                                                        &fields,
+                                                    );
+                                                }
                                                 if let Some(values) = array_params::elements(
                                                     elab_ro,
                                                     &assign.name.name,
                                                     &assign.dimensions,
                                                     init,
                                                     packed,
-                                                    data_type,
+                                                    elem_dt,
                                                     local_map,
                                                     init_params,
                                                 ) {
@@ -42090,6 +42110,9 @@ fn inline_module_items(
                         } else {
                             None
                         };
+                        // §6.20.2: with this body's own types inlined, as
+                        // the constant fold above evaluated the elements.
+                        let inlined = inline_instance_typedefs(data_type);
                         if array_params::register(
                             elab,
                             &inst_prefix,
@@ -42097,7 +42120,7 @@ fn inline_module_items(
                             &assign.dimensions,
                             init,
                             packed,
-                            data_type,
+                            inlined.as_ref().unwrap_or(data_type),
                             &snapshot,
                             if override_expr.is_some() {
                                 scoped_eval_params
