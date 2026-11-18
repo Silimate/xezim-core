@@ -53517,6 +53517,37 @@ fn substitute_type_params_stmts(
     if binds.is_empty() {
         return stmts;
     }
+    substitute_type_params_block(stmts, binds)
+}
+
+/// §6.18, §6.20.3: the statements of one block or subroutine body. A typedef
+/// declared there (`typedef logic [3:0] T;`) hides a type parameter of the
+/// same name for the whole block, so its declarations keep naming the local
+/// type.
+fn substitute_type_params_block(
+    stmts: Vec<Statement>,
+    binds: &HashMap<String, DataType>,
+) -> Vec<Statement> {
+    let shadowed: Vec<&str> = stmts
+        .iter()
+        .filter_map(|st| match &st.kind {
+            StatementKind::Typedef(td) if binds.contains_key(&td.name.name) => {
+                Some(td.name.name.as_str())
+            }
+            _ => None,
+        })
+        .collect();
+    let narrowed;
+    let binds = if shadowed.is_empty() {
+        binds
+    } else {
+        narrowed = binds
+            .iter()
+            .filter(|(k, _)| !shadowed.contains(&k.as_str()))
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect::<HashMap<String, DataType>>();
+        &narrowed
+    };
     stmts
         .into_iter()
         .map(|st| substitute_type_params_stmt(st, binds))
@@ -53621,10 +53652,7 @@ fn substitute_type_params_stmt(stmt: Statement, binds: &HashMap<String, DataType
         StatementKind::Forever { body } => StatementKind::Forever { body: sub(body) },
         StatementKind::SeqBlock { name, stmts } => StatementKind::SeqBlock {
             name,
-            stmts: stmts
-                .into_iter()
-                .map(|st| substitute_type_params_stmt(st, binds))
-                .collect(),
+            stmts: substitute_type_params_block(stmts, binds),
         },
         StatementKind::ParBlock {
             name,
@@ -53633,10 +53661,7 @@ fn substitute_type_params_stmt(stmt: Statement, binds: &HashMap<String, DataType
         } => StatementKind::ParBlock {
             name,
             join_type,
-            stmts: stmts
-                .into_iter()
-                .map(|st| substitute_type_params_stmt(st, binds))
-                .collect(),
+            stmts: substitute_type_params_block(stmts, binds),
         },
         StatementKind::TimingControl { control, stmt } => StatementKind::TimingControl {
             control,
