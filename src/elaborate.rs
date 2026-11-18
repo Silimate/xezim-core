@@ -21972,33 +21972,131 @@ fn lsdd_may_fold_expr(expr: &Expression) -> bool {
 /// instance otherwise kept its bare `P`, which the design-wide map holds only
 /// as `u.P`, and the local was one bit wide. §20.6, §20.7: a query of a
 /// declaration (`$bits(v)`, `$size(a)`) is left to the run time, where a
-/// block local shadows the module's names.
+/// block local shadows the module's names, together with everything inside
+/// it (`$bits($signed(N))`).
 fn lsdd_names_value(expr: &Expression) -> bool {
     let mut names = Vec::new();
     collect_ident_names(expr, &mut names);
     if !names.is_empty() {
         return true;
     }
+    let has_query = {
+        let mut q = false;
+        for_each_sub_expr(expr, &mut |e| {
+            q |= matches!(&e.kind, ExprKind::SystemCall { name, .. } if lsdd_is_decl_query(name));
+        });
+        q
+    };
+    let pruned;
+    let expr = if has_query {
+        // Pre-order: a query collapses to a literal before its arguments
+        // would be visited.
+        let mut e = expr.clone();
+        for_each_sub_expr_mut(&mut e, &mut |x| {
+            if matches!(&x.kind, ExprKind::SystemCall { name, .. } if lsdd_is_decl_query(name)) {
+                x.kind = ExprKind::Number(crate::ast::expr::NumberLiteral::UnbasedUnsized('0'));
+            }
+        });
+        pruned = e;
+        &pruned
+    } else {
+        expr
+    };
     let mut found = false;
     for_each_sub_expr(expr, &mut |e| {
-        if let ExprKind::SystemCall { name, args } = &e.kind {
-            found |= !matches!(
-                name.as_str(),
-                "$bits"
-                    | "$size"
-                    | "$left"
-                    | "$right"
-                    | "$low"
-                    | "$high"
-                    | "$increment"
-                    | "$dimensions"
-                    | "$unpacked_dimensions"
-                    | "$isunbounded"
-                    | "$typename"
-            ) && args.iter().any(lsdd_names_value);
+        if let ExprKind::SystemCall { args, .. } = &e.kind {
+            found |= args.iter().any(|a| {
+                let mut names = Vec::new();
+                collect_ident_names(a, &mut names);
+                !names.is_empty()
+            });
         }
     });
     found
+}
+
+/// §20.6, §20.7: system functions that query a declaration rather than
+/// compute from a value.
+fn lsdd_is_decl_query(name: &str) -> bool {
+    matches!(
+        name,
+        "$bits"
+            | "$size"
+            | "$left"
+            | "$right"
+            | "$low"
+            | "$high"
+            | "$increment"
+            | "$dimensions"
+            | "$unpacked_dimensions"
+            | "$isunbounded"
+            | "$typename"
+    )
+}
+
+/// A decimal literal the i64 dimension evaluators read back as `v`.
+fn lsdd_literal(v: i64) -> ExprKind {
+    ExprKind::Number(crate::ast::expr::NumberLiteral::Integer {
+        size: None,
+        signed: true,
+        base: crate::ast::expr::NumberBase::Decimal,
+        value: v.to_string(),
+        cached_val: crate::ast::cache::LiteralCache::new(None),
+    })
+}
+
+/// Const-evaluate a dimension endpoint in this scope. §11.7: `$signed(x)`
+/// and `$unsigned(x)` reinterpret `x` at its own width (`$signed` of an
+/// 8-bit `8'hff` is -1), which `const_eval_i64_with_params` cannot see: it
+/// treats both as the identity. Each such call is folded first from the
+/// operand's sized value; one whose operand has no known integral value
+/// leaves the endpoint unfolded.
+fn lsdd_eval(e: &Expression, env: &HashMap<String, Value>) -> Option<i64> {
+    let mut has_cast = false;
+    for_each_sub_expr(e, &mut |x| {
+        has_cast |= matches!(&x.kind, ExprKind::SystemCall { name, args }
+            if (name == "$signed" || name == "$unsigned") && args.len() == 1);
+    });
+    if !has_cast {
+        return const_eval_i64_with_params(e, Some(env));
+    }
+    let mut e = e.clone();
+    let mut ok = true;
+    for_each_sub_expr_mut(&mut e, &mut |x| {
+        let ExprKind::SystemCall { name, args } = &x.kind else {
+            return;
+        };
+        if !((name == "$signed" || name == "$unsigned") && args.len() == 1) || !ok {
+            return;
+        }
+        let v = eval_const_expr_val(&args[0], env);
+        let w = v.width;
+        let raw = match v.to_u64() {
+            Some(r) if !v.is_real && !v.has_xz() && (1..=64).contains(&w) => r,
+            _ => {
+                ok = false;
+                return;
+            }
+        };
+        let raw = if w < 64 { raw & ((1u64 << w) - 1) } else { raw };
+        let folded = if name == "$signed" {
+            if w < 64 && raw >> (w - 1) & 1 == 1 {
+                (raw | !((1u64 << w) - 1)) as i64
+            } else {
+                raw as i64
+            }
+        } else if raw > i64::MAX as u64 {
+            ok = false;
+            return;
+        } else {
+            raw as i64
+        };
+        x.kind = lsdd_literal(folded);
+    });
+    if !ok {
+        return None;
+    }
+    const_eval_i64_with_params(&e, Some(env))
 }
 
 /// One subroutine/process body. The fold runs against a lexically scoped
@@ -22189,16 +22287,10 @@ fn lsdd_expr(e: &mut Expression, env: &HashMap<String, Value>) {
     if !lsdd_names_value(e) {
         return;
     }
-    let Some(v) = const_eval_i64_with_params(e, Some(env)) else {
+    let Some(v) = lsdd_eval(e, env) else {
         return;
     };
-    e.kind = ExprKind::Number(crate::ast::expr::NumberLiteral::Integer {
-        size: None,
-        signed: true,
-        base: crate::ast::expr::NumberBase::Decimal,
-        value: v.to_string(),
-        cached_val: crate::ast::cache::LiteralCache::new(None),
-    });
+    e.kind = lsdd_literal(v);
 }
 
 /// Replace a single delay expression with its tick-count equivalent.
@@ -56873,6 +56965,54 @@ mod prepared_callable_ownership_tests {
                     _ => panic!("unpacked dimension expected"),
                 }
             }
+        }
+    }
+
+    /// §20.8.1, §11.7, §20.6.2: a value system function of a parameter folds
+    /// per instance, `$signed` reinterprets its operand at the operand's own
+    /// width, and a query (with everything inside it) is left to the run time.
+    #[test]
+    fn dimension_fold_value_system_functions() {
+        let original = module_items(
+            "module leaf #(parameter logic [7:0] P = 8'hff, parameter int N = 1);
+               task t();
+                 logic [$clog2(N)-1:0] a;
+                 logic [($signed(P) < 0 ? 8 : 4)-1:0] b;
+                 logic [$unsigned(P)-1:0] c;
+                 logic [$bits($signed(N))-1:0] d;
+               endtask
+             endmodule",
+        );
+        for n in [256u64, 64] {
+            let mut prepared = original.clone();
+            literalize_stmt_decl_dims(
+                &mut prepared,
+                &HashMap::from_iter([
+                    ("P".into(), Value::from_u64(0xff, 8)),
+                    ("N".into(), Value::from_u64(n, 32)),
+                ]),
+            );
+            let body = callable_bodies(&prepared).remove(0);
+            let left = |index: usize| {
+                let StatementKind::VarDecl { data_type, .. } = &body[index].kind else {
+                    panic!("local declaration expected");
+                };
+                let DataType::IntegerVector { dimensions, .. } = data_type else {
+                    panic!("vector type expected");
+                };
+                let PackedDimension::Range { left, .. } = &dimensions[0] else {
+                    panic!("packed range expected");
+                };
+                left.clone()
+            };
+            let folded = |index: usize| match &left(index).kind {
+                ExprKind::Number(_) => const_eval_i64_with_params(&left(index), None),
+                _ => None,
+            };
+            assert_eq!(folded(0), Some(n.trailing_zeros() as i64 - 1));
+            assert_eq!(folded(1), Some(7));
+            assert_eq!(folded(2), Some(254));
+            assert_eq!(folded(3), None, "a query must stay for the run time");
         }
     }
 
