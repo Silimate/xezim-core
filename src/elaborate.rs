@@ -5456,15 +5456,17 @@ fn specialized_class_scope_width_at(
     // stands for, which may be a specialization itself (`Cfg#(8)::m`).
     // The alias applies only where the scoped key is missing, as in
     // `lookup_scoped_type`.
+    // When the rewritten name does not size, the forms below still apply.
     if depth < 8
         && let Some(alt) = class_scope_types::specialized(name).or_else(|| {
             (!elab.typedefs.contains_key(&name.qualified()))
                 .then(|| class_scope_types::through_alias(name))
                 .flatten()
         })
+        && let Some(w) = specialized_class_scope_width_at(&alt, elab, depth + 1)
+            .or_else(|| lookup_scoped_type(&alt, &elab.typedefs).copied())
     {
-        return specialized_class_scope_width_at(&alt, elab, depth + 1)
-            .or_else(|| lookup_scoped_type(&alt, &elab.typedefs).copied());
+        return Some(w);
     }
     // The scope link carrying `#(...)` args names the specialized class;
     // without one, the last link may be a typedef naming a specialization.
@@ -6341,10 +6343,17 @@ fn lookup_scoped_type_at<'a, T>(
         .get(&name.qualified())
         .or_else(|| {
             // §6.20.3: a type parameter or typedef used as a class scope
-            // (`C::t`) names the class it is bound to.
+            // (`C::t`) names the class it is bound to. A specialization
+            // with arguments this lookup cannot bind (`h_t::t` with
+            // `typedef C#(byte, 6) h_t;`) would read the default
+            // specialization's `C::t`, so it keeps the fallback below; its
+            // width is bound by `specialized_class_scope_width`.
             (depth < MAX_REWRITES)
                 .then(|| class_scope_types::through_alias(name))
                 .flatten()
+                .filter(|alt| {
+                    !alt.has_specialized_scope() || class_scope_types::specialized(alt).is_some()
+                })
                 .and_then(|alt| lookup_scoped_type_at(&alt, table, depth + 1))
         })
         .or_else(|| table.get(&name.name.name))

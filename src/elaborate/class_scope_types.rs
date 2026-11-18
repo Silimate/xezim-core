@@ -297,6 +297,25 @@ fn default_type_name(class: &ClassTypeScope, param: &str) -> Option<(TypeName, V
     }
 }
 
+/// The keyword types a `#(...)` argument may spell as an identifier.
+const BUILTIN_TYPE_KEYWORDS: &[&str] = &[
+    "bit",
+    "logic",
+    "reg",
+    "byte",
+    "shortint",
+    "int",
+    "longint",
+    "integer",
+    "time",
+    "real",
+    "shortreal",
+    "realtime",
+    "string",
+    "chandle",
+    "event",
+];
+
 /// A `#(...)` type argument that names a type: `cfg_t`, `pkg::cfg_t`, or a
 /// type literal of a named type (with its own specialization arguments).
 fn arg_type_name(e: &Expression) -> Option<(TypeName, Vec<Expression>)> {
@@ -311,8 +330,12 @@ fn arg_type_name(e: &Expression) -> Option<(TypeName, Vec<Expression>)> {
             } if dimensions.is_empty() => Some((name.clone(), type_args.clone())),
             _ => None,
         },
+        // A built-in type keyword argument (`#(byte)`) is no type name.
         ExprKind::Ident(h)
-            if h.root.is_none() && h.path.len() == 1 && h.path[0].selects.is_empty() =>
+            if h.root.is_none()
+                && h.path.len() == 1
+                && h.path[0].selects.is_empty()
+                && !BUILTIN_TYPE_KEYWORDS.contains(&h.path[0].name.name.as_str()) =>
         {
             Some((
                 TypeName {
