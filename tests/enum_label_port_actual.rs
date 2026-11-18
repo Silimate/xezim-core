@@ -91,6 +91,42 @@ endmodule
     );
 }
 
+/// §3.13, §6.10: definitions have a name space of their own, so a module
+/// named `LINK` in the design leaves a bare port actual `LINK` the implicit
+/// net of the scope it is used in, below the top and at it.
+#[test]
+fn module_name_leaves_the_implicit_net() {
+    let m = elaborate(
+        r#"
+module LINK;
+endmodule
+module drv (output logic o);
+  initial o = 1'b1;
+endmodule
+module rcv (input logic i, output logic seen);
+  always @(i) seen = i;
+endmodule
+module wrap (output logic seen);
+  drv d (.o(LINK));
+  rcv r (.i(LINK), .seen(seen));
+endmodule
+module top;
+  logic seen, seen_top;
+  wrap w (.seen(seen));
+  drv d (.o(LINK));
+  rcv r (.i(LINK), .seen(seen_top));
+endmodule
+"#,
+    );
+    for net in ["w.LINK", "LINK"] {
+        assert!(
+            m.implicit_nets.contains(net),
+            "no implicit net {net}: {:?}",
+            m.implicit_nets
+        );
+    }
+}
+
 /// §6.10, §26.3: a label a module imports from a package (or `$unit`) and
 /// uses in a port actual is the package's constant, not a local name of the
 /// module: the inlined module's uses of it keep the bare name instead of
