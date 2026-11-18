@@ -240,7 +240,18 @@ pub use value::Value;
 /// \x49 = \x48 + package members left unrooted in continuous assignments that write another
 ///         scope (§26.3), member signals for each element of a multi-dimensional unpacked-struct
 ///         array (§7.4.2), and `binsof()` of a hierarchical cross item (§19.6.1).
-pub const XEZIM_BYTECODE_MAGIC: &[u8; 8] = b"XEZIMBC\x49";
+/// \x4a = \x49 + fill operands of real operators folded at one bit (§5.7.1), stream operands
+///         keeping their `with [ array_range ]` (§11.4.14.4), per-driver delay stages and
+///         declaration-initializer drivers of user-defined nettype nets (§10.3.3, §6.6.7), and
+///         nettype input ports kept apart from non-nettype actuals (§23.3.3).
+/// \x4b = \x4a + unsized signed decimal numbers sized by their magnitude and a sign bit in
+///         parameters, constant expressions and cached literals (§5.7.1).
+/// \x4c = \x4b + package parameters qualified in the data types of package subroutines and
+///         classes (§26.3), an instance's `[N]` sized by its module's uncontested import
+///         (§7.4.2), nested classes named through a specialized host by their renamed spelling
+///         (§8.23), class-local typedef property widths (§6.18) and package sequences and
+///         properties under `pkg::name` keys (§16.8, §26.3).
+pub const XEZIM_BYTECODE_MAGIC: &[u8; 8] = b"XEZIMBC\x4c";
 
 /// Name of the synthetic root that instantiates every top of a multi-top
 /// design (§23.3.3), each instance named after its module. It is not part of

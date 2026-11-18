@@ -2822,8 +2822,13 @@ fn elaborate_class_in_scope(
                 // `resolve_type_width`'s TypeReference branch, which returns a
                 // flat 32 when it has no table — so every such property was
                 // recorded 32 bits wide however narrow its type.
-                let width =
-                    typedefs_snapshot(|td| resolve_type_width(&p.data_type, class_params, td));
+                // §6.18, §8.25: a type the class itself declares is sized by
+                // its declaration in the class's constant scope. The bare
+                // typedef table was sized in the enclosing scope, which has
+                // no class `localparam`, so `typedef logic [W-1:0] t;` read
+                // one bit there.
+                let width_dt = class_local_typedef_target(c, &p.data_type, u8::MAX);
+                let width = typedefs_snapshot(|td| resolve_type_width(width_dt, class_params, td));
                 // §6.20.3 / §6.18: a body type alias retains its signedness.
                 let is_signed = TYPEDEF_SHAPES_TLS
                     .with(|types| is_type_signed_resolved(&p.data_type, &types.borrow().0));
@@ -6257,32 +6262,28 @@ fn hoist_package_params(defs: &HashMap<String, Definition>, elab: &mut Elaborate
     // §26.2: hoist package-scope named properties/sequences into the same
     // maps a module-level declaration populates, so an importing module's
     // `assert property (p(...))` resolves them.
+    // §26.3: each is also registered as `pkg::name`, the spelling
+    // `pkg_scope` gives a reference when two packages declare the name.
     for p in &pkgs {
         for item in &p.items {
-            match item {
-                crate::ast::decl::PackageItem::Property(pd) => {
-                    elab.sequences.insert(pd.name.name.clone());
-                    if let Some(body) = &pd.body {
-                        elab.property_decls
-                            .entry(pd.name.name.clone())
-                            .or_insert_with(|| body.clone());
-                        elab.property_params
-                            .entry(pd.name.name.clone())
-                            .or_insert_with(|| pd.ports.iter().map(|p| p.name.clone()).collect());
-                    }
-                }
-                crate::ast::decl::PackageItem::Sequence(sd) => {
-                    elab.sequences.insert(sd.name.name.clone());
-                    if let Some(body) = &sd.body {
-                        elab.property_decls
-                            .entry(sd.name.name.clone())
-                            .or_insert_with(|| body.clone());
-                        elab.property_params
-                            .entry(sd.name.name.clone())
-                            .or_insert_with(|| sd.ports.iter().map(|p| p.name.clone()).collect());
-                    }
-                }
-                _ => {}
+            let (name, body, ports) = match item {
+                crate::ast::decl::PackageItem::Property(pd) => (&pd.name.name, &pd.body, &pd.ports),
+                crate::ast::decl::PackageItem::Sequence(sd) => (&sd.name.name, &sd.body, &sd.ports),
+                _ => continue,
+            };
+            let qualified = format!("{}::{}", p.name.name, name);
+            elab.sequences.insert(name.clone());
+            elab.sequences.insert(qualified.clone());
+            if let Some(body) = body {
+                let params: Vec<String> = ports.iter().map(|p| p.name.clone()).collect();
+                elab.property_decls
+                    .entry(name.clone())
+                    .or_insert_with(|| body.clone());
+                elab.property_params
+                    .entry(name.clone())
+                    .or_insert_with(|| params.clone());
+                elab.property_decls.insert(qualified.clone(), body.clone());
+                elab.property_params.insert(qualified, params);
             }
         }
     }
@@ -13181,12 +13182,37 @@ pub fn elaborate_module_with_defs(
                         if is_type_two_state_resolved(&dd.data_type, &elab.typedef_types) {
                             elab.two_state_signals.insert(decl.name.name.clone());
                         }
+                        // §6.6.7 + §10.3.1: a USER-DEFINED-NETTYPE net's
+                        // declaration initializer is a CONTINUOUS DRIVER of
+                        // that net, subject to its resolution function — not
+                        // just the high-hold seed this declaration would
+                        // otherwise write. Without it the resolver never saw
+                        // the initializer, so a resolver that keys on driver
+                        // COUNT (issue #1204) resolved as if the net had one
+                        // fewer driver. A non-constant initializer drives the
+                        // net the same way, instead of the one-time
+                        // procedural write a variable gets below.
+                        let nettype_net = get_type_name(&dd.data_type)
+                            .is_some_and(|t| elab.nettype_resolvers.contains_key(&t));
+                        if nettype_net && let Some(init_expr) = decl.init.as_ref() {
+                            elab.continuous_assigns.push(ContinuousAssignment {
+                                gate_delay_fall: None,
+                                delay_select: None,
+                                origin: Some((init_expr.span, String::new())),
+                                lhs: make_ident_expr(&decl.name.name),
+                                rhs: init_expr.clone(),
+                                delay: 0,
+                                rhs_parent_scoped: true,
+                                delay_fall: None,
+                                delay_off: None,
+                            });
+                        }
                         if let Some(view) = &data_modport_view {
                             elab.modport_views
                                 .insert(decl.name.name.clone(), view.clone());
                         }
 
-                        if let Some(expr) = procedural_init {
+                        if let Some(expr) = procedural_init.filter(|_| !nettype_net) {
                             // §6.20.6: a `const` declaration's initializer is its
                             // one legal write — record it so the const-write
                             // check exempts this synthetic assignment.
@@ -24241,8 +24267,8 @@ fn const_eval_typed_pattern_index_env<P: ParamLookup>(
                     .or_else(|_| i64::from_str_radix(&digits, radix).map(|v| v as u64))
                     .ok()?;
                 let width = size.unwrap_or(32);
-                // Keep the scalar path for large unsized decimal integers;
-                // their minimum width is a separate §5.7.1 limitation.
+                // Keep large unsized values on the general evaluator so
+                // this scalar folding path cannot truncate their magnitude.
                 let unsized_max = if *signed && matches!(base, NumberBase::Decimal) {
                     i32::MAX as u64
                 } else {
@@ -24868,7 +24894,9 @@ pub fn const_eval_i64_with_params_env<P: ParamLookup>(
                     ExprKind::Number(NumberLiteral::Integer { size: Some(s), .. }) => {
                         Some(*s as i64)
                     }
-                    ExprKind::Number(NumberLiteral::Integer { size: None, .. }) => Some(32),
+                    ExprKind::Number(n @ NumberLiteral::Integer { size: None, .. }) => {
+                        Some(i64::from(number_literal_width(n)))
+                    }
                     ExprKind::Number(NumberLiteral::UnbasedUnsized(_)) => Some(1),
                     ExprKind::SystemCall { name: cn, .. } if is_cast_call(cn) => params
                         .and_then(|p| const_cast_bits(inner, p))
@@ -24896,8 +24924,8 @@ pub fn const_eval_i64_with_params_env<P: ParamLookup>(
                                 ExprKind::Number(NumberLiteral::Integer {
                                     size: Some(s), ..
                                 }) => Some(*s as i64),
-                                ExprKind::Number(NumberLiteral::Integer { size: None, .. }) => {
-                                    Some(32)
+                                ExprKind::Number(n @ NumberLiteral::Integer { size: None, .. }) => {
+                                    Some(number_literal_width(n) as i64)
                                 }
                                 ExprKind::Number(NumberLiteral::UnbasedUnsized(_)) => Some(1),
                                 ExprKind::Paren(i) => expr_bits(i, params),
@@ -27603,7 +27631,9 @@ fn const_self_width<P: ParamLookup>(e: &Expression, params: &P) -> Option<u32> {
     };
     match &e.kind {
         ExprKind::Number(NumberLiteral::Integer { size: Some(s), .. }) => Some(*s),
-        ExprKind::Number(NumberLiteral::Integer { size: None, .. }) => Some(32),
+        ExprKind::Number(n @ NumberLiteral::Integer { size: None, .. }) => {
+            Some(number_literal_width(n))
+        }
         ExprKind::Number(NumberLiteral::UnbasedUnsized(_)) => Some(1),
         ExprKind::Number(NumberLiteral::Real(_)) => Some(64),
         ExprKind::StringLiteral(t) => Some(8 * t.len().max(1) as u32),
@@ -28287,7 +28317,7 @@ fn string_literal_width(init: &Expression) -> Option<u32> {
 
 /// §6.20.2: a parameter with no type and no range takes the type of its
 /// final value — the SELF-DETERMINED width (§11.6.1, Table 11-21) of its
-/// initializer. Known for literals (sized, unsized 32, string 8 per
+/// initializer. Known for literals (sized, unsized at least 32, string 8 per
 /// character), other parameters in `params`, and the operators whose result
 /// width follows from their operands'. `None` when an operand's width is not
 /// known here (a function call, an element select, a cast), which keeps the
@@ -28296,7 +28326,21 @@ fn string_literal_width(init: &Expression) -> Option<u32> {
 pub fn untyped_param_width(e: &Expression, params: &HashMap<String, Value>) -> Option<u32> {
     let w = |x: &Expression| untyped_param_width(x, params);
     match &e.kind {
-        ExprKind::Number(NumberLiteral::Integer { size, .. }) => Some(size.unwrap_or(32)),
+        ExprKind::Number(NumberLiteral::Integer {
+            size,
+            signed,
+            base,
+            value,
+            ..
+        }) => {
+            let radix = match base {
+                NumberBase::Binary => 2,
+                NumberBase::Octal => 8,
+                NumberBase::Hex => 16,
+                NumberBase::Decimal => 10,
+            };
+            Some(size.unwrap_or_else(|| Value::unsized_integer_width(value, radix, *signed)))
+        }
         ExprKind::StringLiteral(t) if !t.is_empty() && !t.contains('\\') => {
             Some(8 * t.len() as u32)
         }
@@ -29340,7 +29384,9 @@ pub(crate) fn normalize_unpacked_dims_env(
                 }
                 if let DataType::TypeReference { name, .. } = dt.as_ref() {
                     let n = &name.name.name;
-                    if !typedef_types.contains_key(n) && params.contains_key(n) {
+                    if !typedef_types.contains_key(n)
+                        && (params.contains_key(n) || param_fallback_get(n).is_some())
+                    {
                         return UnpackedDimension::Expression {
                             expr: Box::new(make_ident_expr(n)),
                             span: *span,
@@ -31155,50 +31201,27 @@ fn package_var_init_value(
     v
 }
 
-
-/// §5.7.1 makes an unsized decimal literal SIGNED, and it is exactly 32 bits
-/// wide, so a value from 2^31 up reads back negative: `localparam real P =
-/// 3000000000` evaluates to -1294967296, and 4294967297 collapses to 1.
-///
-/// That wrap is deliberate and stays. §5.7's "at least 32 bits" leaves the
-/// >= 2^31 decimal case tool-defined, and the reference simulator sizes it 32
-/// signed and wraps exactly as we do (`$bits(3000000000)` is 32 there, and
-/// there too the literal reads -1294967296). Widening to fit would be a
-/// visible divergence -- `$bits` would answer 33, and every expression-width
-/// rule keyed on a literal's self-determined width would shift with it.
-///
-/// What the reference ALSO does, and what xezim was missing, is SAY so. The
-/// wrap is otherwise completely silent, and it is not a corner case for
-/// analog modelling: a fitted pole above 2^31 rad/s (about 342 MHz) that
-/// happens to come out integral gets written without a decimal point, and the
-/// sign flip turns `dx/dt = -WP*x` into positive feedback. A real-number model
-/// built that way elaborates, runs, and produces a plausible waveform for
-/// thousands of steps before it runs away to inf.
-pub fn warn_unsized_decimal_wrap(size: Option<u32>, base: &NumberBase, value: &str) {
-    let radix = match base {
-        NumberBase::Decimal => 10,
-        _ => return,
-    };
-    let Some(wrapped) = Value::unsized_decimal_wrap(size, radix, value) else {
-        return;
-    };
-    use std::sync::{Mutex, OnceLock};
-    static WARNED: OnceLock<Mutex<std::collections::HashSet<String>>> = OnceLock::new();
-    let seen = WARNED.get_or_init(|| Mutex::new(std::collections::HashSet::new()));
-    if !seen
-        .lock()
-        .map(|mut g| g.insert(value.to_string()))
-        .unwrap_or(false)
-    {
-        return;
+/// §5.7.1: self-determined literal width, shared by elaboration queries.
+pub fn number_literal_width(num: &NumberLiteral) -> u32 {
+    match num {
+        NumberLiteral::Integer {
+            size,
+            signed,
+            base,
+            value,
+            ..
+        } => {
+            let radix = match base {
+                NumberBase::Binary => 2,
+                NumberBase::Octal => 8,
+                NumberBase::Hex => 16,
+                NumberBase::Decimal => 10,
+            };
+            size.unwrap_or_else(|| Value::unsized_integer_width(value, radix, *signed))
+        }
+        NumberLiteral::UnbasedUnsized(_) => 1,
+        _ => 64,
     }
-    crate::elab_diag(format!(
-        "[xezim][warning] unsized decimal literal '{}' is treated as a 32-bit \
-         signed integer and wraps to {} (IEEE 1800-2017 \u{00a7}5.7); \
-         write it as '{}.0' for a real constant, or size it explicitly \
-         (e.g. 64'd{})",
-        value, wrapped, value, value
-    ));
 }
 
 /// Evaluate a constant expression, returning a full Value (preserving width/sign).
@@ -31323,13 +31346,13 @@ fn eval_const_expr_val_with_ctx<P: ParamLookup>(
                     value,
                     ..
                 } => {
-                    let w = size.unwrap_or(32);
                     let r = match base {
                         NumberBase::Binary => 2,
                         NumberBase::Octal => 8,
                         NumberBase::Hex => 16,
                         NumberBase::Decimal => 10,
                     };
+                    let w = size.unwrap_or_else(|| Value::unsized_integer_width(value, r, *signed));
                     // A NEGATIVE genvar substituted into a generate body
                     // (`genvar_const_expr`, §27.4) spells its value `-2`; the
                     // radix parse has no sign and read it as x.
@@ -31340,7 +31363,6 @@ fn eval_const_expr_val_with_ctx<P: ParamLookup>(
                         _ => Value::from_str_radix(&value.replace('_', ""), r, w),
                     };
                     v.is_signed = *signed;
-                    warn_unsized_decimal_wrap(*size, base, value);
                     v
                 }
                 NumberLiteral::Real(f) => Value::from_f64(*f),
@@ -31669,7 +31691,9 @@ fn eval_const_expr_val_with_ctx<P: ParamLookup>(
                         .unwrap_or(0)
                 }
                 ExprKind::Number(NumberLiteral::Integer { size: Some(s), .. }) => *s,
-                ExprKind::Number(NumberLiteral::Integer { size: None, .. }) => 32,
+                ExprKind::Number(n @ NumberLiteral::Integer { size: None, .. }) => {
+                    number_literal_width(n)
+                }
                 ExprKind::Number(NumberLiteral::UnbasedUnsized(_)) => 1,
                 ExprKind::SystemCall { name: cn, .. } if is_cast_call(cn) => {
                     const_cast_bits(inner, params).unwrap_or(0)
@@ -37882,7 +37906,9 @@ fn ai_conn_expr_width(
             }
             Some(sum)
         }
-        EK::Number(crate::ast::expr::NumberLiteral::Integer { size: None, .. }) => Some(32),
+        EK::Number(n @ crate::ast::expr::NumberLiteral::Integer { size: None, .. }) => {
+            Some(number_literal_width(n))
+        }
         EK::Unary { op, operand } => {
             use crate::ast::expr::UnaryOp as U;
             match op {
@@ -39637,6 +39663,7 @@ fn prefill_literal_caches(items: &[ModuleItem]) {
     fn fill(n: &NumberLiteral) {
         let NumberLiteral::Integer {
             size,
+            signed,
             base,
             value,
             cached_val,
@@ -39654,12 +39681,9 @@ fn prefill_literal_caches(items: &[ModuleItem]) {
             NumberBase::Hex => 16,
             NumberBase::Decimal => 10,
         };
-        if Value::unsized_decimal_wrap(*size, radix, value).is_some() {
-            return;
-        }
         let w = match size {
             Some(sz) => *sz,
-            None => Value::unsized_literal_width(value, radix),
+            None => Value::unsized_integer_width(value, radix, *signed),
         };
         if w > 64 {
             return;
@@ -41042,6 +41066,9 @@ fn inline_module_items(
                 // the declaration walk below and emitted once the instance's
                 // rewrite context exists.
                 let mut deferred_decl_inits: Vec<(String, Expression)> = Vec::new();
+                // §6.6.7, §10.3.1: initializers of user-defined nettype nets,
+                // by local name; they become net declaration assignments.
+                let mut nettype_decl_inits: Vec<(String, Expression)> = Vec::new();
                 if elab_trace_enabled() {
                     eprintln!(
                         "[xezim][elab] inline instance path='{}' target='{}'",
@@ -45576,6 +45603,18 @@ fn inline_module_items(
                                     // INSTANTIATED module lost its "HEAD_"
                                     // prefix, while the identical declaration
                                     // in the top module was correct).
+                                    // §6.6.7, §10.3.1: the initializer of a
+                                    // user-defined nettype net is one of its
+                                    // continuous drivers, as at top level; it
+                                    // joins the instance's net declaration
+                                    // assignments once the rewrite context
+                                    // exists.
+                                    let nettype_net = get_type_name(&dd.data_type)
+                                        .is_some_and(|t| elab.nettype_resolvers.contains_key(&t));
+                                    if nettype_net && let Some(init_expr) = &decl.init {
+                                        nettype_decl_inits
+                                            .push((decl.name.name.clone(), init_expr.clone()));
+                                    }
                                     let init_val = if let Some(init_expr) = &decl.init {
                                         // An initializer that is NOT a constant
                                         // expression reads a sibling VARIABLE
@@ -45588,8 +45627,10 @@ fn inline_module_items(
                                         // initial-block assignment exactly as the
                                         // top-level declaration path does.
                                         if !is_const_expr(init_expr, &sub_merged_params) {
-                                            deferred_decl_inits
-                                                .push((sig_name.clone(), init_expr.clone()));
+                                            if !nettype_net {
+                                                deferred_decl_inits
+                                                    .push((sig_name.clone(), init_expr.clone()));
+                                            }
                                             default_value_for_type_resolved(
                                                 &dd.data_type,
                                                 width,
@@ -46226,6 +46267,31 @@ fn inline_module_items(
                     {
                         no_subst_ports.insert(pname.clone());
                     }
+                    // §23.3.3: "If only one of the two connections is of a
+                    // user-defined nettype then ... the connection shall be
+                    // treated as a continuous assignment from source to
+                    // sink"; only connections of the same nettype merge into
+                    // one simulated net. An input formal of a user-defined
+                    // nettype therefore keeps its own net, driven by the
+                    // connection assign and resolved by the nettype's
+                    // resolution function (§6.6.7), unless the actual is a
+                    // whole net of that nettype. Substituting a variable, a
+                    // literal or a member select renames the formal onto it,
+                    // and every read of the formal then skips the resolution
+                    // function. Checked before the signal lookup below: a
+                    // nettype over an unpacked struct has no signal of its
+                    // own, only member leaves.
+                    if matches!(
+                        prepared_sub.port_directions.get(pname.as_str()),
+                        Some(PortDirection::Input)
+                    ) && let Some(formal_nettype) =
+                        user_nettype_of(elab, &cat2(&inst_prefix, pname))
+                        && whole_net_ident_name_scoped(actual, elab)
+                            .and_then(|n| user_nettype_of(elab, &n))
+                            .is_none_or(|t| t != formal_nettype)
+                    {
+                        no_subst_ports.insert(pname.clone());
+                    }
                     let Some(formal) = elab
                         .signals
                         .get(&cat2(&inst_prefix, &pname))
@@ -46708,6 +46774,21 @@ fn inline_module_items(
                     owner: sub_mod.name().to_string(),
                     upward: Rc::clone(&elab.upward_scopes),
                 });
+                // §6.6.7, §10.3.1: a nettype net's initializer drives the net
+                // like a net declaration assignment, in the instance's scope.
+                for (name, init_expr) in nettype_decl_inits.drain(..) {
+                    elab.pending_cont_assign.push(PendingContAssign {
+                        lhs_source: std::rc::Rc::new(make_ident_expr(&name)),
+                        lhs_is_net_initializer: true,
+                        origin_span: Some(init_expr.span),
+                        rhs_source: std::rc::Rc::new(init_expr),
+                        ctx: std::rc::Rc::clone(&pend_ctx),
+                        strength: None,
+                        delay_source: None,
+                        delay_fall_source: None,
+                        delay_off_source: None,
+                    });
+                }
 
                 crate::oom_trace::checkpoint(
                     "retain instance context",
@@ -50638,7 +50719,8 @@ pub fn resolve_user_nettype_drivers(elab: &mut ElaboratedModule) -> Result<(), S
         touch(&mut parent, n);
     }
 
-    let mut real_drivers: HashMap<String, Vec<Expression>> = HashMap::default();
+    // net -> its real drivers with their own delays (§10.3.3).
+    let mut real_drivers: HashMap<String, Vec<(Expression, u64)>> = HashMap::default();
     let mut order: Vec<String> = Vec::new();
     let mut delays: HashMap<String, u64> = HashMap::default();
     let mut kept: Vec<ContinuousAssignment> = Vec::new();
@@ -50710,18 +50792,23 @@ pub fn resolve_user_nettype_drivers(elab: &mut ElaboratedModule) -> Result<(), S
                 continue;
             }
         }
-        if !real_drivers.contains_key(&lhs_name) {
+        if !delays.contains_key(&lhs_name) {
             delays.insert(lhs_name.clone(), ca.delay);
         }
         if !order.contains(&lhs_name) {
             order.push(lhs_name.clone());
         }
-        real_drivers.entry(lhs_name).or_default().push(ca.rhs);
+        real_drivers
+            .entry(lhs_name)
+            .or_default()
+            .push((ca.rhs, ca.delay));
     }
 
     // Component -> its drivers, in first-seen order (deterministic: the emitted
-    // CA order is observable through settle ordering).
-    let mut comp_drivers: HashMap<String, Vec<Expression>> = HashMap::default();
+    // CA order is observable through settle ordering). Each driver keeps its
+    // OWN delay (§10.3.3: a delay on one continuous assignment delays that
+    // driver's contribution alone, before resolution folds the others in).
+    let mut comp_drivers: HashMap<String, Vec<(Expression, u64)>> = HashMap::default();
     let mut comp_order: Vec<String> = Vec::new();
     let mut comp_delay: HashMap<String, u64> = HashMap::default();
     for n in &order {
@@ -50889,10 +50976,25 @@ pub fn resolve_user_nettype_drivers(elab: &mut ElaboratedModule) -> Result<(), S
         if drivers.is_empty() {
             continue;
         }
-        let delay = comp_delay.remove(&root).unwrap_or(0);
         let resolver = net_resolver[&root].clone();
-        let span = drivers[0].span;
+        let span = drivers[0].0.span;
         let members = struct_members(elab, &root);
+        // §10.3.3: a delay on one continuous assignment delays that driver's
+        // contribution alone, before resolution folds the others in. A single
+        // folded resolver call can carry only ONE delay, so when a SCALAR
+        // net's drivers reach it with DIFFERENT delays (issue #1204), stage
+        // each delayed driver onto its own `<net>$drv<k>` signal and fold the
+        // stages undelayed; the resolver then re-evaluates the moment any
+        // driver's staged contribution changes. Uniform delays (all equal, 0
+        // included) keep the current single folded call — equal-delay drivers
+        // collapse exactly onto it.
+        let staged = members.is_none()
+            && drivers.len() > 1
+            && drivers[1..].iter().any(|(_, d)| *d != drivers[0].1);
+        let mut delay = comp_delay.remove(&root).unwrap_or(0);
+        if staged {
+            delay = 0;
+        }
 
         let rhs = if resolver.is_empty() {
             // §6.6.7: a nettype declared without a resolution function accepts
@@ -50933,49 +51035,91 @@ pub fn resolve_user_nettype_drivers(elab: &mut ElaboratedModule) -> Result<(), S
             // variable; the only restriction the clause places on a
             // user-defined nettype is on the LEFT ("shall not contain any
             // indexing or select"). So the fix is to expand, not to reject.
-            let items: Vec<crate::ast::expr::AssignmentPatternItem> = drivers
-                .into_iter()
-                .map(|d| {
-                    let d = match (&members, &d.kind) {
-                        // Already member-wise.
-                        (Some(_), ExprKind::AssignmentPattern(_)) => d,
-                        (Some(_), ExprKind::TypedPattern { pattern, .. }) => (**pattern).clone(),
-                        // Name it member by member instead: '{d.m0, d.m1, ..}
-                        (Some(ms), _) => {
-                            let span = d.span;
-                            let fields: Vec<crate::ast::expr::AssignmentPatternItem> = ms
-                                .iter()
-                                .map(|(m, _, mdims)| {
-                                    let mident = Identifier {
-                                        name: m.clone(),
-                                        span: Span::dummy(),
-                                    };
-                                    let mut e = member_ref_expr(&d, &mident);
-                                    e.span = span;
-                                    // An unpacked array member is read
-                                    // element by element (§7.4).
-                                    if let Some(lists) = (!mdims.is_empty())
-                                        .then(|| {
-                                            fixed_unpacked_index_lists(
-                                                mdims,
-                                                &elab.parameters,
-                                                &elab.typedef_types,
-                                            )
-                                        })
-                                        .flatten()
-                                    {
-                                        e = element_pattern(&e, &lists);
-                                    }
-                                    crate::ast::expr::AssignmentPatternItem::Ordered(e)
-                                })
-                                .collect();
-                            Expression::new(ExprKind::AssignmentPattern(fields), span)
-                        }
-                        _ => d,
-                    };
-                    crate::ast::expr::AssignmentPatternItem::Ordered(d)
-                })
-                .collect();
+            // Each driver keeps its own fold contribution: its ORIGINAL value
+            // when undelayed or uniform, or (when `staged`) the identifier of
+            // its own `<net>$drv<k>` delay stage.
+            let mut stage_rhs: Vec<(String, Expression, u64)> = Vec::new();
+            let mut items: Vec<crate::ast::expr::AssignmentPatternItem> =
+                Vec::with_capacity(drivers.len());
+            let mut k: u32 = 0;
+            for (driver, dly) in drivers.iter() {
+                let fold = if staged && *dly != 0 {
+                    let stage = format!("{root}$drv{k}");
+                    k += 1;
+                    // §10.3.3: synthesize the driver's own delay stage — a
+                    // signal cloned from the net, driven by the driver's value
+                    // behind its OWN delay, and read undelayed by the resolver.
+                    // The `<net>$drv<k>` spelling is the same stage-net shape
+                    // `resolve_multi_driver_nets` synthesizes for ordinary
+                    // nets, so it is not a design object in dumps/scope.
+                    if let Some(sig) = elab.signals.get(&root) {
+                        let mut s = sig.clone();
+                        s.name = stage.clone().into();
+                        s.direction = None;
+                        elab.signals.insert(stage.clone(), s);
+                    }
+                    stage_rhs.push((stage.clone(), driver.clone(), *dly));
+                    Expression::new(make_ident_expr(&stage).kind, driver.span)
+                } else {
+                    driver.clone()
+                };
+                let d = match (&members, &fold.kind) {
+                    // Already member-wise.
+                    (Some(_), ExprKind::AssignmentPattern(_)) => fold,
+                    (Some(_), ExprKind::TypedPattern { pattern, .. }) => (**pattern).clone(),
+                    // Name it member by member instead: '{d.m0, d.m1, ..}
+                    (Some(ms), _) => {
+                        let span = fold.span;
+                        let fields: Vec<crate::ast::expr::AssignmentPatternItem> = ms
+                            .iter()
+                            .map(|(m, _, mdims)| {
+                                let mident = Identifier {
+                                    name: m.clone(),
+                                    span: Span::dummy(),
+                                };
+                                let mut e = member_ref_expr(&fold, &mident);
+                                e.span = span;
+                                // An unpacked array member is read
+                                // element by element (§7.4).
+                                if let Some(lists) = (!mdims.is_empty())
+                                    .then(|| {
+                                        fixed_unpacked_index_lists(
+                                            mdims,
+                                            &elab.parameters,
+                                            &elab.typedef_types,
+                                        )
+                                    })
+                                    .flatten()
+                                {
+                                    e = element_pattern(&e, &lists);
+                                }
+                                crate::ast::expr::AssignmentPatternItem::Ordered(e)
+                            })
+                            .collect();
+                        Expression::new(ExprKind::AssignmentPattern(fields), span)
+                    }
+                    _ => fold,
+                };
+                items.push(crate::ast::expr::AssignmentPatternItem::Ordered(d));
+            }
+            // A delayed driver's stage is driven by its own value behind its
+            // OWN delay, so a change to that one driver re-resolves on its
+            // own schedule (and zeroes/holds the stage's initial 0 in the
+            // delay's first period — what the reference nettype resolution
+            // shows at 1 ns in issue #1204). Scalar stages have no members.
+            for (stage, drv, dly) in stage_rhs {
+                emit(
+                    &mut kept,
+                    &stage,
+                    drv,
+                    &None,
+                    dly,
+                    span,
+                    &elab.typedef_types,
+                    &elab.typedef_unpacked_dims,
+                    &elab.parameters,
+                );
+            }
             Expression::new(
                 ExprKind::Call {
                     func: Box::new(make_ident_expr(&resolver)),
@@ -54214,6 +54358,18 @@ fn is_net_name(elab: &ElaboratedModule, name: &str) -> bool {
             .as_deref()
             .is_some_and(|t| elab.nettype_resolvers.contains_key(t))
     })
+}
+
+/// The user-defined nettype (§6.6.7) `name` is declared with, if any: its
+/// signal's type name, or the declared type of a nettype net over an
+/// unpacked struct, which is stored as member leaves with no signal of its
+/// own.
+fn user_nettype_of(elab: &ElaboratedModule, name: &str) -> Option<String> {
+    let tn = match elab.signals.get(name) {
+        Some(s) => s.type_name.clone(),
+        None => elab.var_decl_types.get(name).and_then(get_type_name),
+    }?;
+    elab.nettype_resolvers.contains_key(&tn).then_some(tn)
 }
 
 /// The head name of a hierarchical path expression — `g[1].w` names the
@@ -58004,6 +58160,25 @@ fn process_import(
                             elab.lets.insert(l.name.name.clone(), l.clone());
                             found = true;
                         }
+                        // §16.8, §16.12, §26.3: so are a named sequence and
+                        // property; the import binds the bare name to this
+                        // package's declaration.
+                        PackageItem::Property(PropertyDeclaration {
+                            name, ports, body, ..
+                        })
+                        | PackageItem::Sequence(SequenceDeclaration {
+                            name, ports, body, ..
+                        }) if &name.name == sym_name => {
+                            elab.sequences.insert(name.name.clone());
+                            if let Some(body) = body {
+                                elab.property_decls.insert(name.name.clone(), body.clone());
+                                elab.property_params.insert(
+                                    name.name.clone(),
+                                    ports.iter().map(|p| p.name.clone()).collect(),
+                                );
+                            }
+                            found = true;
+                        }
                         PackageItem::Class(c) if &c.name.name == sym_name => {
                             register_class_enum_members(c, elab);
                             register_class_scoped_typedef_aliases(c, Some(&pkg_name), elab);
@@ -59330,12 +59505,15 @@ mod prepared_process_ownership_tests {
             sources.push(Rc::clone(source));
         }
         assert_eq!(sources.len(), 2);
-        // §5.7.1: cache ordinary literals in the retained source, but leave
-        // warning-producing unsized decimal literals for their evaluator.
+        // §5.7.1: cache literals in the retained source at their full width,
+        // including the sign bit of an unsized decimal magnitude.
         let StatementKind::SeqBlock { stmts, .. } = &sources[0].kind else {
             unreachable!();
         };
-        for (stmt, expected) in stmts.iter().zip([Some((42, 0, 8)), None]) {
+        for (stmt, expected) in stmts
+            .iter()
+            .zip([Some((42, 0, 8)), Some((3_000_000_000, 0, 33))])
+        {
             let StatementKind::BlockingAssign { rvalue, .. } = &stmt.kind else {
                 panic!("assignment expected");
             };
