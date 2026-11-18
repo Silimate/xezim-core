@@ -55,6 +55,42 @@ endmodule
     }
 }
 
+/// §6.10, §27.5: a label declared in a generate block is the block's, so a
+/// port actual of the same name in the module scope is still an implicit
+/// net of the module, the one net connecting the two instances. Taken for a
+/// declared constant, it was not created, and with procedural children (no
+/// continuous assignment for the later scan to find) the connection had no
+/// signal.
+#[test]
+fn generate_block_label_leaves_the_module_implicit_net() {
+    let m = elaborate(
+        r#"
+module drv (output logic o);
+  initial o = 1'b1;
+endmodule
+module rcv (input logic i, output logic seen);
+  always @(i) seen = i;
+endmodule
+module wrap (output logic seen);
+  if (0) begin : g
+    typedef enum logic {LINK, IDLE} t;
+  end
+  drv d (.o(LINK));
+  rcv r (.i(LINK), .seen(seen));
+endmodule
+module top;
+  logic seen;
+  wrap w (.seen(seen));
+endmodule
+"#,
+    );
+    assert!(
+        m.implicit_nets.contains("w.LINK"),
+        "no implicit net w.LINK: {:?}",
+        m.implicit_nets
+    );
+}
+
 /// §6.10, §26.3: a label a module imports from a package (or `$unit`) and
 /// uses in a port actual is the package's constant, not a local name of the
 /// module: the inlined module's uses of it keep the bare name instead of
