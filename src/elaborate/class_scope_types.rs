@@ -23,6 +23,8 @@ struct ClassTypeScope {
     /// Every header parameter, type and value, in declaration order: the
     /// positions of `#(...)` arguments.
     param_order: Vec<String>,
+    /// The type parameters.
+    type_params: Vec<String>,
     /// Each type parameter's default, when it has one.
     type_defaults: HashMap<String, DataType>,
     /// Typedef name -> the type parameter it names and the member path after
@@ -141,8 +143,10 @@ fn class_type_scope(c: &ClassDeclaration) -> Option<ClassTypeScope> {
         let leaf = td.name.name.rsplit("::").next().unwrap_or(&td.name.name);
         typedefs.insert(leaf.to_string(), entry);
     }
+    let type_params = type_params.into_iter().map(str::to_string).collect();
     (!typedefs.is_empty()).then_some(ClassTypeScope {
         param_order,
+        type_params,
         type_defaults,
         typedefs,
     })
@@ -163,28 +167,7 @@ pub(crate) fn specialized(name: &TypeName) -> Option<TypeName> {
         .flatten()
         .or_else(|| scopes.get(&link.name.name))?;
     let (param, member) = class.typedefs.get(&name.name.name)?;
-    let named = link.type_args.iter().find_map(|a| match &a.kind {
-        ExprKind::NamedArg { name, expr } if &name.name == param => Some(expr.as_deref()),
-        _ => None,
-    });
-    let arg: (TypeName, Vec<Expression>) = match named {
-        Some(Some(e)) => arg_type_name(e)?,
-        // `.T()` keeps the default.
-        Some(None) => default_type_name(class, param)?,
-        None => {
-            let position = class.param_order.iter().position(|p| p == param)?;
-            let positional: Vec<&Expression> = link
-                .type_args
-                .iter()
-                .filter(|a| !matches!(a.kind, ExprKind::NamedArg { .. }))
-                .collect();
-            match positional.get(position) {
-                Some(e) => arg_type_name(e)?,
-                None => default_type_name(class, param)?,
-            }
-        }
-    };
-    let (arg_name, arg_args) = arg;
+    let (arg_name, arg_args) = bind_type_param(class, &link.type_args, param, 0)?;
     let Some(member) = member else {
         // `typedef T t;`: the argument itself, when it names a type without
         // specialization arguments of its own.
@@ -238,6 +221,68 @@ pub(crate) fn through_alias(name: &TypeName) -> Option<TypeName> {
         span: name.span,
         bound: Default::default(),
     })
+}
+
+/// The type the type parameter `param` takes in the specialization with
+/// `args`: its argument by name or position, else its default. A default
+/// that names an earlier type parameter (`type U = T`, `type U = T::m`)
+/// takes that parameter's own binding (§8.25).
+fn bind_type_param(
+    class: &ClassTypeScope,
+    args: &[Expression],
+    param: &str,
+    depth: usize,
+) -> Option<(TypeName, Vec<Expression>)> {
+    if depth > class.type_params.len() {
+        return None;
+    }
+    let position = class.param_order.iter().position(|p| p == param)?;
+    let named = args.iter().find_map(|a| match &a.kind {
+        ExprKind::NamedArg { name, expr } if name.name == param => Some(expr.as_deref()),
+        _ => None,
+    });
+    let explicit = match named {
+        Some(e) => e,
+        None => args
+            .iter()
+            .filter(|a| !matches!(a.kind, ExprKind::NamedArg { .. }))
+            .nth(position),
+    };
+    if let Some(e) = explicit {
+        return arg_type_name(e);
+    }
+    let (default, default_args) = default_type_name(class, param)?;
+    let earlier = |n: &str| {
+        class.type_params.iter().any(|t| t == n)
+            && class.param_order.iter().position(|p| p == n) < Some(position)
+    };
+    if default.scopes.is_empty() && earlier(&default.name.name) {
+        return default_args
+            .is_empty()
+            .then(|| bind_type_param(class, args, &default.name.name, depth + 1))
+            .flatten();
+    }
+    match default.scopes.split_first() {
+        Some((head, rest)) if head.type_args.is_empty() && earlier(&head.name.name) => {
+            let (bound, bound_args) = bind_type_param(class, args, &head.name.name, depth + 1)?;
+            let mut scopes = bound.scopes;
+            scopes.push(TypeScope {
+                name: bound.name,
+                type_args: bound_args,
+            });
+            scopes.extend(rest.iter().cloned());
+            Some((
+                TypeName {
+                    scopes,
+                    name: default.name,
+                    span: default.span,
+                    bound: Default::default(),
+                },
+                default_args,
+            ))
+        }
+        _ => Some((default, default_args)),
+    }
 }
 
 fn default_type_name(class: &ClassTypeScope, param: &str) -> Option<(TypeName, Vec<Expression>)> {

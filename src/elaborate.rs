@@ -5441,6 +5441,31 @@ pub fn specialized_class_scope_width(
     name: &crate::ast::types::TypeName,
     elab: &ElaboratedModule,
 ) -> Option<u32> {
+    specialized_class_scope_width_at(name, elab, 0)
+}
+
+/// `specialized_class_scope_width` after `depth` rewrites of the name.
+fn specialized_class_scope_width_at(
+    name: &crate::ast::types::TypeName,
+    elab: &ElaboratedModule,
+    depth: u32,
+) -> Option<u32> {
+    // §8.25.1, §6.20.3: a typedef naming a member of a type parameter
+    // (`typedef T::m t;`), or a scope that names a class through a type
+    // parameter or typedef (`C::t`, `e_t::t`), is sized as the name it
+    // stands for, which may be a specialization itself (`Cfg#(8)::m`).
+    // The alias applies only where the scoped key is missing, as in
+    // `lookup_scoped_type`.
+    if depth < 8
+        && let Some(alt) = class_scope_types::specialized(name).or_else(|| {
+            (!elab.typedefs.contains_key(&name.qualified()))
+                .then(|| class_scope_types::through_alias(name))
+                .flatten()
+        })
+    {
+        return specialized_class_scope_width_at(&alt, elab, depth + 1)
+            .or_else(|| lookup_scoped_type(&alt, &elab.typedefs).copied());
+    }
     // The scope link carrying `#(...)` args names the specialized class;
     // without one, the last link may be a typedef naming a specialization.
     let (cls_name, type_args): (&str, &[Expression]) =
@@ -5448,11 +5473,6 @@ pub fn specialized_class_scope_width(
             Some(link) => (&link.name.name, &link.type_args),
             None => typedef_specialization(&name.scopes.last()?.name.name, elab)?,
         };
-    // A typedef naming a member of a type parameter (`typedef T::m t;`) is
-    // sized through the argument's member type by `lookup_scoped_type`.
-    if class_scope_types::specialized(name).is_some_and(|alt| alt.has_scope()) {
-        return None;
-    }
     let cls = elab.classes.get(cls_name)?;
     // Bind the class's value parameters: defaults first, then the
     // positional `#(...)` args in `param_order` (type and value params
@@ -5470,7 +5490,14 @@ pub fn specialized_class_scope_width(
             params.insert(pn.clone(), v);
         }
     }
-    let target = cls.typedef_targets.get(&name.name.name)?;
+    // A typedef name that several scopes declare is keyed by its qualified
+    // spelling (`cls::t`).
+    let target = cls.typedef_targets.get(&name.name.name).or_else(|| {
+        cls.typedef_targets
+            .iter()
+            .find(|(k, _)| k.rsplit("::").next() == Some(name.name.name.as_str()))
+            .map(|(_, v)| v)
+    })?;
     // §8.25: a typedef of one of the class's TYPE parameters
     // (`typedef T elem_t;`) takes the type that argument binds.
     if let DataType::TypeReference {
