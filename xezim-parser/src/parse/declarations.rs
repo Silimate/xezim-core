@@ -761,7 +761,9 @@ impl Parser {
         let mut decls: Vec<(&Identifier, Option<(usize, usize)>)> =
             body_ports.iter().map(|p| (&p.name, None)).collect();
         for (si, it) in items.iter().enumerate() {
-            if let StatementKind::VarDecl { declarators, .. } = &it.kind {
+            if let StatementKind::VarDecl { declarators, .. }
+            | StatementKind::ParamDecl { declarators, .. } = &it.kind
+            {
                 decls.extend(
                     declarators
                         .iter()
@@ -817,7 +819,9 @@ impl Parser {
         items.retain_mut(|it| {
             let here = si;
             si += 1;
-            let StatementKind::VarDecl { declarators, .. } = &mut it.kind else {
+            let (StatementKind::VarDecl { declarators, .. }
+            | StatementKind::ParamDecl { declarators, .. }) = &mut it.kind
+            else {
                 return true;
             };
             let mut di = 0;
@@ -1182,12 +1186,22 @@ impl Parser {
             if !var_kw && self.at(TokenKind::KwVar) {
                 var_kw = self.eat(TokenKind::KwVar).is_some();
             } // Handle var after const
-            let direction = self.parse_optional_direction().unwrap_or(prev_direction);
+            let explicit_direction = self.parse_optional_direction();
+            let direction = explicit_direction.unwrap_or(prev_direction);
             prev_direction = direction;
             // §13.3: `input var int x` — `var` may follow the direction too.
             if !var_kw && self.at(TokenKind::KwVar) {
                 var_kw = self.eat(TokenKind::KwVar).is_some();
             }
+            // §13.5 (1800-2023): a formal written with neither a data type
+            // nor a direction (`input int a, b`) takes the previous formal's
+            // data type; first, or with a direction, it is `logic`. It was left
+            // untyped, so `b` was not sized like `a` and an import passed it to
+            // C as an svLogic.
+            let inherited_type = ports
+                .last()
+                .filter(|_| explicit_direction.is_none() && !var_kw)
+                .map(|p| p.data_type.clone());
 
             // Handle `virtual interface <name>` port type (legacy form)
             // and the LRM 1800-2017 §25.9 form `virtual <iface_type>` /
@@ -1267,11 +1281,11 @@ impl Parser {
                 // avoid the later `parse_identifier` consuming the `[`.
                 let name = self.parse_identifier();
                 let dimensions = self.parse_unpacked_dimensions();
-                let data_type = DataType::Implicit {
+                let data_type = inherited_type.unwrap_or_else(|| DataType::Implicit {
                     signing: None,
                     dimensions: Vec::new(),
                     span: self.span_from(start),
-                };
+                });
                 let default = if self.eat(TokenKind::Assign).is_some() {
                     Some(self.parse_expression())
                 } else {
@@ -1341,11 +1355,11 @@ impl Parser {
                     // port inline, mirroring the `name [$]` arm above.
                     let name = self.parse_identifier();
                     let dimensions = self.parse_unpacked_dimensions();
-                    let data_type = DataType::Implicit {
+                    let data_type = inherited_type.unwrap_or_else(|| DataType::Implicit {
                         signing: None,
                         dimensions: Vec::new(),
                         span: self.span_from(start),
-                    };
+                    });
                     let default = if self.eat(TokenKind::Assign).is_some() {
                         Some(self.parse_expression())
                     } else {
@@ -1373,11 +1387,11 @@ impl Parser {
                     span: self.span_from(start),
                 }
             } else {
-                DataType::Implicit {
+                inherited_type.unwrap_or_else(|| DataType::Implicit {
                     signing: None,
                     dimensions: Vec::new(),
                     span: self.span_from(start),
-                }
+                })
             };
             // An unnamed formal of a prototype: a placeholder name by position.
             let name = if self.prototype_ports
