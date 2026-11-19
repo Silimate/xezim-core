@@ -45,7 +45,8 @@ endmodule
     let renamed = |inst: &str| {
         m.input_port_actuals
             .iter()
-            .any(|(f, ..)| f.rsplit('.').nth(1) == Some(inst) && f.ends_with(".e_i"))
+            .map(|p| p.formal())
+            .any(|f| f.rsplit('.').nth(1) == Some(inst) && f.ends_with(".e_i"))
     };
     // A signed formal keeps its net for an unsigned actual.
     assert!(!renamed("s_concat"));
@@ -87,7 +88,8 @@ endmodule
     let renamed = |inst: &str| {
         m.input_port_actuals
             .iter()
-            .any(|(f, ..)| f.rsplit('.').nth(1) == Some(inst) && f.ends_with(".e_i"))
+            .map(|p| p.formal())
+            .any(|f| f.rsplit('.').nth(1) == Some(inst) && f.ends_with(".e_i"))
     };
     assert!(!renamed("u_elem"));
     assert!(!renamed("u_member"));
