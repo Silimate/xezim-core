@@ -1615,6 +1615,11 @@ impl<'a> Binder<'a> {
                 data_type,
                 declarators,
                 ..
+            }
+            | StatementKind::ParamDecl {
+                data_type,
+                declarators,
+                ..
             } => {
                 self.with_pos("local-dim", |b| b.data_type(data_type));
                 for d in declarators.iter_mut() {
