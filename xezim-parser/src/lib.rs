@@ -423,6 +423,15 @@ pub static RELAX_LIBRARY_PACKAGES: RelaxFlag = RelaxFlag::new(
     "compile the packages a -v library file declares, as if the file were also a source file",
 );
 
+/// §26.3: a name that two wildcard-imported packages declare resolves to
+/// the first of those imports in source order (checked when package names
+/// are resolved, before elaboration; the flag lives here with the others).
+pub static RELAX_WILDCARD_IMPORT_CONFLICT: RelaxFlag = RelaxFlag::new(
+    "wildcard-import-conflict",
+    "XEZIM_RELAX_WILDCARD_IMPORT_CONFLICT",
+    "resolve a name that two wildcard-imported packages declare to the first of those imports in source order (§26.3)",
+);
+
 /// §25.3: an instance that leaves an interface port unconnected is
 /// elaborated (checked at elaboration; the flag lives here with the others).
 pub static RELAX_UNCONNECTED_INTERFACE_PORT: RelaxFlag = RelaxFlag::new(
@@ -432,7 +441,7 @@ pub static RELAX_UNCONNECTED_INTERFACE_PORT: RelaxFlag = RelaxFlag::new(
 );
 
 /// Every parser relaxation, for command-line options and cache keys.
-pub fn relax_flags() -> [&'static RelaxFlag; 11] {
+pub fn relax_flags() -> [&'static RelaxFlag; 12] {
     [
         &RELAX_DUPLICATE_DECLS,
         &RELAX_ENUM_NO_BASE,
@@ -444,6 +453,7 @@ pub fn relax_flags() -> [&'static RelaxFlag; 11] {
         &RELAX_CROSS_HIER_ITEM,
         &RELAX_USE_BEFORE_DECL,
         &RELAX_LIBRARY_PACKAGES,
+        &RELAX_WILDCARD_IMPORT_CONFLICT,
         &RELAX_UNCONNECTED_INTERFACE_PORT,
     ]
 }
