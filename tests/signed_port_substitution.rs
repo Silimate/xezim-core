@@ -96,9 +96,11 @@ endmodule
     assert!(!renamed("s_elem"));
 }
 
-/// §11.8.1: a select through several packed dimensions (`p[1][2]`,
-/// `p[1][2][7:0]`) is unsigned like a one-level select, even of a signed
-/// vector, so it renames an unsigned formal and keeps a signed one's net.
+/// §11.8.1: a select through several packed dimensions (`q[1][7:0]`) is
+/// unsigned like a one-level select, even of a signed vector, so it renames
+/// an unsigned formal of its width and keeps a signed formal's net. A nested
+/// select whose width elaboration can't measure here (`p[1][2]`) keeps the
+/// formal, so a narrower port still truncates it.
 #[test]
 fn a_select_through_packed_dimensions_is_unsigned() {
     let m = elaborate(
@@ -109,13 +111,17 @@ endmodule
 module ku (input logic [7:0] e_i);
   wire lt = e_i < 0;
 endmodule
+module ku4 (input logic [3:0] e_i);
+  wire hi = e_i == 4'hf;
+endmodule
 module top;
+  logic [3:0][7:0] q;
+  logic signed [3:0][7:0] sq;
   logic [3:0][3:0][7:0] p;
-  logic signed [3:0][3:0][7:0] sp;
-  ku u_index (.e_i(p[1][2]));
-  ku u_range (.e_i(p[1][2][7:0]));
-  ku u_signed_base (.e_i(sp[1][2]));
-  ks s_index (.e_i(sp[1][2]));
+  ku u_range (.e_i(q[1][7:0]));
+  ku u_signed_base (.e_i(sq[1][7:0]));
+  ks s_range (.e_i(sq[1][7:0]));
+  ku4 u_narrow (.e_i(p[1][2]));
 endmodule
 "#,
     );
@@ -125,10 +131,10 @@ endmodule
             .map(|p| p.formal())
             .any(|f| f.rsplit('.').nth(1) == Some(inst) && f.ends_with(".e_i"))
     };
-    assert!(renamed("u_index"));
     assert!(renamed("u_range"));
     assert!(renamed("u_signed_base"));
-    assert!(!renamed("s_index"));
+    assert!(!renamed("s_range"));
+    assert!(!renamed("u_narrow"));
 }
 
 /// §26.3: a package parameter actual (`p::U`) is bound under its scoped
