@@ -96,6 +96,41 @@ endmodule
     assert!(!renamed("s_elem"));
 }
 
+/// §11.8.1: a select through several packed dimensions (`p[1][2]`,
+/// `p[1][2][7:0]`) is unsigned like a one-level select, even of a signed
+/// vector, so it renames an unsigned formal and keeps a signed one's net.
+#[test]
+fn a_select_through_packed_dimensions_is_unsigned() {
+    let m = elaborate(
+        r#"
+module ks (input logic signed [7:0] e_i);
+  wire lt = e_i < 0;
+endmodule
+module ku (input logic [7:0] e_i);
+  wire lt = e_i < 0;
+endmodule
+module top;
+  logic [3:0][3:0][7:0] p;
+  logic signed [3:0][3:0][7:0] sp;
+  ku u_index (.e_i(p[1][2]));
+  ku u_range (.e_i(p[1][2][7:0]));
+  ku u_signed_base (.e_i(sp[1][2]));
+  ks s_index (.e_i(sp[1][2]));
+endmodule
+"#,
+    );
+    let renamed = |inst: &str| {
+        m.input_port_actuals
+            .iter()
+            .map(|p| p.formal())
+            .any(|f| f.rsplit('.').nth(1) == Some(inst) && f.ends_with(".e_i"))
+    };
+    assert!(renamed("u_index"));
+    assert!(renamed("u_range"));
+    assert!(renamed("u_signed_base"));
+    assert!(!renamed("s_index"));
+}
+
 /// §26.3: a package parameter actual (`p::U`) is bound under its scoped
 /// name, and its own signedness decides the rename as a local net's does.
 #[test]
