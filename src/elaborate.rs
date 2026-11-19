@@ -8298,10 +8298,18 @@ fn simple_actual_signedness(
             // packed dimensions it goes through (§11.8.1): `a[1][3:1]` on
             // `logic [3:0][5:0][7:0] a` is a select of a select of `a`.
             let mut inner = expr.as_ref();
+            let mut nested = false;
             while let ExprKind::Index { expr, .. } | ExprKind::RangeSelect { expr, .. } =
                 &inner.kind
             {
                 inner = expr;
+                nested = true;
+            }
+            // The width check after this one skips an actual it can't measure,
+            // so a nested select is known here only when it can be measured:
+            // otherwise `p[1][2]` (8 bits) could rename `input logic [3:0]`.
+            if nested && port_conn_width(e, elab).is_none() {
+                return None;
             }
             let base = whole_net_ident_name(inner)?;
             let unpacked = elab.arrays.contains_key(&base)
