@@ -25396,9 +25396,10 @@ thread_local! {
     /// `import p::*`. Read by `imported_array_element`.
     static DEF_IMPORTS_TLS: std::cell::RefCell<HashMap<String, Rc<[(String, Option<String>)]>>>
         = std::cell::RefCell::new(HashMap::default());
-    /// §26.3: the definitions whose items are being read, innermost last
+    /// §26.3: the definitions whose items are being read, innermost last,
+    /// each with the address of its parent's own parameter map
     /// (`ImportScope`).
-    static IMPORT_SCOPE_TLS: std::cell::RefCell<Vec<String>>
+    static IMPORT_SCOPE_TLS: std::cell::RefCell<Vec<(String, usize)>>
         = const { std::cell::RefCell::new(Vec::new()) };
     /// Typedef bodies for `const_eval_user_call`. That path builds an empty
     /// module shell, so a generate-if that calls a package function could not
@@ -25447,11 +25448,16 @@ fn param_fallback_get(name: &str) -> Option<Value> {
 
 /// §26.3: an instance's items are read with its definition's imports in
 /// scope, from where its parent binds them until the instance is inlined.
+/// The parent evaluates the expressions it wrote for the instance (its
+/// `#(...)` overrides) against its own parameter map, `parent_params`; an
+/// expression evaluated against that map is answered by the parent's
+/// imports instead.
 struct ImportScope;
 
 impl ImportScope {
-    fn enter(def: &str) -> Self {
-        IMPORT_SCOPE_TLS.with(|s| s.borrow_mut().push(def.to_string()));
+    fn enter(def: &str, parent_params: &HashMap<String, Value>) -> Self {
+        let parent = parent_params as *const HashMap<String, Value> as usize;
+        IMPORT_SCOPE_TLS.with(|s| s.borrow_mut().push((def.to_string(), parent)));
         ImportScope
     }
 }
@@ -25468,7 +25474,8 @@ impl Drop for ImportScope {
 /// that the definition being read imports, under its package's qualified key
 /// (`p::V[0][index]`). An explicit `import p::V` names the package;
 /// otherwise exactly one of the wildcard-imported packages must declare the
-/// element. The innermost definition that imports it decides.
+/// element. The innermost definition that imports it decides, from the one
+/// that wrote the expression outward (`ImportScope`).
 fn imported_array_element<P: ParamLookup>(name: &str, index: i64, params: &P) -> Option<Value> {
     let (root, rows) = name.split_at(name.find('[').unwrap_or(name.len()));
     let read = |pkg: &str| {
@@ -25478,8 +25485,17 @@ fn imported_array_element<P: ParamLookup>(name: &str, index: i64, params: &P) ->
             .cloned()
             .or_else(|| param_fallback_get(&key))
     };
+    let map = params
+        .as_hashmap_base()
+        .map(|m| m as *const HashMap<String, Value> as usize);
     let scopes = IMPORT_SCOPE_TLS.with(|s| s.borrow().clone());
-    for def in scopes.iter().rev() {
+    // Evaluated against an instance's parent map: the parent (the entry
+    // before it, or the top) wrote it.
+    let end = scopes
+        .iter()
+        .rposition(|(_, parent)| map == Some(*parent))
+        .unwrap_or(scopes.len());
+    for (def, _) in scopes[..end].iter().rev() {
         let Some(imports) = DEF_IMPORTS_TLS.with(|c| c.borrow().get(def).cloned()) else {
             continue;
         };
@@ -41204,8 +41220,9 @@ fn inline_module_items(
                 }
                 // §26.3: until this instance is inlined (the recursive call
                 // below), its own imports answer a bare imported array
-                // element (`imported_array_element`).
-                let _import_scope = ImportScope::enter(sub_mod.name());
+                // element (`imported_array_element`), except in the
+                // overrides this scope evaluates for it.
+                let _import_scope = ImportScope::enter(sub_mod.name(), scoped_eval_params);
                 // §6.10 implicit nets bound by port connections INSIDE the
                 // module being inlined. The top-level pass only sees the top
                 // module's instantiations, and the pending pass only sees
