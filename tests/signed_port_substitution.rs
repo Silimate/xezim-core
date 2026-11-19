@@ -95,3 +95,39 @@ endmodule
     assert!(!renamed("u_member"));
     assert!(!renamed("s_elem"));
 }
+
+/// §26.3: a package parameter actual (`p::U`) is bound under its scoped
+/// name, and its own signedness decides the rename as a local net's does.
+#[test]
+fn a_package_parameter_actual_is_renamed_by_its_signedness() {
+    let m = elaborate(
+        r#"
+package p;
+  parameter logic [12:0] U = 13'h1fe5;
+  parameter logic signed [12:0] S = -13'sd27;
+endpackage
+module ks (input logic signed [12:0] e_i);
+  wire lt = e_i < 0;
+endmodule
+module ku (input logic [12:0] e_i);
+  wire lt = e_i < 0;
+endmodule
+module top;
+  ku u_unsigned (.e_i(p::U));
+  ks s_signed (.e_i(p::S));
+  ku u_signed (.e_i(p::S));
+  ks s_unsigned (.e_i(p::U));
+endmodule
+"#,
+    );
+    let renamed = |inst: &str| {
+        m.input_port_actuals
+            .iter()
+            .map(|p| p.formal())
+            .any(|f| f.rsplit('.').nth(1) == Some(inst) && f.ends_with(".e_i"))
+    };
+    assert!(renamed("u_unsigned"));
+    assert!(renamed("s_signed"));
+    assert!(!renamed("u_signed"));
+    assert!(!renamed("s_unsigned"));
+}

@@ -8052,13 +8052,22 @@ fn port_actual_is_simple(
 /// §11.8.1: whether a port actual that `port_actual_is_simple` accepts is a
 /// signed expression. A part-select, a bit-select of a vector, a
 /// concatenation and a replication are unsigned; a whole net or parameter
-/// and a literal keep their own signedness. `None` when it cannot tell (an
-/// element of an unpacked array, a struct member).
+/// and a literal keep their own signedness, as does a package parameter
+/// (`p::V`, §26.3), which is bound under its scoped name. `None` when it
+/// cannot tell (an element of an unpacked array, a struct member).
 fn simple_actual_signedness(
     e: &Expression,
     elab: &ElaboratedModule,
     params: &HashMap<String, Value>,
 ) -> Option<bool> {
+    let lookup = |name: &str| {
+        elab.signals.get(name).map(|sig| sig.is_signed).or_else(|| {
+            params
+                .get(name)
+                .or_else(|| elab.parameters.get(name))
+                .map(|v| v.is_signed)
+        })
+    };
     match &e.kind {
         ExprKind::Paren(inner) => simple_actual_signedness(inner, elab, params),
         ExprKind::Number(NumberLiteral::Integer {
@@ -8067,21 +8076,17 @@ fn simple_actual_signedness(
         ExprKind::Number(NumberLiteral::UnbasedUnsized(_)) | ExprKind::StringLiteral(_) => {
             Some(false)
         }
-        ExprKind::Ident(_) => {
+        ExprKind::Ident(h) => {
             if let Some(name) = whole_net_ident_name(e) {
-                if let Some(sig) = elab.signals.get(name.as_str()) {
-                    return Some(sig.is_signed);
-                }
-                return params
-                    .get(name.as_str())
-                    .or_else(|| elab.parameters.get(name.as_str()))
-                    .map(|v| v.is_signed);
+                return lookup(&name).or_else(|| match h.path.as_slice() {
+                    [pkg, member] if elab.packages.contains(&pkg.name.name) => {
+                        lookup(&format!("{}::{}", pkg.name.name, member.name.name))
+                    }
+                    _ => None,
+                });
             }
             // A select in the name: a bit- or part-select of a packed vector
             // is unsigned; an element of an unpacked array is not known here.
-            let ExprKind::Ident(h) = &e.kind else {
-                return None;
-            };
             let base: Vec<&str> = h.path.iter().map(|s| s.name.name.as_str()).collect();
             let base = base.join(".");
             let last_selects = h.path.last().map_or(0, |s| s.selects.len());
@@ -8102,6 +8107,16 @@ fn simple_actual_signedness(
                 || elab.arrays_nd.contains_key(&base);
             (!unpacked && elab.signals.contains_key(base.as_str())).then_some(false)
         }
+        ExprKind::MemberAccess { expr, member } => match &expr.kind {
+            ExprKind::Ident(bh)
+                if bh.path.len() == 1
+                    && bh.path[0].selects.is_empty()
+                    && elab.packages.contains(&bh.path[0].name.name) =>
+            {
+                lookup(&format!("{}::{}", bh.path[0].name.name, member.name))
+            }
+            _ => None,
+        },
         ExprKind::Concatenation(_) | ExprKind::Replication { .. } => Some(false),
         _ => None,
     }
