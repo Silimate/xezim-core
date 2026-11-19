@@ -28576,6 +28576,40 @@ fn register_visible_array_param(
     true
 }
 
+/// §26.3: an array parameter brought in by `import p::*` or `import p::V`.
+/// Besides registering it under the visible name, publish its elements to
+/// the constant-evaluation fallback, as the scalar import path does with
+/// `param_fallback_set`: an inlined instance evaluates `V[k]` against its
+/// own parameters only, and reads an imported element from there.
+fn import_visible_array_param(
+    elab: &mut ElaboratedModule,
+    pkg: &str,
+    assign: &ParamAssignment,
+    data_type: &DataType,
+) -> bool {
+    if !register_visible_array_param(elab, pkg, assign, data_type) {
+        return false;
+    }
+    let name = &assign.name.name;
+    if let Some(shape) = elab.unpacked_decl_dims.get(name) {
+        let mut keys = vec![name.clone()];
+        for &(left, right) in shape {
+            keys = keys
+                .iter()
+                .flat_map(|key| {
+                    (left.min(right)..=left.max(right)).map(move |i| format!("{key}[{i}]"))
+                })
+                .collect();
+        }
+        for key in keys {
+            if let Some(value) = elab.parameters.get(&key) {
+                param_fallback_set(&key, value);
+            }
+        }
+    }
+    true
+}
+
 fn struct_typedef_self_reference(
     target: &str,
     dt: &DataType,
@@ -57937,7 +57971,7 @@ fn process_import(
                                 for assign in assignments {
                                     if &assign.name.name == sym_name {
                                         imported_params.insert(assign.name.name.clone());
-                                        if register_visible_array_param(
+                                        if import_visible_array_param(
                                             elab, pkg_name, assign, data_type,
                                         ) {
                                             elab.note_decl_site(
@@ -58439,7 +58473,7 @@ fn process_import(
                                         continue;
                                     }
                                     imported_params.insert(assign.name.name.clone());
-                                    if register_visible_array_param(
+                                    if import_visible_array_param(
                                         elab, pkg_name, assign, data_type,
                                     ) {
                                         elab.note_decl_site(
