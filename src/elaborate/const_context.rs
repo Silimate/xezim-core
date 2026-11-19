@@ -51,7 +51,7 @@ impl Types {
     }
 }
 
-pub(super) fn infer(expr: &Expression, params: &HashMap<String, Value>, types: &mut Types) -> Type {
+pub(super) fn infer<P: ParamLookup>(expr: &Expression, params: &P, types: &mut Types) -> Type {
     // A bound name already carries its type. Reading it for type inference
     // must not clone its value or allocate a cache entry on each loop step.
     if let ExprKind::Ident(h) = &expr.kind {
@@ -70,8 +70,23 @@ pub(super) fn infer(expr: &Expression, params: &HashMap<String, Value>, types: &
     }
     let mut cached = None;
     let ty = match &expr.kind {
-        ExprKind::Number(NumberLiteral::Integer { size, signed, .. }) => {
-            Type::integer(size.unwrap_or(32), *signed)
+        ExprKind::Number(NumberLiteral::Integer {
+            size,
+            signed,
+            base,
+            value,
+            ..
+        }) => {
+            let radix = match base {
+                NumberBase::Binary => 2,
+                NumberBase::Octal => 8,
+                NumberBase::Hex => 16,
+                NumberBase::Decimal => 10,
+            };
+            Type::integer(
+                size.unwrap_or_else(|| Value::unsized_integer_width(value, radix, *signed)),
+                *signed,
+            )
         }
         ExprKind::Number(NumberLiteral::UnbasedUnsized(_)) => Type::integer(1, false),
         ExprKind::Number(NumberLiteral::Real(_)) => Type {
@@ -194,23 +209,23 @@ pub(super) fn infer(expr: &Expression, params: &HashMap<String, Value>, types: &
     ty
 }
 
-fn function_type(func: &Expression, params: &HashMap<String, Value>) -> Option<Type> {
+fn function_type<P: ParamLookup>(func: &Expression, params: &P) -> Option<Type> {
     function_type_inner(func, params, false)
 }
 
 /// [`function_type`] only when the declared return type resolves past every
 /// type name: a typedef this scope cannot see would be sized from the width
 /// table but read as unsigned, which an untyped parameter must not take.
-pub(super) fn function_type_resolved(
+pub(super) fn function_type_resolved<P: ParamLookup>(
     func: &Expression,
-    params: &HashMap<String, Value>,
+    params: &P,
 ) -> Option<Type> {
     function_type_inner(func, params, true)
 }
 
-fn function_type_inner(
+fn function_type_inner<P: ParamLookup>(
     func: &Expression,
-    params: &HashMap<String, Value>,
+    params: &P,
     require_resolved: bool,
 ) -> Option<Type> {
     let (name, scoped) = const_fn_call_name(func)?;
@@ -238,7 +253,7 @@ fn function_type_inner(
     let width = if real {
         64
     } else {
-        typedefs_snapshot(|td| resolve_type_width(&resolved, Some(params), td))
+        typedefs_snapshot(|td| resolve_type_width_env(&resolved, Some(params), td))
     };
     (width > 0 || text).then_some(Type {
         width,
