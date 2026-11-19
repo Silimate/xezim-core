@@ -25391,6 +25391,15 @@ thread_local! {
     /// the imported package parameter still resolves.
     static PARAM_FALLBACK_TLS: std::cell::RefCell<HashMap<String, Value>>
         = std::cell::RefCell::new(HashMap::default());
+    /// §26.3: the `import` items of each inlined definition, by definition
+    /// name: `(package, Some(item))` for `import p::x`, `(package, None)` for
+    /// `import p::*`. Read by `imported_array_element`.
+    static DEF_IMPORTS_TLS: std::cell::RefCell<HashMap<String, Rc<[(String, Option<String>)]>>>
+        = std::cell::RefCell::new(HashMap::default());
+    /// §26.3: the definitions whose items are being read, innermost last
+    /// (`ImportScope`).
+    static IMPORT_SCOPE_TLS: std::cell::RefCell<Vec<String>>
+        = const { std::cell::RefCell::new(Vec::new()) };
     /// Typedef bodies for `const_eval_user_call`. That path builds an empty
     /// module shell, so a generate-if that calls a package function could not
     /// see `typedef unit_type_t [0:4] fmt_unit_types_t` and indexed the formal
@@ -25412,6 +25421,7 @@ thread_local! {
 /// previous one's until it installed its own (#739).
 pub(crate) fn reset_const_eval_snapshots() {
     PARAM_FALLBACK_TLS.with(|c| c.borrow_mut().clear());
+    DEF_IMPORTS_TLS.with(|c| c.borrow_mut().clear());
     TYPEDEF_TYPES_TLS.with(|c| *c.borrow_mut() = None);
     TYPEDEF_WIDTHS_TLS.with(|c| *c.borrow_mut() = None);
 }
@@ -25433,6 +25443,61 @@ fn set_typedef_widths_tls(widths: &TypedefTable) {
 /// Look up `name` in the global parameter fallback (package/$unit params).
 fn param_fallback_get(name: &str) -> Option<Value> {
     PARAM_FALLBACK_TLS.with(|c| c.borrow().get(name).cloned())
+}
+
+/// §26.3: an instance's items are read with its definition's imports in
+/// scope, from where its parent binds them until the instance is inlined.
+struct ImportScope;
+
+impl ImportScope {
+    fn enter(def: &str) -> Self {
+        IMPORT_SCOPE_TLS.with(|s| s.borrow_mut().push(def.to_string()));
+        ImportScope
+    }
+}
+
+impl Drop for ImportScope {
+    fn drop(&mut self) {
+        IMPORT_SCOPE_TLS.with(|s| {
+            s.borrow_mut().pop();
+        });
+    }
+}
+
+/// §26.3: element `index` of the array `name` (`V`, or a row `V[0]` of it)
+/// that the definition being read imports, under its package's qualified key
+/// (`p::V[0][index]`). An explicit `import p::V` names the package;
+/// otherwise exactly one of the wildcard-imported packages must declare the
+/// element. The innermost definition that imports it decides.
+fn imported_array_element<P: ParamLookup>(name: &str, index: i64, params: &P) -> Option<Value> {
+    let (root, rows) = name.split_at(name.find('[').unwrap_or(name.len()));
+    let read = |pkg: &str| {
+        let key = format!("{pkg}::{root}{rows}[{index}]");
+        params
+            .get(&key)
+            .cloned()
+            .or_else(|| param_fallback_get(&key))
+    };
+    let scopes = IMPORT_SCOPE_TLS.with(|s| s.borrow().clone());
+    for def in scopes.iter().rev() {
+        let Some(imports) = DEF_IMPORTS_TLS.with(|c| c.borrow().get(def).cloned()) else {
+            continue;
+        };
+        if let Some((pkg, _)) = imports
+            .iter()
+            .find(|(_, item)| item.as_deref() == Some(root))
+        {
+            return read(pkg);
+        }
+        let mut found = imports
+            .iter()
+            .filter(|(_, item)| item.is_none())
+            .filter_map(|(pkg, _)| read(pkg));
+        if let Some(value) = found.next() {
+            return found.next().is_none().then_some(value);
+        }
+    }
+    None
 }
 
 /// Fold a bare alias into the global parameter fallback so an inlined
@@ -28572,40 +28637,6 @@ fn register_visible_array_param(
     r1.apply(elab, "");
     if let Some(r2) = r2 {
         r2.apply(elab, "");
-    }
-    true
-}
-
-/// §26.3: an array parameter brought in by `import p::*` or `import p::V`.
-/// Besides registering it under the visible name, publish its elements to
-/// the constant-evaluation fallback, as the scalar import path does with
-/// `param_fallback_set`: an inlined instance evaluates `V[k]` against its
-/// own parameters only, and reads an imported element from there.
-fn import_visible_array_param(
-    elab: &mut ElaboratedModule,
-    pkg: &str,
-    assign: &ParamAssignment,
-    data_type: &DataType,
-) -> bool {
-    if !register_visible_array_param(elab, pkg, assign, data_type) {
-        return false;
-    }
-    let name = &assign.name.name;
-    if let Some(shape) = elab.unpacked_decl_dims.get(name) {
-        let mut keys = vec![name.clone()];
-        for &(left, right) in shape {
-            keys = keys
-                .iter()
-                .flat_map(|key| {
-                    (left.min(right)..=left.max(right)).map(move |i| format!("{key}[{i}]"))
-                })
-                .collect();
-        }
-        for key in keys {
-            if let Some(value) = elab.parameters.get(&key) {
-                param_fallback_set(&key, value);
-            }
-        }
     }
     true
 }
@@ -32380,18 +32411,26 @@ fn eval_const_expr_val_with_ctx<P: ParamLookup>(
                         return ev.clone();
                     }
                     // §26.3: an element of a PACKAGE array parameter read in
-                    // an instance's scope (`V[k]` after `import p::*`, or
-                    // `p::V[k]`). The scope's map holds the instance's own
-                    // parameters only; the package's elements are in the
-                    // package/$unit snapshot, as its scalars are for the
-                    // Ident arm. An array of the scope's own takes precedence.
-                    // `keys()` collects every row of the lookup, so scan them
-                    // only once the package does hold this element.
-                    let prefix = format!("{k}[");
-                    if !params.contains_key(k)
-                        && let Some(ev) =
-                            signed_index.and_then(|i| param_fallback_get(&format!("{k}[{i}]")))
-                        && !params.keys().iter().any(|name| name.starts_with(&prefix))
+                    // an instance's scope (`p::V[k]`, or `V[k]` after
+                    // `import p::*` or `import p::V`). The scope's map need not
+                    // hold it: a scoped name is in the package/$unit snapshot,
+                    // as its scalars are for the Ident arm, and a bare name is
+                    // read under the package that this definition imports it
+                    // from. An array of the scope's own (any row of it) takes
+                    // precedence. `keys()` collects every row of the lookup,
+                    // so scan them only once the package does hold this
+                    // element.
+                    let root = &k[..k.find('[').unwrap_or(k.len())];
+                    if !params.contains_key(root)
+                        && let Some(i) = signed_index
+                        && let Some(ev) = if root.contains("::") || root.contains('.') {
+                            param_fallback_get(&format!("{k}[{i}]"))
+                        } else {
+                            imported_array_element(k, i, params)
+                        }
+                        && !params.keys().iter().any(|name| {
+                            name.strip_prefix(root).is_some_and(|rest| rest.starts_with('['))
+                        })
                     {
                         return ev;
                     }
@@ -40718,10 +40757,23 @@ fn bind_inlined_import_params(
     def: Definition,
     definitions: &HashMap<String, Definition>,
 ) -> Result<(), String> {
+    let mut imports: Vec<(String, Option<String>)> = Vec::new();
     for item in def.items() {
         if let ModuleItem::ImportDeclaration(imp) = item {
             process_import(imp, elab, definitions, true)?;
+            for ii in &imp.items {
+                let entry = (ii.package.name.clone(), ii.item.as_ref().map(|i| i.name.clone()));
+                if !imports.contains(&entry) {
+                    imports.push(entry);
+                }
+            }
         }
+    }
+    if !imports.is_empty() {
+        DEF_IMPORTS_TLS.with(|c| {
+            c.borrow_mut()
+                .insert(def.name().to_string(), imports.into());
+        });
     }
     Ok(())
 }
@@ -41150,6 +41202,10 @@ fn inline_module_items(
                         .insert(sub_mod.name().to_string());
                     bind_inlined_import_params(elab, sub_mod, definitions)?;
                 }
+                // §26.3: until this instance is inlined (the recursive call
+                // below), its own imports answer a bare imported array
+                // element (`imported_array_element`).
+                let _import_scope = ImportScope::enter(sub_mod.name());
                 // §6.10 implicit nets bound by port connections INSIDE the
                 // module being inlined. The top-level pass only sees the top
                 // module's instantiations, and the pending pass only sees
@@ -57971,7 +58027,7 @@ fn process_import(
                                 for assign in assignments {
                                     if &assign.name.name == sym_name {
                                         imported_params.insert(assign.name.name.clone());
-                                        if import_visible_array_param(
+                                        if register_visible_array_param(
                                             elab, pkg_name, assign, data_type,
                                         ) {
                                             elab.note_decl_site(
@@ -58473,7 +58529,7 @@ fn process_import(
                                         continue;
                                     }
                                     imported_params.insert(assign.name.name.clone());
-                                    if import_visible_array_param(
+                                    if register_visible_array_param(
                                         elab, pkg_name, assign, data_type,
                                     ) {
                                         elab.note_decl_site(
