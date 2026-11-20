@@ -1,6 +1,6 @@
 //! Module-level item parsing (IEEE 1800-2017 §A.1)
 
-use super::Parser;
+use super::{Parser, compact_syntax_list};
 use crate::ast::Identifier;
 use crate::ast::decl::*;
 use crate::ast::expr::*;
@@ -419,7 +419,7 @@ impl Parser {
         match &mut stmt.kind {
             K::Assertion(a) => {
                 if a.is_property && a.procedural {
-                    a.inferred_clock = Some(clock.clone());
+                    a.inferred_clock = Some(Box::new(clock.clone()));
                 }
             }
             K::If {
@@ -1181,7 +1181,7 @@ impl Parser {
                     crate::ast::decl::ClassItem::Constraint(k)
                         if k.name.name == name.name.name && !k.has_body =>
                     {
-                        Some(k)
+                        Some(std::sync::Arc::make_mut(k))
                     }
                     _ => None,
                 })
@@ -2330,9 +2330,9 @@ impl Parser {
                 self.expect(TokenKind::Semicolon);
                 Some(ModuleItem::ContinuousAssign(ContinuousAssign {
                     strength,
-                    delay,
-                    delay_fall,
-                    delay_off,
+                    delay: delay.map(Box::new),
+                    delay_fall: delay_fall.map(Box::new),
+                    delay_off: delay_off.map(Box::new),
                     assignments: asgns,
                     span: self.span_from(start),
                 }))
@@ -2389,7 +2389,7 @@ impl Parser {
             }
             TokenKind::KwImport => {
                 if self.peek_kind() == TokenKind::StringLiteral {
-                    Some(ModuleItem::DPIImport(self.parse_dpi_import()))
+                    Some(ModuleItem::DPIImport(Box::new(self.parse_dpi_import())))
                 } else {
                     Some(ModuleItem::ImportDeclaration(
                         self.parse_import_declaration(),
@@ -2398,7 +2398,7 @@ impl Parser {
             }
             TokenKind::KwExport => {
                 if self.peek_kind() == TokenKind::StringLiteral {
-                    Some(ModuleItem::DPIExport(self.parse_dpi_export()))
+                    Some(ModuleItem::DPIExport(Box::new(self.parse_dpi_export())))
                 } else {
                     self.bump();
                     while !self.at(TokenKind::Semicolon) && !self.at(TokenKind::Eof) {
@@ -2823,8 +2823,8 @@ impl Parser {
                     clock_signal: clock_signal_id,
                     clock_bound: Default::default(),
                     clock_edge,
-                    default_input_skew,
-                    default_output_skew,
+                    default_input_skew: default_input_skew.map(Box::new),
+                    default_output_skew: default_output_skew.map(Box::new),
                     default_output_edge,
                     is_default: false,
                     signals,
@@ -3333,7 +3333,7 @@ impl Parser {
                 };
                 self.expect(TokenKind::RParen);
                 let (items, name, _) = self.parse_generate_branch_items_named();
-                Some(ModuleItem::GenerateFor(GenerateFor {
+                Some(ModuleItem::GenerateFor(Box::new(GenerateFor {
                     var: var_name,
                     init_val,
                     init: Some(init_expr),
@@ -3344,7 +3344,7 @@ impl Parser {
                     name_decl: Default::default(),
                     implicit_name: String::new(),
                     span: self.span_from(s),
-                }))
+                })))
             }
             TokenKind::KwAnd
             | TokenKind::KwNand
@@ -3567,9 +3567,9 @@ impl Parser {
             net_type,
             strength,
             data_type,
-            delay,
-            delay_fall,
-            delay_off,
+            delay: delay.map(Box::new),
+            delay_fall: delay_fall.map(Box::new),
+            delay_off: delay_off.map(Box::new),
             declarators,
             span: self.span_from(start),
         }
@@ -3620,14 +3620,14 @@ impl Parser {
                 decl: crate::ast::binding::Bound::UNSET,
                 name,
                 dimensions,
-                init,
+                init: init.map(Box::new),
                 span: self.span_from(start),
             });
             if self.eat(TokenKind::Comma).is_none() {
                 break;
             }
         }
-        decls
+        compact_syntax_list(decls)
     }
 
     fn parse_gate_instantiation(&mut self) -> GateInstantiation {
@@ -5479,14 +5479,14 @@ impl Parser {
                     self.expect(TokenKind::Semicolon);
                     (Vec::new(), false)
                 };
-                ClassItem::Constraint(ClassConstraint {
+                ClassItem::Constraint(std::sync::Arc::new(ClassConstraint {
                     is_static: qualifiers.contains(&ClassQualifier::Static),
                     is_extern: qualifiers.contains(&ClassQualifier::Extern),
                     has_body,
                     name: cname,
                     items,
                     span: self.span_from(start),
-                })
+                }))
             }
             TokenKind::KwTypedef => ClassItem::Typedef(self.parse_typedef_declaration()),
             TokenKind::KwParameter | TokenKind::KwLocalparam => {

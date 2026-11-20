@@ -1,6 +1,6 @@
 //! Declaration parsing (IEEE 1800-2017 §A.2)
 
-use super::Parser;
+use super::{Parser, compact_syntax_list};
 use crate::ast::Identifier;
 use crate::ast::decl::*;
 use crate::ast::stmt::VarDeclarator;
@@ -482,14 +482,14 @@ impl Parser {
                 decl: crate::ast::binding::Bound::UNSET,
                 name,
                 dimensions,
-                init,
+                init: init.map(Box::new),
                 span: self.span_from(start),
             });
             if self.eat(TokenKind::Comma).is_none() {
                 break;
             }
         }
-        decls
+        compact_syntax_list(decls)
     }
 
     pub(super) fn parse_function_declaration(&mut self) -> FunctionDeclaration {
@@ -550,6 +550,7 @@ impl Parser {
                 ports[ansi_ports].span,
             ));
         }
+        let items = compact_syntax_list(items);
         FunctionDeclaration {
             lifetime,
             specifier,
@@ -704,6 +705,7 @@ impl Parser {
         let endlabel = self.parse_end_label();
         self.check_tf_body_redeclarations(&ports[ansi_ports..], &mut items);
         Self::merge_nonansi_port_types(&mut ports, &mut items);
+        let items = compact_syntax_list(items);
         TaskDeclaration {
             lifetime,
             specifier,
@@ -1428,7 +1430,7 @@ impl Parser {
             }
         }
         self.expect(TokenKind::RParen);
-        ports
+        compact_syntax_list(ports)
     }
 
     pub(super) fn parse_package_item(&mut self) -> Option<PackageItem> {
@@ -1593,12 +1595,12 @@ impl Parser {
                                     NetType::Supply0 => '0',
                                     _ => 'z',
                                 };
-                                crate::ast::expr::Expression::new(
+                                Box::new(crate::ast::expr::Expression::new(
                                     crate::ast::expr::ExprKind::Number(
                                         crate::ast::expr::NumberLiteral::UnbasedUnsized(fill),
                                     ),
                                     d.span,
-                                )
+                                ))
                             })),
                             name: d.name,
                             dimensions: d.dimensions,
