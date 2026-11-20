@@ -1,6 +1,6 @@
 //! Expression parsing (IEEE 1800-2017 §A.8) with Pratt precedence climbing.
 
-use super::Parser;
+use super::{Parser, compact_syntax_list};
 use super::items::ConstraintPos;
 use crate::ast::Identifier;
 use crate::ast::Span;
@@ -2682,7 +2682,7 @@ impl Parser {
             }
         }
         self.expect(TokenKind::RParen);
-        args
+        compact_syntax_list(args)
     }
 
     /// Parse a hierarchical identifier (handles pkg::name and obj.member).
@@ -3549,22 +3549,28 @@ fn parse_number_literal(text: &str) -> NumberLiteral {
     // simulator converts it against the global tick precision. Kept distinct
     // from a bare numeric delay (scaled by the module timeunit) so relative
     // timing is correct under sub-ns timescales.
-    let time_suffixes: &[(&str, f64)] = &[
-        ("fs", 1e-15),
-        ("ps", 1e-12),
-        ("ns", 1e-9),
-        ("us", 1e-6),
-        ("ms", 1e-3),
-        ("s", 1.0),
+    // §5.8: the seconds are the nearest f64 to the literal's decimal value,
+    // read in one correctly rounded conversion (`9.2e3`, `1.5e-9`); scaling
+    // the mantissa by an inexact `1e-9` rounded twice.
+    let time_suffixes: &[(&str, i32)] = &[
+        ("fs", -15),
+        ("ps", -12),
+        ("ns", -9),
+        ("us", -6),
+        ("ms", -3),
+        ("s", 0),
     ];
-    for (suf, scale) in time_suffixes {
+    for (suf, exp) in time_suffixes {
         if text.ends_with(suf)
             && text.len() > suf.len()
             && text.as_bytes()[text.len() - suf.len() - 1].is_ascii_digit()
         {
-            let mantissa = &text[..text.len() - suf.len()];
-            if let Ok(v) = mantissa.replace('_', "").parse::<f64>() {
-                return NumberLiteral::Time(v * *scale);
+            let mantissa = text[..text.len() - suf.len()].replace('_', "");
+            if let Ok(m) = mantissa.parse::<f64>() {
+                let v = format!("{mantissa}e{exp}")
+                    .parse::<f64>()
+                    .unwrap_or(m * 10f64.powi(*exp));
+                return NumberLiteral::Time(v);
             }
         }
     }
