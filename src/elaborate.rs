@@ -30,7 +30,12 @@ pub mod interface_ports;
 mod module_class_scope;
 mod param_prefix_index;
 mod param_scope;
+mod prepared_bodies;
+#[cfg(test)]
+mod prepared_bodies_tests;
 pub(crate) mod unit_storage;
+#[cfg(test)]
+mod upward_scopes_tests;
 pub(crate) mod relaxed_static;
 
 struct ScopeGuardLite<F: FnMut()>(F);
@@ -517,9 +522,19 @@ pub struct ContinuousAssignment {
     /// declaration assignment): the span of that statement and the instance
     /// scope it was elaborated in (`""` for the top). `None` for the ones
     /// elaboration synthesizes (port connections, gate primitives, delayed
-    /// nets). Code coverage counts only the former.
+    /// nets). Code coverage counts only the former. The assignments of one
+    /// instance hold one scope string between them (aionhw/xezim#721).
     #[serde(default)]
-    pub origin: Option<(crate::ast::Span, String)>,
+    pub origin: Option<(crate::ast::Span, std::sync::Arc<str>)>,
+}
+
+/// The `ContinuousAssignment::origin` scope of the top module, one string
+/// for all of its assignments.
+fn top_origin_scope() -> std::sync::Arc<str> {
+    thread_local! {
+        static TOP: std::sync::Arc<str> = std::sync::Arc::from("");
+    }
+    TOP.with(std::sync::Arc::clone)
 }
 
 /// IEEE 1800-2017 §29 User-Defined Primitive instance, flattened during
@@ -928,6 +943,9 @@ impl<'de> serde::Deserialize<'de> for InputPortActual {
 #[derive(Debug, Clone)]
 pub struct RewriteCtx {
     pub prefix: String,
+    /// `prefix` without its trailing dot: the scope every continuous
+    /// assignment of the instance records as its origin, held once.
+    pub origin_scope: std::sync::Arc<str>,
     /// Port name → connecting expression in the parent scope. Per-instance
     /// (different connections per instantiation). The one table the
     /// instance's own inlining rewrote with, shared rather than copied; the
@@ -1187,7 +1205,7 @@ impl PendingContAssign {
         let delay_off = eval_delay(&self.delay_off_source);
         let origin = self
             .origin_span
-            .map(|sp| (sp, self.ctx.prefix.trim_end_matches('.').to_string()));
+            .map(|sp| (sp, std::sync::Arc::clone(&self.ctx.origin_scope)));
         ContinuousAssignment {
             gate_delay_fall: None,
             delay_select: None,
@@ -1245,8 +1263,12 @@ pub struct ElaboratedClass {
     /// Properties marked specifically as 'randc' (cyclic random).
     #[serde(default)]
     pub randc_properties: HashSet<String>,
-    /// Constraints: name -> constraint declaration.
-    pub constraints: HashMap<String, ClassConstraint>,
+    /// Constraints: name -> constraint declaration. Shared with the class
+    /// declaration and with every other elaborated copy of the class that
+    /// did not rewrite the block (aionhw/xezim#721): a reader that changes
+    /// one, or that keys state by where its items are stored, takes its own
+    /// copy first.
+    pub constraints: HashMap<String, std::sync::Arc<ClassConstraint>>,
     /// Class parameters with default values, in declaration order.
     /// `(name, default_value_expr)`.
     pub param_defaults: Vec<(String, Option<crate::ast::expr::Expression>)>,
@@ -1546,6 +1568,7 @@ fn install_ooc_constraint_body(
         .map(std::sync::Arc::make_mut)
     {
         if let Some(existing) = cd.constraints.get_mut(constraint_name) {
+            let existing = std::sync::Arc::make_mut(existing);
             existing.items = items.to_vec();
             existing.has_body = true;
         }
@@ -1645,11 +1668,12 @@ fn design_package(name: &str) -> bool {
 /// is materialized, by which time the tree is complete.
 #[derive(Debug, Default)]
 pub struct UpwardScopes {
-    /// Parent scope path (`""` = the top module) → its child instances as
-    /// `(instance name, definition name)`, bound instances included.
-    children: HashMap<String, Vec<(String, String)>>,
+    /// Parent scope path (`""` = the top module) → the paths of its child
+    /// instances, bound instances included. A child's instance name is its
+    /// path below the parent's (`child_leaf`).
+    children: HashMap<Rc<str>, Vec<Rc<str>>>,
     /// Instance path (`""` = the top module) → definition name.
-    defs: HashMap<String, String>,
+    defs: HashMap<Rc<str>, Rc<str>>,
     /// Definition name → the scope names its source declares anywhere in
     /// its body (instances of every generate branch, generate and block
     /// labels, subroutines): a reference headed by one of them is a
@@ -1659,33 +1683,88 @@ pub struct UpwardScopes {
     /// package constant, never a scope path.
     packages: HashSet<String>,
     /// §23.8.1: instance path → where its instantiation sits in its parent.
-    parents: HashMap<String, InstanceParent>,
+    parents: HashMap<Rc<str>, InstanceParent>,
+    /// The definition names in `defs` and `parents`, one string per
+    /// definition. An instance path is likewise one string, shared by the
+    /// tables that name it (aionhw/xezim#721).
+    def_names: HashSet<Rc<str>>,
+    /// The scope the last instance was recorded in; the children of one
+    /// scope arrive together, so most lookups of a parent end here.
+    last_parent: Option<Rc<str>>,
 }
 
 /// The scope of the parent definition holding an instantiation.
 #[derive(Debug)]
 struct InstanceParent {
     /// The instance's own definition.
-    def: String,
-    path: String,
+    def: Rc<str>,
+    path: Rc<str>,
     tree: Rc<crate::scope_tree::ScopeTree>,
     scope: crate::ast::binding::ScopeId,
     indices: Vec<i64>,
 }
 
 impl UpwardScopes {
-    fn add_instance(&mut self, parent: &str, path: &str, def: &str) {
-        let leaf = match parent.is_empty() {
+    /// The one string of the scope path `parent`, an instance recorded
+    /// earlier (or the top): the key a table already holds it under.
+    fn shared_parent(&mut self, parent: &str) -> Rc<str> {
+        if let Some(held) = self.last_parent.as_ref().filter(|p| &***p == parent) {
+            return Rc::clone(held);
+        }
+        let held = self.defs.get_key_value(parent).map(|(k, _)| k);
+        let held = held.or_else(|| self.parents.get_key_value(parent).map(|(k, _)| k));
+        let held = held.or_else(|| self.children.get_key_value(parent).map(|(k, _)| k));
+        let held = held.cloned().unwrap_or_else(|| Rc::from(parent));
+        self.last_parent = Some(Rc::clone(&held));
+        held
+    }
+
+    /// The one string of definition name `def`.
+    fn shared_def(&mut self, def: &str) -> Rc<str> {
+        if let Some(held) = self.def_names.get(def) {
+            return Rc::clone(held);
+        }
+        let name: Rc<str> = Rc::from(def);
+        self.def_names.insert(Rc::clone(&name));
+        name
+    }
+
+    /// The instance name of the child at `path` in the scope `parent`.
+    fn child_leaf<'a>(parent: &str, path: &'a str) -> &'a str {
+        match parent.is_empty() {
             true => path,
             false => path
                 .strip_prefix(parent)
                 .map_or(path, |p| p.trim_start_matches('.')),
-        };
+        }
+    }
+
+    /// The child instance of scope `parent` named `name`, by that name.
+    fn child_named(&self, parent: &str, name: &str) -> Option<&str> {
         self.children
-            .entry(parent.to_string())
+            .get(parent)?
+            .iter()
+            .map(|path| Self::child_leaf(parent, path))
+            .find(|leaf| *leaf == name)
+    }
+
+    /// The top module is an instance of `def` at the empty path.
+    fn set_top(&mut self, def: &str) {
+        let (path, def) = (self.shared_parent(""), self.shared_def(def));
+        self.defs.insert(path, def);
+    }
+
+    fn add_instance(&mut self, parent: &str, path: &str, def: &str) {
+        let parent = self.shared_parent(parent);
+        // `add_parent` recorded the instantiation first, under this path.
+        let held = self.parents.get_key_value(path).map(|(k, _)| Rc::clone(k));
+        let path = held.unwrap_or_else(|| Rc::from(path));
+        let def = self.shared_def(def);
+        self.children
+            .entry(parent)
             .or_default()
-            .push((leaf.to_string(), def.to_string()));
-        self.defs.insert(path.to_string(), def.to_string());
+            .push(Rc::clone(&path));
+        self.defs.insert(path, def);
     }
 
     /// Record where instance `path` is declared in its parent `parent`, an
@@ -1706,11 +1785,14 @@ impl UpwardScopes {
         if scope.0 as usize >= tree.scopes.len() {
             return;
         }
+        let parent = self.shared_parent(parent);
+        let def = self.shared_def(&inst.module_name.name);
+        // The first record of this instance: its path string starts here.
         self.parents.insert(
-            path.to_string(),
+            Rc::from(path),
             InstanceParent {
-                def: inst.module_name.name.clone(),
-                path: parent.to_string(),
+                def,
+                path: parent,
                 tree,
                 scope,
                 indices: hi.gen_indices.clone(),
@@ -1757,7 +1839,7 @@ impl UpwardScopes {
                 }
                 scope = sc.parent;
             }
-            at = &up.path;
+            at = &*up.path;
         }
         None
     }
@@ -1765,7 +1847,7 @@ impl UpwardScopes {
     /// §23.8.1: a bare call of `name` in a body of definition `def` finds a
     /// subroutine upward from every instance of `def`. The top finds none.
     fn every_instance_finds(&self, def: &str, name: &str) -> bool {
-        let mut insts = self.defs.iter().filter(|(_, d)| *d == def).peekable();
+        let mut insts = self.defs.iter().filter(|(_, d)| &***d == def).peekable();
         insts.peek().is_some() && insts.all(|(p, _)| self.find_subroutine(p, name).is_some())
     }
 
@@ -3432,7 +3514,7 @@ fn elaborate_class_in_scope(
                     // Remember scalar initializers so instantiation can re-eval
                     // them with the live parameter table (e.g. `= NUM_HARTS`).
                     if let Some(init) = &decl.init {
-                        property_inits.insert(decl.name.name.clone(), init.clone());
+                        property_inits.insert(decl.name.name.clone(), init.as_ref().clone());
                     }
                     let mut v = if let Some(init) = &decl.init {
                         let mut val =
@@ -4191,7 +4273,7 @@ pub struct ElaboratedModule {
     /// (`localparam e_t RST`), keyed as in `parameters`. The self-determined
     /// type of a parameter (§6.20.2), e.g. for a `default:` key (§10.9.1).
     #[serde(default)]
-    pub param_decl_types: SharedNameMap<DataType>,
+    pub param_decl_types: crate::decl_types::ParamDeclTypeMap,
     /// Struct variable -> its top-level member names in DECLARATION order, for
     /// packed and unpacked alike. `packed_struct_fields` is ordered by bit
     /// offset (i.e. reversed) and unpacked members live in separate signals, so
@@ -4779,7 +4861,7 @@ impl ElaboratedModule {
             packed_struct_fields: HashMap::default(),
             struct_field_range_idents: HashMap::default(),
             var_decl_types: Default::default(),
-            param_decl_types: SharedNameMap::default(),
+            param_decl_types: Default::default(),
             struct_members: HashMap::default(),
             packed_signal_elem_widths: HashMap::default(),
             typedef_elem_widths: HashMap::default(),
@@ -4860,6 +4942,10 @@ impl ElaboratedModule {
             self.initial_blocks.push(p.materialize());
         }
         let pending_ca = std::mem::take(&mut self.pending_cont_assign);
+        // One allocation for the lot: growing the table a push at a time
+        // copies it at every doubling, old and new buffer held together,
+        // and leaves up to half of the last one unused (aionhw/xezim#721).
+        self.continuous_assigns.reserve_exact(pending_ca.len());
         for p in pending_ca {
             let ca = p.materialize(&self.parameters);
             // A sub-module's `assign dst = src;` between unpacked arrays
@@ -8153,6 +8239,26 @@ fn check_implicit_static_inits(
     ))
 }
 
+/// Declaration-order snapshots are immutable inside procedural scopes.
+/// Sharing them avoids copying every module declaration for each function,
+/// block and condition; module/generate declarations retain copy-on-write
+/// isolation (§6.5, §6.21).
+#[derive(Clone, Default)]
+struct DeclaredModuleNames(Rc<HashSet<String>>);
+
+impl DeclaredModuleNames {
+    fn contains(&self, name: &str) -> bool {
+        self.0.contains(name)
+    }
+
+    fn insert(&mut self, name: String) -> bool {
+        Rc::make_mut(&mut self.0).insert(name)
+    }
+}
+
+#[cfg(test)]
+mod declaration_order_snapshot_tests;
+
 /// IEEE 1800-2017 §6.5: data shall be declared before use, except implicit
 /// nets (§6.10). Only names actually declared as module data are checked;
 /// unresolved names remain the responsibility of implicit-net/name resolution.
@@ -8166,7 +8272,7 @@ fn check_module_use_before_decl(
 ) -> Vec<String> {
     #[derive(Clone, Default)]
     struct Scope {
-        declared: HashSet<String>,
+        declared: DeclaredModuleNames,
         locals: HashSet<String>,
         objects: HashMap<String, String>,
         constraint_caller: Option<HashSet<String>>,
@@ -10165,7 +10271,16 @@ pub fn elaborate_module_with_defs(
     // §20.6.2/§20.7: the module's declarations answer `$bits` and the array
     // queries in its constant expressions for the whole elaboration.
     DECL_SHAPES_CACHE.with(|c| c.borrow_mut().clear());
+    crate::oom_trace::checkpoint(
+        "elaborate.decl_shapes.begin",
+        &[
+            ("module_items", module.items().len()),
+            ("shape_inline_bytes", std::mem::size_of::<StoredDeclShape>()),
+            ("shape_query_inline_bytes", std::mem::size_of::<DeclShape>()),
+        ],
+    );
     let _decl_shapes = install_decl_shapes(module);
+    crate::oom_trace::checkpoint("elaborate.decl_shapes.ready", &[]);
 
     // §24.3: a program block shall not contain module declarations —
     // reject before elaboration runs the nested module's items (ivtest
@@ -10404,6 +10519,8 @@ pub fn elaborate_module_with_defs(
         hoist_package_struct_params(defs, &mut elab);
     }
 
+    crate::oom_trace::checkpoint("elaborate.global_definitions.ready", &[("functions", elab.functions.len())]);
+
     // Process top-level imports
     for imp in top_level_imports {
         if let Some(defs) = all_defs {
@@ -10465,7 +10582,9 @@ pub fn elaborate_module_with_defs(
                 .insert_if_absent_with(fd.name.name.name.clone(), || fd.clone());
         }
     }
+    crate::oom_trace::checkpoint("elaborate.functions.registered", &[("functions", elab.functions.len())]);
     set_funcs_tls(&elab.functions);
+    crate::oom_trace::checkpoint("elaborate.functions.published", &[("functions", elab.functions.len())]);
     // §23.2.2 / A.1.2: module-HEADER imports (`module m import P::*;
     // #(parameter X = FOO) (...)`) precede the parameter list in the grammar
     // and are usable in it. The items walk processes imports in source order
@@ -10486,7 +10605,7 @@ pub fn elaborate_module_with_defs(
             .iter()
             .chain(item_param_decls(module.items())),
         str::to_string,
-        DataType::clone,
+        |dt| Rc::new(dt.clone()),
     );
     if let Some(defs) = all_defs {
         for def in defs.values() {
@@ -10499,7 +10618,7 @@ pub fn elaborate_module_with_defs(
                     &mut elab,
                     pds,
                     |n| format!("{}::{n}", p.name.name),
-                    DataType::clone,
+                    |dt| Rc::new(dt.clone()),
                 );
             }
         }
@@ -10535,7 +10654,14 @@ pub fn elaborate_module_with_defs(
                             && !items.is_empty()
                             && items
                                 .iter()
-                                .all(|it| matches!(it, AssignmentPatternItem::Keyed(_, _)));
+                                .all(|it| matches!(it, AssignmentPatternItem::Keyed(_, _)))
+                            && pack_packed_vector_pattern(
+                                data_type,
+                                init,
+                                &elab.parameters,
+                                &elab.typedef_types,
+                            )
+                            .is_none();
                         if all_keyed {
                             let elem_w = resolve_type_width(
                                 data_type,
@@ -10872,6 +10998,8 @@ pub fn elaborate_module_with_defs(
         }
         PortList::Empty => {}
     }
+
+    crate::oom_trace::checkpoint("elaborate.header.ready", &[("signals", elab.signals.len())]);
 
     // Process items
     if let Definition::Package(p) = module {
@@ -11383,7 +11511,24 @@ pub fn elaborate_module_with_defs(
     // `extends` when their constraints are validated.
     let local_defs = defs_with_local_classes(module.items(), all_defs);
     let cls_defs = local_defs.as_ref().or(all_defs);
-    for item in module.items() {
+    for (item_index, item) in module.items().iter().enumerate() {
+        if item_index + 4096 >= module.items().len() && crate::oom_trace::enabled() {
+            crate::oom_trace::checkpoint("elaborate.last_item", &[
+                ("item_index", item_index), ("signals", elab.signals.len()),
+                ("var_decl_types", elab.var_decl_types.len()),
+                ("initial", matches!(item, ModuleItem::InitialConstruct(_)) as usize),
+                ("always", matches!(item, ModuleItem::AlwaysConstruct(_)) as usize),
+                ("signal_inline_bytes", std::mem::size_of::<Signal>()),
+                ("type_inline_bytes", std::mem::size_of::<DataType>()),
+            ]);
+        }
+        if item_index % 4096 == 0 && crate::oom_trace::enabled() {
+            crate::oom_trace::checkpoint("elaborate.items", &[
+                ("item_index", item_index), ("module_items", module.items().len()),
+                ("signals", elab.signals.len()), ("var_decl_types", elab.var_decl_types.len()),
+                ("functions", elab.functions.len()),
+            ]);
+        }
         match item {
             ModuleItem::PortDeclaration(pd) => {
                 let port_modport_view = match &pd.data_type {
@@ -11709,7 +11854,7 @@ pub fn elaborate_module_with_defs(
                                 elab.continuous_assigns.push(ContinuousAssignment {
                                     gate_delay_fall: None,
                                     delay_select: None,
-                                    origin: Some((init_expr.span, String::new())),
+                                    origin: Some((init_expr.span, top_origin_scope())),
                                     lhs: make_ident_expr(&decl.name.name),
                                     rhs: decl_rhs,
                                     delay: decl_dly.0,
@@ -11933,7 +12078,7 @@ pub fn elaborate_module_with_defs(
                         elab.continuous_assigns.push(ContinuousAssignment {
                             gate_delay_fall: None,
                             delay_select: None,
-                            origin: Some((init_expr.span, String::new())),
+                            origin: Some((init_expr.span, top_origin_scope())),
                             lhs: make_ident_expr(&decl.name.name),
                             rhs: decl_rhs,
                             delay: decl_dly.0,
@@ -12770,7 +12915,7 @@ pub fn elaborate_module_with_defs(
                                     stmt: Statement::new(
                                         StatementKind::BlockingAssign {
                                             lvalue: make_ident_expr(&decl.name.name),
-                                            rvalue: init_expr.clone(),
+                                            rvalue: init_expr.as_ref().clone(),
                                         },
                                         Span::dummy(),
                                     ),
@@ -12843,7 +12988,7 @@ pub fn elaborate_module_with_defs(
                                 stmt: Statement::new(
                                     StatementKind::BlockingAssign {
                                         lvalue: make_ident_expr(&decl.name.name),
-                                        rvalue: init_expr.clone(),
+                                        rvalue: init_expr.as_ref().clone(),
                                     },
                                     Span::dummy(),
                                 ),
@@ -13003,7 +13148,7 @@ pub fn elaborate_module_with_defs(
                                     stmt: Statement::new(
                                         StatementKind::BlockingAssign {
                                             lvalue: make_ident_expr(&decl.name.name),
-                                            rvalue: init_expr.clone(),
+                                            rvalue: init_expr.as_ref().clone(),
                                         },
                                         Span::dummy(),
                                     ),
@@ -13060,7 +13205,7 @@ pub fn elaborate_module_with_defs(
                                 }
                                 elab.initial_blocks.push(InitialBlock {
                                     stmt: Statement::new(
-                                        StatementKind::SeqBlock { name: None, stmts },
+                                        StatementKind::SeqBlock { name: None, stmts: stmts.into() },
                                         Span::dummy(),
                                     ),
                                     scope: String::new(),
@@ -13070,7 +13215,7 @@ pub fn elaborate_module_with_defs(
                                     stmt: Statement::new(
                                         StatementKind::BlockingAssign {
                                             lvalue: make_ident_expr(&decl.name.name),
-                                            rvalue: init_expr.clone(),
+                                            rvalue: init_expr.as_ref().clone(),
                                         },
                                         Span::dummy(),
                                     ),
@@ -13140,7 +13285,7 @@ pub fn elaborate_module_with_defs(
                                         w,
                                         &elab.typedef_types,
                                     ),
-                                    Some(init_expr.clone()),
+                                    Some(init_expr.as_ref().clone()),
                                 )
                             }
                         } else {
@@ -13198,9 +13343,9 @@ pub fn elaborate_module_with_defs(
                             elab.continuous_assigns.push(ContinuousAssignment {
                                 gate_delay_fall: None,
                                 delay_select: None,
-                                origin: Some((init_expr.span, String::new())),
+                                origin: Some((init_expr.span, top_origin_scope())),
                                 lhs: make_ident_expr(&decl.name.name),
-                                rhs: init_expr.clone(),
+                                rhs: init_expr.as_ref().clone(),
                                 delay: 0,
                                 rhs_parent_scoped: true,
                                 delay_fall: None,
@@ -13829,7 +13974,7 @@ pub fn elaborate_module_with_defs(
                                 if !stmts.is_empty() {
                                     elab.initial_blocks.push(InitialBlock {
                                         stmt: Statement::new(
-                                            StatementKind::SeqBlock { name: None, stmts },
+                                            StatementKind::SeqBlock { name: None, stmts: stmts.into() },
                                             Span::dummy(),
                                         ),
                                         scope: String::new(),
@@ -14534,7 +14679,7 @@ pub fn elaborate_module_with_defs(
                         elab.continuous_assigns.push(ContinuousAssignment {
                             gate_delay_fall: None,
                             delay_select: None,
-                            origin: Some((ca.span, String::new())),
+                            origin: Some((ca.span, top_origin_scope())),
                             lhs: lhs.clone(),
                             rhs: rhs_final,
                             delay,
@@ -14911,6 +15056,18 @@ pub fn elaborate_module_with_defs(
             }
         }
     }
+    crate::oom_trace::checkpoint(
+        "elaborate.items.ready",
+        &[
+            ("signals", elab.signals.len()),
+            ("signals_capacity", elab.signals.capacity()),
+            ("var_decl_types", elab.var_decl_types.len()),
+            ("var_types_capacity", elab.var_decl_types.as_map().capacity()),
+            ("signal_inline_bytes", std::mem::size_of::<Signal>()),
+            ("type_inline_bytes", std::mem::size_of::<DataType>()),
+            ("shape_inline_bytes", std::mem::size_of::<StoredDeclShape>()),
+        ],
+    );
     expand_whole_struct_continuous_assigns(&mut elab);
 
     // IEEE 1800-2017 §6.10: Implicit nets — identifiers used in continuous assigns
@@ -14933,10 +15090,9 @@ pub fn elaborate_module_with_defs(
     // regions, so one call over the module's items covers every depth —
     // per-arm registration in the item loop would miss the ones that
     // `elaborate_items` handles on its own recursion.
-    {
-        let items: Vec<ModuleItem> = module.items().to_vec();
-        register_generate_labels(&items, &mut elab);
-    }
+    crate::oom_trace::checkpoint("elaborate.labels.begin", &[("signals", elab.signals.len())]);
+    register_generate_labels(module.items(), &mut elab);
+    crate::oom_trace::checkpoint("elaborate.labels.ready", &[("signals", elab.signals.len())]);
     // §23.9: a NAMED block's locals are reachable hierarchically
     // (`nb.q` from a sibling process), so every block label in the module is
     // a legal reference root — collect them all before validating.
@@ -14998,6 +15154,8 @@ pub fn elaborate_module_with_defs(
         validate_expr_idents(&ca.lhs, &elab, &HashSet::default())?;
         validate_expr_idents(&ca.rhs, &elab, &HashSet::default())?;
     }
+
+    crate::oom_trace::checkpoint("elaborate.identifiers.ready", &[("signals", elab.signals.len())]);
 
     // IEEE 1800-2017 §6.20.6: a `const` variable may be assigned only once, in
     // its declaration. The `validate_stmt_idents` check above exempts a const
@@ -16684,6 +16842,65 @@ pub fn secs_to_exp(s: f64) -> i32 {
 /// Power-of-ten exponent -> seconds (-6 -> 1e-6).
 pub fn exp_to_secs(e: i32) -> f64 {
     10f64.powi(e)
+}
+
+/// The powers of ten that are exact in an f64 (10^0 to 10^22).
+const POW10_EXACT: [f64; 23] = [
+    1e0, 1e1, 1e2, 1e3, 1e4, 1e5, 1e6, 1e7, 1e8, 1e9, 1e10, 1e11, 1e12, 1e13, 1e14, 1e15, 1e16,
+    1e17, 1e18, 1e19, 1e20, 1e21, 1e22,
+];
+
+/// §5.8, §3.14.1: `x * 10^e`, correctly rounded. A time value changes units
+/// by a power of ten; 10^n is exact in an f64 up to 10^22, so the product
+/// (or, for a negative `e`, the quotient) is the nearest f64 to the exact
+/// result. `x / 10f64.powi(-15)` is not: 1e-15 is not 10^-15, and
+/// `9200.0 / 1e-15` is 9199999999999998000, so `9200s` under `1ns/1fs` was
+/// 2048 fs short of 9200 s and never equal to the integer 9200000000000.
+#[inline]
+pub fn scale_pow10(x: f64, e: i32) -> f64 {
+    match e {
+        0 => x,
+        1..=22 => x * POW10_EXACT[e as usize],
+        -22..=-1 => x / POW10_EXACT[e.unsigned_abs() as usize],
+        _ => x * 10f64.powi(e),
+    }
+}
+
+/// §3.14.1, §6.12.1: round a time value counted in units of a precision to
+/// the nearest whole unit, ties away from zero. A decimal half reaches here
+/// a few ulps off after a change of unit (`2.5ps` as 2.4999999999999996
+/// ps), so a value within four ulps below a half is taken as the half. The
+/// slack applies below 2^30 only, where four ulps are under 2^-20; a larger
+/// count is rounded as it is (every f64 of 2^52 or more is an integer
+/// already). The relative nudge used before, `x * (1 + 1e-12)`, moved such
+/// a count: 9.2e15 by 9200.
+#[inline]
+pub fn round_time_units(x: f64) -> f64 {
+    let a = x.abs();
+    if !(a < 1_073_741_824.0) {
+        return x.round();
+    }
+    let f = a.floor();
+    let r = if a - f >= 0.5 - 4.0 * f64::EPSILON * a.max(1.0) {
+        f + 1.0
+    } else {
+        f
+    };
+    r.copysign(x)
+}
+
+/// §5.8: the value of a time literal of `secs` seconds in a scope whose time
+/// unit is 10^`unit_exp` s and whose precision is 10^`prec_exp` s: rounded
+/// to the precision (§3.14.1), then expressed in the unit. Both changes of
+/// unit are by an exact power of ten (`scale_pow10`), so a literal that is a
+/// whole number of precision ticks gives exactly that count whenever an f64
+/// holds it (`9200s` under `1ns/1fs` is 9200000000000.0).
+#[inline]
+pub fn time_literal_in_units(secs: f64, unit_exp: i32, prec_exp: i32) -> f64 {
+    scale_pow10(
+        round_time_units(scale_pow10(secs, -prec_exp)),
+        prec_exp - unit_exp,
+    )
 }
 
 pub fn time_literal_to_exp(s: &str) -> i32 {
@@ -19556,7 +19773,7 @@ fn elaborate_items(
                         elab.continuous_assigns.push(ContinuousAssignment {
                             gate_delay_fall: None,
                             delay_select: None,
-                            origin: Some((init_expr.span, String::new())),
+                            origin: Some((init_expr.span, top_origin_scope())),
                             lhs: make_ident_expr(&decl.name.name),
                             rhs: decl_rhs,
                             delay: decl_dly.0,
@@ -19928,7 +20145,7 @@ fn elaborate_items(
                                 stmt: Statement::new(
                                     StatementKind::BlockingAssign {
                                         lvalue: make_ident_expr(&decl.name.name),
-                                        rvalue: init_expr.clone(),
+                                        rvalue: init_expr.as_ref().clone(),
                                     },
                                     Span::dummy(),
                                 ),
@@ -20015,7 +20232,7 @@ fn elaborate_items(
                                     stmt: Statement::new(
                                         StatementKind::BlockingAssign {
                                             lvalue: make_ident_expr(&decl.name.name),
-                                            rvalue: init_expr.clone(),
+                                            rvalue: init_expr.as_ref().clone(),
                                         },
                                         Span::dummy(),
                                     ),
@@ -20072,7 +20289,7 @@ fn elaborate_items(
                                 }
                                 elab.initial_blocks.push(InitialBlock {
                                     stmt: Statement::new(
-                                        StatementKind::SeqBlock { name: None, stmts },
+                                        StatementKind::SeqBlock { name: None, stmts: stmts.into() },
                                         Span::dummy(),
                                     ),
                                     scope: String::new(),
@@ -20082,10 +20299,10 @@ fn elaborate_items(
                     } else {
                         let procedural_init = decl
                             .init
-                            .as_ref()
+                            .as_deref()
                             .filter(|init| !is_const_expr(init, &elab.parameters));
                         let init_val = if let Some(init_expr) =
-                            decl.init.as_ref().filter(|_| procedural_init.is_none())
+                            decl.init.as_deref().filter(|_| procedural_init.is_none())
                         {
                             let mut rv =
                                 eval_init_for_target(init_expr, &elab.parameters, width, is_real);
@@ -20431,7 +20648,7 @@ fn elaborate_items(
                         elab.continuous_assigns.push(ContinuousAssignment {
                             gate_delay_fall: None,
                             delay_select: None,
-                            origin: Some((ca.span, String::new())),
+                            origin: Some((ca.span, top_origin_scope())),
                             lhs: lhs.clone(),
                             rhs: rhs_final,
                             delay,
@@ -21625,10 +21842,7 @@ fn scope_time_expr(e: &mut Expression, u: i32, p: i32) {
         // VALUE-position time literal: absolute seconds, scaled to the
         // scope's unit rounded at its precision (§5.8).
         ExprKind::Number(NumberLiteral::Time(secs)) => {
-            let prec_s = 10f64.powi(p);
-            let ratio = 10f64.powi(u - p);
-            let v = (*secs / prec_s).round() / ratio;
-            e.kind = ExprKind::Number(NumberLiteral::Real(v));
+            e.kind = ExprKind::Number(NumberLiteral::Real(time_literal_in_units(*secs, u, p)));
         }
         ExprKind::SystemCall { name, args } => {
             if args.is_empty() && matches!(name.as_str(), "$time" | "$stime" | "$realtime") {
@@ -22458,15 +22672,16 @@ fn rewrite_delay_expr(d: &mut Expression, unit_s: f64, prec_s: f64, tick_s: f64)
     // 1ns/1ns BFM kept a real 2 ps duration when called hierarchically
     // from a 1 ps-precision testbench, phase-shifting delay-paced loops
     // off the clock grid for the rest of the run).
-    let q = prec_s / tick_s;
-    let quant = |ticks: f64| -> f64 {
-        if q > 1.0 + f64::EPSILON {
-            let x = (ticks / q) * (1.0 + 1e-12);
-            (x.round() * q).round()
-        } else {
-            ticks
-        }
-    };
+    // Every change of unit is by an exact power of ten (`scale_pow10`): the
+    // quotients of the unit, precision and tick in seconds are not exact
+    // (`1e-6 / 1e-15` is 999999999.9999999), and neither was `9200s / 1e-15`.
+    let (u, p, t) = (
+        secs_to_exp(unit_s),
+        secs_to_exp(prec_s),
+        secs_to_exp(tick_s),
+    );
+    // A count of precision units, rounded to a whole one, in global ticks.
+    let quant = |prec_units: f64| -> f64 { scale_pow10(round_time_units(prec_units), p - t) };
     match &d.kind {
         // §3.14.3 / A.2.2.3: `1step` is the global time precision, one tick,
         // whatever the scope's own unit and precision (#615).
@@ -22486,7 +22701,7 @@ fn rewrite_delay_expr(d: &mut Expression, unit_s: f64, prec_s: f64, tick_s: f64)
         }
         ExprKind::Number(NumberLiteral::Time(s)) => {
             // Absolute time literal → ticks, on the precision grid.
-            let ticks = quant(*s / tick_s);
+            let ticks = quant(scale_pow10(*s, -p));
             *d = Expression::new(ExprKind::Number(NumberLiteral::Real(ticks)), d.span);
         }
         // A FRACTIONAL bare delay is the only bare form the precision grid
@@ -22494,12 +22709,12 @@ fn rewrite_delay_expr(d: &mut Expression, unit_s: f64, prec_s: f64, tick_s: f64)
         // and quantize now. Integer and non-constant delays keep the
         // multiply-by-scale form (+ runtime quantization).
         ExprKind::Number(NumberLiteral::Real(r)) => {
-            let ticks = quant(*r * (unit_s / tick_s));
+            let ticks = quant(scale_pow10(*r, u - p));
             *d = Expression::new(ExprKind::Number(NumberLiteral::Real(ticks)), d.span);
         }
         _ => {
             // Bare delay (count of the module timeunit) → ticks.
-            let scale = unit_s / tick_s;
+            let scale = scale_pow10(1.0, u - t);
             if (scale - 1.0).abs() > f64::EPSILON {
                 let span = d.span;
                 let inner = std::mem::replace(d, Expression::new(ExprKind::Null, span));
@@ -22558,11 +22773,11 @@ fn net_decl_assign_delay(
     nd: &crate::ast::decl::NetDeclaration,
     params: &HashMap<String, Value>,
 ) -> (u64, Option<u64>, Option<u64>) {
-    let ev = |d: &Option<Expression>| d.as_ref().map(|d| eval_const_expr(d, params));
+    let ev = |d: Option<&Expression>| d.map(|d| eval_const_expr(d, params));
     (
-        ev(&nd.delay).unwrap_or(0),
-        ev(&nd.delay_fall),
-        ev(&nd.delay_off),
+        ev(nd.delay.as_deref()).unwrap_or(0),
+        ev(nd.delay_fall.as_deref()),
+        ev(nd.delay_off.as_deref()),
     )
 }
 
@@ -26347,12 +26562,230 @@ pub struct DeclShape {
     pub param: bool,
 }
 
+/// The common declaration types do not need the space of a named type in
+/// every shape-table bucket. Keep their fields verbatim, including spans;
+/// rich types retain the complete AST in the fallback.
+#[derive(Debug, Clone)]
+enum DeclShapeDataType {
+    IntegerVector {
+        kind: IntegerVectorType,
+        signing: Option<Signing>,
+        dimensions: Vec<PackedDimension>,
+        span: Span,
+    },
+    IntegerAtom {
+        kind: IntegerAtomType,
+        signing: Option<Signing>,
+        span: Span,
+    },
+    Real {
+        kind: RealType,
+        span: Span,
+    },
+    Implicit {
+        signing: Option<Signing>,
+        dimensions: Vec<PackedDimension>,
+        span: Span,
+    },
+    Other(Box<DataType>),
+}
+
+impl DeclShapeDataType {
+    fn new(dt: &DataType) -> Self {
+        match dt {
+            DataType::IntegerVector {
+                kind,
+                signing,
+                dimensions,
+                span,
+            } => Self::IntegerVector {
+                kind: *kind,
+                signing: *signing,
+                dimensions: dimensions.clone(),
+                span: *span,
+            },
+            DataType::IntegerAtom {
+                kind,
+                signing,
+                span,
+            } => Self::IntegerAtom {
+                kind: *kind,
+                signing: *signing,
+                span: *span,
+            },
+            DataType::Real { kind, span } => Self::Real {
+                kind: *kind,
+                span: *span,
+            },
+            DataType::Implicit {
+                signing,
+                dimensions,
+                span,
+            } => Self::Implicit {
+                signing: *signing,
+                dimensions: dimensions.clone(),
+                span: *span,
+            },
+            _ => Self::Other(Box::new(dt.clone())),
+        }
+    }
+
+    fn into_data_type(self) -> DataType {
+        match self {
+            Self::IntegerVector {
+                kind,
+                signing,
+                dimensions,
+                span,
+            } => DataType::IntegerVector {
+                kind,
+                signing,
+                dimensions,
+                span,
+            },
+            Self::IntegerAtom {
+                kind,
+                signing,
+                span,
+            } => DataType::IntegerAtom {
+                kind,
+                signing,
+                span,
+            },
+            Self::Real { kind, span } => DataType::Real { kind, span },
+            Self::Implicit {
+                signing,
+                dimensions,
+                span,
+            } => DataType::Implicit {
+                signing,
+                dimensions,
+                span,
+            },
+            Self::Other(dt) => *dt,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct StoredDeclShape {
+    data_type: DeclShapeDataType,
+    unpacked: Vec<UnpackedDimension>,
+    by_type_param: bool,
+    param: bool,
+}
+
+impl StoredDeclShape {
+    fn new(
+        dt: &DataType,
+        unpacked: &[UnpackedDimension],
+        by_type_param: bool,
+        param: bool,
+    ) -> Self {
+        Self {
+            data_type: DeclShapeDataType::new(dt),
+            unpacked: unpacked.to_vec(),
+            by_type_param,
+            param,
+        }
+    }
+
+    fn into_decl_shape(self) -> DeclShape {
+        DeclShape {
+            data_type: self.data_type.into_data_type(),
+            unpacked: self.unpacked,
+            by_type_param: self.by_type_param,
+            param: self.param,
+        }
+    }
+}
+
+#[cfg(test)]
+mod decl_shape_storage_tests {
+    use super::*;
+
+    #[test]
+    fn compact_shape_types_preserve_their_ast_fields() {
+        let parsed = crate::parse(
+            "module shapes; logic signed [3:1] v [2:5]; int unsigned a; realtime r; \
+             wire signed [7:0] imp; typedef logic [6:0] word_t; word_t named [1:3]; \
+             struct packed { logic [1:0] x; bit y; } aggregate; \
+             enum logic [2:0] { A, B } enumeration; endmodule",
+        );
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+        let crate::ast::Description::Module(module) = &parsed.source.descriptions[0] else {
+            panic!("expected module");
+        };
+        let (shapes, _) = collect_decl_shapes(
+            &module.ports,
+            &module.items,
+            &module.params,
+            &HashSet::default(),
+        );
+        for item in &module.items {
+            let (dt, name, dims) = match item {
+                ModuleItem::DataDeclaration(d) => (
+                    &d.data_type,
+                    &d.declarators[0].name,
+                    &d.declarators[0].dimensions,
+                ),
+                ModuleItem::NetDeclaration(d) => (
+                    &d.data_type,
+                    &d.declarators[0].name,
+                    &d.declarators[0].dimensions,
+                ),
+                _ => continue,
+            };
+            let stored = shapes.get(&name.name).expect("fixed declaration shape");
+            let shape = stored.clone().into_decl_shape();
+            assert_eq!(
+                serde_json::to_value(&shape.data_type).unwrap(),
+                serde_json::to_value(dt).unwrap()
+            );
+            assert_eq!(
+                serde_json::to_value(&shape.unpacked).unwrap(),
+                serde_json::to_value(dims).unwrap()
+            );
+            assert!(!shape.by_type_param);
+            assert!(!shape.param);
+        }
+        assert!(std::mem::size_of::<StoredDeclShape>() < std::mem::size_of::<DeclShape>());
+    }
+
+    #[test]
+    fn streamed_scope_items_keep_declaration_order_and_generate_boundaries() {
+        let parsed = crate::parse(
+            "module shapes #(parameter type T=logic [5:0]); \
+             generate logic [3:0] first; T typed; endgenerate \
+             logic [9:0] first; \
+             if (1) begin : child logic hidden; end \
+             localparam logic [4:0] P=0; endmodule",
+        );
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+        let crate::ast::Description::Module(module) = &parsed.source.descriptions[0] else {
+            panic!("expected module");
+        };
+        let (shapes, type_params) = collect_decl_shapes(
+            &module.ports,
+            &module.items,
+            &module.params,
+            &HashSet::default(),
+        );
+        assert!(type_params.contains("T"));
+        assert!(shapes["typed"].by_type_param);
+        assert!(shapes["P"].param);
+        assert!(!shapes.contains_key("hidden"));
+        let first = shapes["first"].clone().into_decl_shape();
+        assert_eq!(resolve_type_width(&first.data_type, None, None), 4);
+    }
+}
+
 thread_local! {
     /// Declared shapes of the module (or instance) whose body is being
     /// elaborated, keyed by bare name. Installed by `DeclShapesGuard` for that
     /// scope only and restored afterwards, so a name never answers from
     /// another module's declarations, and nothing is installed at run time.
-    static DECL_SHAPES_TLS: std::cell::RefCell<Option<std::rc::Rc<HashMap<String, DeclShape>>>>
+    static DECL_SHAPES_TLS: std::cell::RefCell<Option<std::rc::Rc<HashMap<String, StoredDeclShape>>>>
         = const { std::cell::RefCell::new(None) };
     /// Built declared-shape tables, keyed by definition (name and source
     /// identity) — see `install_decl_shapes`.
@@ -26390,12 +26823,13 @@ fn peel_unpacked_typed_pattern(e: &Expression) -> &Expression {
 }
 
 /// §6.20.2: record under `key(name)` the declared type of each explicitly
-/// typed value parameter of `pds`.
+/// typed value parameter of `pds`. The parameters of one declaration hold
+/// one copy of its type.
 fn record_param_decl_types<'a>(
     elab: &mut ElaboratedModule,
     pds: impl Iterator<Item = &'a ParameterDeclaration>,
     key: impl Fn(&str) -> String,
-    ty: impl Fn(&DataType) -> DataType,
+    mut ty: impl FnMut(&DataType) -> Rc<DataType>,
 ) {
     for pd in pds {
         let ParameterKind::Data {
@@ -26411,7 +26845,8 @@ fn record_param_decl_types<'a>(
         }
         let dt = ty(data_type);
         for a in assignments.iter().filter(|a| a.dimensions.is_empty()) {
-            elab.param_decl_types.insert(key(&a.name.name), dt.clone());
+            elab.param_decl_types
+                .insert_shared(key(&a.name.name), Rc::clone(&dt));
         }
     }
 }
@@ -26505,28 +26940,28 @@ fn tls_restore_typedef_shape(name: &str, saved: TypedefShapeSave) {
 #[derive(Default)]
 struct DeclShapeLayers {
     type_params: std::rc::Rc<HashSet<String>>,
-    blocks: Vec<std::rc::Rc<HashMap<String, DeclShape>>>,
+    blocks: Vec<std::rc::Rc<HashMap<String, StoredDeclShape>>>,
     /// The shapes of the blocks already elaborated in this scope, under
     /// their block keys (`g[0].arr`), for a query from outside (§23.6).
-    left: HashMap<String, DeclShape>,
+    left: HashMap<String, StoredDeclShape>,
     /// Every generate block's declared shapes as written, under the block
     /// path without loop indices (`g.arr`), for a query from outside a block
     /// not yet elaborated. A shape that reads a genvar does not evaluate.
-    by_path: std::rc::Rc<HashMap<String, DeclShape>>,
+    by_path: std::rc::Rc<HashMap<String, StoredDeclShape>>,
 }
 
 /// A definition's declared shapes, the names of its type parameters, and
 /// its generate blocks' shapes by block path.
 type DeclShapeTable = (
-    std::rc::Rc<HashMap<String, DeclShape>>,
+    std::rc::Rc<HashMap<String, StoredDeclShape>>,
     std::rc::Rc<HashSet<String>>,
-    std::rc::Rc<HashMap<String, DeclShape>>,
+    std::rc::Rc<HashMap<String, StoredDeclShape>>,
 );
 
 /// Restores the previously installed declared-shape table, and the block
 /// layers over it, on drop.
 pub struct DeclShapesGuard(
-    Option<std::rc::Rc<HashMap<String, DeclShape>>>,
+    Option<std::rc::Rc<HashMap<String, StoredDeclShape>>>,
     DeclShapeLayers,
 );
 
@@ -26562,6 +26997,7 @@ fn decl_shape_of(name: &str) -> Option<DeclShape> {
                 })
             })
         })
+        .map(StoredDeclShape::into_decl_shape)
 }
 
 /// `g[0].n.arr` without its loop indices (`g.n.arr`); None for a simple name.
@@ -26589,12 +27025,12 @@ fn collect_block_shapes(
     items: &[ModuleItem],
     prefix: &str,
     type_params: &HashSet<String>,
-    out: &mut HashMap<String, DeclShape>,
+    out: &mut HashMap<String, StoredDeclShape>,
     clash: &mut HashSet<String>,
 ) {
     let block = |name: &str,
                  block_items: &[ModuleItem],
-                 out: &mut HashMap<String, DeclShape>,
+                 out: &mut HashMap<String, StoredDeclShape>,
                  clash: &mut HashSet<String>| {
         let p = format!("{prefix}{name}.");
         let (shapes, _) = collect_decl_shapes(&PortList::Empty, block_items, &[], type_params);
@@ -26813,15 +27249,30 @@ pub fn install_decl_shapes(def: Definition) -> DeclShapesGuard {
 
 /// The items of a scope, with those of its `generate` regions in place: a
 /// region is not a scope (§27.3).
-fn scope_items(items: &[ModuleItem]) -> Vec<&ModuleItem> {
-    let mut out = Vec::with_capacity(items.len());
-    for it in items {
-        match it {
-            ModuleItem::GenerateRegion(gr) => out.extend(scope_items(&gr.items)),
-            _ => out.push(it),
+fn scope_items(items: &[ModuleItem]) -> ScopeItems<'_> {
+    ScopeItems {
+        pending: vec![items.iter()],
+    }
+}
+
+struct ScopeItems<'a> {
+    pending: Vec<std::slice::Iter<'a, ModuleItem>>,
+}
+
+impl<'a> Iterator for ScopeItems<'a> {
+    type Item = &'a ModuleItem;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            match self.pending.last_mut()?.next() {
+                Some(ModuleItem::GenerateRegion(gr)) => self.pending.push(gr.items.iter()),
+                Some(item) => return Some(item),
+                None => {
+                    self.pending.pop();
+                }
+            }
         }
     }
-    out
 }
 
 /// The declared shapes of a scope's ports and declarations, and the type
@@ -26832,13 +27283,12 @@ fn collect_decl_shapes(
     items: &[ModuleItem],
     header_params: &[ParameterDeclaration],
     outer_type_params: &HashSet<String>,
-) -> (HashMap<String, DeclShape>, HashSet<String>) {
-    let items = scope_items(items);
+) -> (HashMap<String, StoredDeclShape>, HashSet<String>) {
     // A variable typed by one of the module's own TYPE parameters takes the
     // instance's binding; it is sized from that width alone, never from a
     // same-named typedef elsewhere.
     let mut type_params: HashSet<String> = outer_type_params.clone();
-    let body_params = items.iter().filter_map(|it| match it {
+    let body_params = scope_items(items).filter_map(|it| match it {
         ModuleItem::ParameterDeclaration(pd) | ModuleItem::LocalparamDeclaration(pd) => Some(pd),
         _ => None,
     });
@@ -26851,64 +27301,50 @@ fn collect_decl_shapes(
         matches!(dt, DataType::TypeReference { name, .. }
             if name.scopes.is_empty() && type_params.contains(name.name.name.as_str()))
     };
-    let mut m: HashMap<String, DeclShape> = HashMap::default();
+    let mut m: HashMap<String, StoredDeclShape> = HashMap::default();
     if let PortList::Ansi(ps) = ports {
         for p in ps {
             if let Some(dt) = &p.data_type
                 && decl_shape_is_fixed(dt, &p.dimensions)
             {
-                m.entry(p.name.name.clone()).or_insert_with(|| DeclShape {
-                    data_type: dt.clone(),
-                    unpacked: p.dimensions.clone(),
-                    by_type_param: by_type_param(dt),
-                    param: false,
+                m.entry(p.name.name.clone()).or_insert_with(|| {
+                    StoredDeclShape::new(dt, &p.dimensions, by_type_param(dt), false)
                 });
             }
         }
     }
-    for &item in &items {
-        let (dt, decls): (&DataType, Vec<(&Identifier, &Vec<UnpackedDimension>)>) = match item {
-            ModuleItem::DataDeclaration(dd) => (
-                &dd.data_type,
-                dd.declarators
-                    .iter()
-                    .map(|d| (&d.name, &d.dimensions))
-                    .collect(),
-            ),
-            ModuleItem::NetDeclaration(nd) => (
-                &nd.data_type,
-                nd.declarators
-                    .iter()
-                    .map(|d| (&d.name, &d.dimensions))
-                    .collect(),
-            ),
-            ModuleItem::PortDeclaration(pd) => (
-                &pd.data_type,
-                pd.declarators
-                    .iter()
-                    .map(|d| (&d.name, &d.dimensions))
-                    .collect(),
-            ),
-            _ => continue,
-        };
-        for (name, dims) in decls {
-            // A non-ANSI port is declared twice (direction, then type); the
-            // first spelling that carries the shape wins.
-            if !decl_shape_is_fixed(dt, dims) {
-                continue;
+    // A non-ANSI port is declared twice (direction, then type); the first
+    // spelling that carries the shape wins.
+    let mut add_decl = |dt: &DataType, name: &Identifier, dims: &[UnpackedDimension]| {
+        if decl_shape_is_fixed(dt, dims) {
+            m.entry(name.name.clone())
+                .or_insert_with(|| StoredDeclShape::new(dt, dims, by_type_param(dt), false));
+        }
+    };
+    for item in scope_items(items) {
+        match item {
+            ModuleItem::DataDeclaration(dd) => {
+                for d in &dd.declarators {
+                    add_decl(&dd.data_type, &d.name, &d.dimensions);
+                }
             }
-            m.entry(name.name.clone()).or_insert_with(|| DeclShape {
-                data_type: dt.clone(),
-                unpacked: dims.clone(),
-                by_type_param: by_type_param(dt),
-                param: false,
-            });
+            ModuleItem::NetDeclaration(nd) => {
+                for d in &nd.declarators {
+                    add_decl(&nd.data_type, &d.name, &d.dimensions);
+                }
+            }
+            ModuleItem::PortDeclaration(pd) => {
+                for d in &pd.declarators {
+                    add_decl(&pd.data_type, &d.name, &d.dimensions);
+                }
+            }
+            _ => {}
         }
     }
     // §20.7, §6.20.2: a value parameter with a declared type or range has
     // that shape (`$size(V)` of `localparam logic [7:0] V` is 8); an untyped
     // one takes its value's, which the parameter table answers.
-    let body_params = items.iter().filter_map(|it| match it {
+    let body_params = scope_items(items).filter_map(|it| match it {
         ModuleItem::ParameterDeclaration(pd) | ModuleItem::LocalparamDeclaration(pd) => Some(pd),
         _ => None,
     });
@@ -26925,11 +27361,8 @@ fn collect_decl_shapes(
         }
         for a in assignments {
             if decl_shape_is_fixed(data_type, &a.dimensions) {
-                m.entry(a.name.name.clone()).or_insert_with(|| DeclShape {
-                    data_type: data_type.clone(),
-                    unpacked: a.dimensions.clone(),
-                    by_type_param: by_type_param(data_type),
-                    param: true,
+                m.entry(a.name.name.clone()).or_insert_with(|| {
+                    StoredDeclShape::new(data_type, &a.dimensions, by_type_param(data_type), true)
                 });
             }
         }
@@ -28689,112 +29122,6 @@ fn struct_typedef_self_reference(
 /// Flatten a (possibly nested) packed struct/union `DataType` into
 /// `(field_path, lsb_offset, width)` tuples for `packed_struct_fields`.
 /// First-declared member is the MSB (IEEE 1800-2017 §7.2.1), so offsets are
-/// Pack an assignment-pattern literal for a PACKED ARRAY OF STRUCTS parameter
-/// (`T [N-1:0] p = '{ '{...}, '{...}, ... }`, e.g. black-parrot's
-/// `bp_proc_param_s [max_cfgs-1:0] all_cfgs_gp`) into one packed Value. Each
-/// pattern element is packed as the element struct type and the elements are
-/// concatenated MSB-first (first pattern item = highest index, IEEE 1800-2017
-/// §10.9.2 / §7.4.2). Returns None unless `dt` is a packed array of a struct
-/// typedef and `expr` is an assignment pattern, so callers fall back cleanly.
-fn pack_packed_array_const_value(
-    dt: &DataType,
-    expr: &Expression,
-    params: &dyn ParamLookup,
-    typedefs: &HashMap<String, u32>,
-    typedef_types: &HashMap<String, DataType>,
-) -> Option<Value> {
-    if let ExprKind::TypedPattern { ty, pattern } = &expr.kind {
-        return pack_typed_pattern(ty, pattern, params, typedefs, typedef_types);
-    }
-    let ExprKind::AssignmentPattern(items) = &expr.kind else {
-        return None;
-    };
-    let DataType::TypeReference {
-        name, dimensions, ..
-    } = dt
-    else {
-        return None;
-    };
-    if dimensions.is_empty() {
-        return None;
-    }
-    // Element type = the referenced typedef, fully chased to its struct.
-    let elem_dt = resolve_typedef_chain(typedef_types.get(&name.name.name)?, typedef_types);
-    if !matches!(elem_dt, DataType::Struct(_)) {
-        return None;
-    }
-    let elem_w = resolve_type_width_env(elem_dt, Some(&params), Some(typedefs));
-    if elem_w == 0 {
-        return None;
-    }
-    let mut parts: Vec<Value> = Vec::with_capacity(items.len());
-    for it in items {
-        let e = it.expr();
-        let v = pack_struct_const_value(elem_dt, e, params, typedefs, typedef_types)
-            .map(|sv| sv.resize(elem_w))
-            .unwrap_or_else(|| eval_init_for_width(e, params, elem_w));
-        parts.push(v);
-    }
-    Some(Value::concat(&parts))
-}
-
-/// Type-aware parameter initializer evaluation: packed array-of-structs pattern,
-/// then single struct pattern, else the generic const-eval. Centralises the
-/// black-parrot config-table packing so every param-load site resolves
-/// `all_cfgs_gp` (and struct params) consistently.
-/// §10.9 / §6.20.2: pack an assignment-pattern value against a MULTI-DIM
-/// packed VECTOR type (`parameter bit [1:0][7:0] M = '{8'hAA, 8'hBB}`).
-///
-/// The generic const-eval cannot pack a pattern — it has no type to take
-/// element widths from — so such a parameter silently evaluated to 0, both as
-/// a declared default and as an instance `#(.M('{...}))` override, in module,
-/// package and interface scope alike. (`pack_packed_array_const_value` above
-/// only covers typedef'd STRUCT element types.)
-///
-/// The pattern's first element corresponds to the leftmost index of the outer
-/// dimension, which is the MS end of packed storage for descending and
-/// ascending ranges alike, so filled slots concatenate in slot order. Returns
-/// `None` — callers fall back to the previous behavior — for anything not a
-/// resolvable ≥2-dimension packed vector or any pattern shape not understood.
-pub(crate) fn pack_packed_vector_pattern(
-    dt: &DataType,
-    expr: &Expression,
-    params: &HashMap<String, Value>,
-    typedef_types: &HashMap<String, DataType>,
-) -> Option<Value> {
-    pack_packed_vector_pattern_env(dt, expr, params, typedef_types)
-}
-
-pub(crate) fn pack_packed_vector_pattern_env(
-    dt: &DataType,
-    expr: &Expression,
-    params: &dyn ParamLookup,
-    typedef_types: &HashMap<String, DataType>,
-) -> Option<Value> {
-    if let ExprKind::TypedPattern { ty, pattern } = &expr.kind {
-        return pack_packed_vector_pattern_env(ty, pattern, params, typedef_types);
-    }
-    let (dims, leaf_w) = packed_pattern_shape(dt, params, typedef_types)?;
-    if dims.is_empty() {
-        return None;
-    }
-    pack_vector_pattern_dims(&dims, expr, params, leaf_w)
-}
-
-/// §10.9: the constant value of the typed pattern `ty'{...}`, packed against
-/// `ty` (a packed array of structs, a struct, or a packed vector).
-fn pack_typed_pattern(
-    ty: &DataType,
-    pattern: &Expression,
-    params: &dyn ParamLookup,
-    typedefs: &HashMap<String, u32>,
-    typedef_types: &HashMap<String, DataType>,
-) -> Option<Value> {
-    pack_packed_array_const_value(ty, pattern, params, typedefs, typedef_types)
-        .or_else(|| pack_struct_const_value(ty, pattern, params, typedefs, typedef_types))
-        .or_else(|| pack_packed_vector_pattern_env(ty, pattern, params, typedef_types))
-}
-
 /// Packed dimensions of `dt`, outermost first, and the width of one leaf
 /// element. A `logic` vector's leaf is 1 bit (the ranges ARE the bits). An
 /// enum's leaf is the enum base width (`unit_type_t` is 2 bits), and every
@@ -28832,18 +29159,14 @@ fn packed_pattern_shape(
     None
 }
 
-/// Recursive core of [`pack_packed_vector_pattern`], over a packed-dimension
-/// slice so nested patterns (`'{'{..}, '{..}}` on a 3-D vector) reuse it.
-fn pack_vector_pattern_dims(
-    dims: &[PackedDimension],
-    expr: &Expression,
+/// The outermost packed dimension of `dt` (left and right bound) and the
+/// type of one element below it, through typedefs. None when `dt` has no
+/// packed dimension with constant bounds.
+fn peel_packed_dim_const(
+    dt: &DataType,
     params: &dyn ParamLookup,
-    leaf_w: u32,
-) -> Option<Value> {
-    use crate::ast::expr::AssignmentPatternItem;
-    let ExprKind::AssignmentPattern(items) = &expr.kind else {
-        return None;
-    };
+    typedef_types: &HashMap<String, DataType>,
+) -> Option<(i64, i64, DataType)> {
     let bounds = |d: &PackedDimension| -> Option<(i64, i64)> {
         let PackedDimension::Range { left, right, .. } = d else {
             return None;
@@ -28853,20 +29176,313 @@ fn pack_vector_pattern_dims(
             const_eval_i64_with_params_env(right, Some(&params))?,
         ))
     };
-    let (l, r) = bounds(dims.first()?)?;
-    let n = ((l - r).unsigned_abs() + 1) as usize;
-    let inner = &dims[1..];
-    let mut elem_w: u32 = leaf_w.max(1);
-    for d in inner {
-        let (il, ir) = bounds(d)?;
-        elem_w = elem_w.checked_mul(((il - ir).unsigned_abs() + 1) as u32)?;
-    }
-    let eval_elem = |e: &Expression, context: bool| -> Option<Value> {
-        if !inner.is_empty() && matches!(e.kind, ExprKind::AssignmentPattern(_)) {
-            return pack_vector_pattern_dims(inner, e, params, leaf_w);
+    let mut cur = dt.clone();
+    for _ in 0..64 {
+        match cur {
+            DataType::TypeReference {
+                name,
+                mut dimensions,
+                type_args,
+                span,
+            } => {
+                if !dimensions.is_empty() {
+                    let first = dimensions.remove(0);
+                    let (l, r) = bounds(&first)?;
+                    let elem = DataType::TypeReference {
+                        name,
+                        dimensions,
+                        type_args,
+                        span,
+                    };
+                    return Some((l, r, elem));
+                }
+                cur = lookup_scoped_type(&name, typedef_types)?.clone();
+            }
+            DataType::Struct(mut su) if su.packed => {
+                if su.dimensions.is_empty() {
+                    return None;
+                }
+                let first = su.dimensions.remove(0);
+                let (l, r) = bounds(&first)?;
+                return Some((l, r, DataType::Struct(su)));
+            }
+            DataType::IntegerVector {
+                kind,
+                mut dimensions,
+                span,
+                ..
+            } => {
+                if dimensions.is_empty() {
+                    return None;
+                }
+                let first = dimensions.remove(0);
+                let (l, r) = bounds(&first)?;
+                return Some((
+                    l,
+                    r,
+                    DataType::IntegerVector {
+                        kind,
+                        signing: None,
+                        dimensions,
+                        span,
+                    },
+                ));
+            }
+            DataType::Implicit {
+                signing,
+                dimensions,
+                span,
+            } => {
+                cur = DataType::IntegerVector {
+                    kind: IntegerVectorType::Logic,
+                    signing,
+                    dimensions,
+                    span,
+                };
+            }
+            DataType::Enum(mut e) => {
+                if e.dimensions.is_empty() {
+                    return None;
+                }
+                let first = e.dimensions.remove(0);
+                let (l, r) = bounds(&first)?;
+                return Some((l, r, DataType::Enum(e)));
+            }
+            _ => return None,
         }
-        // §6.12.2: a real item CONVERTS (rounds) to the element type — the
-        // width-fit path would reinterpret its IEEE-754 bits.
+    }
+    None
+}
+
+/// The number of elements `dims` span, when every bound is constant.
+fn packed_dims_product_const(dims: &[PackedDimension], params: &dyn ParamLookup) -> Option<u32> {
+    let mut total: u32 = 1;
+    for d in dims {
+        let PackedDimension::Range { left, right, .. } = d else {
+            return None;
+        };
+        let l = const_eval_i64_with_params_env(left, Some(&params))?;
+        let r = const_eval_i64_with_params_env(right, Some(&params))?;
+        total = total.checked_mul(((l - r).unsigned_abs() + 1) as u32)?;
+    }
+    Some(total)
+}
+
+/// The packed width of `dt` with constant bounds; 0 when it cannot be sized.
+fn packed_type_width_const(
+    dt: &DataType,
+    params: &dyn ParamLookup,
+    typedefs: Option<&HashMap<String, u32>>,
+    typedef_types: &HashMap<String, DataType>,
+) -> u32 {
+    if let Some(td) = typedefs {
+        let w = resolve_type_width_env(dt, Some(&params), Some(td));
+        if w > 0 {
+            return w;
+        }
+    }
+    let mut cur = dt;
+    let mut mul: u32 = 1;
+    for _ in 0..64 {
+        match cur {
+            DataType::TypeReference {
+                name, dimensions, ..
+            } => {
+                let Some(dm) = packed_dims_product_const(dimensions, params) else {
+                    return 0;
+                };
+                mul = mul.saturating_mul(dm);
+                let Some(next) = lookup_scoped_type(name, typedef_types) else {
+                    return 0;
+                };
+                cur = next;
+            }
+            DataType::IntegerVector { dimensions, .. } | DataType::Implicit { dimensions, .. } => {
+                let dm = packed_dims_product_const(dimensions, params).unwrap_or(1);
+                return mul.saturating_mul(dm).max(1);
+            }
+            DataType::IntegerAtom { kind, .. } => {
+                let w = match kind {
+                    IntegerAtomType::Byte => 8,
+                    IntegerAtomType::ShortInt => 16,
+                    IntegerAtomType::Int | IntegerAtomType::Integer => 32,
+                    IntegerAtomType::LongInt | IntegerAtomType::Time => 64,
+                };
+                return mul.saturating_mul(w);
+            }
+            DataType::Enum(e) => {
+                let dm = packed_dims_product_const(&e.dimensions, params).unwrap_or(1);
+                let bw = e
+                    .base_type
+                    .as_deref()
+                    .map(|b| packed_type_width_const(b, params, typedefs, typedef_types))
+                    .unwrap_or(32);
+                return mul.saturating_mul(dm).saturating_mul(bw);
+            }
+            DataType::Struct(su) => {
+                let dm = packed_dims_product_const(&su.dimensions, params).unwrap_or(1);
+                let union = su.kind == StructUnionKind::Union;
+                let mut total: u32 = 0;
+                for m in &su.members {
+                    let mw = packed_type_width_const(&m.data_type, params, typedefs, typedef_types);
+                    for _ in &m.declarators {
+                        total = if union {
+                            total.max(mw)
+                        } else {
+                            total.saturating_add(mw)
+                        };
+                    }
+                }
+                return mul.saturating_mul(dm).saturating_mul(total);
+            }
+            _ => return resolve_type_width_env(cur, Some(&params), typedefs).saturating_mul(mul),
+        }
+    }
+    0
+}
+
+/// Pack an assignment-pattern literal for a PACKED ARRAY OF STRUCTS parameter
+/// (`T [N-1:0] p = '{ '{...}, '{...}, ... }`, e.g. black-parrot's
+/// `bp_proc_param_s [max_cfgs-1:0] all_cfgs_gp`) into one packed Value. Each
+/// pattern element is packed as the element struct type and the elements are
+/// concatenated MSB-first (first pattern item = highest index, IEEE 1800-2017
+/// §10.9.2 / §7.4.2). Returns None unless `dt` is a packed array of a struct
+/// typedef and `expr` is an assignment pattern, so callers fall back cleanly.
+fn pack_packed_array_const_value(
+    dt: &DataType,
+    expr: &Expression,
+    params: &dyn ParamLookup,
+    typedefs: &HashMap<String, u32>,
+    typedef_types: &HashMap<String, DataType>,
+) -> Option<Value> {
+    if let ExprKind::TypedPattern { ty, pattern } = &expr.kind {
+        return pack_typed_pattern(ty, pattern, params, typedefs, typedef_types);
+    }
+    let (_, _, elem_dt) = peel_packed_dim_const(dt, params, typedef_types)?;
+    if !matches!(
+        resolve_typedef_chain(&elem_dt, typedef_types),
+        DataType::Struct(_)
+    ) {
+        return None;
+    }
+    pack_packed_dt_pattern(dt, expr, params, Some(typedefs), typedef_types, &[])
+}
+
+/// §10.9 / §6.20.2: pack an assignment-pattern value against a MULTI-DIM
+/// packed VECTOR type (`parameter bit [1:0][7:0] M = '{8'hAA, 8'hBB}`).
+///
+/// The generic const-eval cannot pack a pattern — it has no type to take
+/// element widths from — so such a parameter silently evaluated to 0, both as
+/// a declared default and as an instance `#(.M('{...}))` override, in module,
+/// package and interface scope alike.
+///
+/// The pattern's first element corresponds to the leftmost index of the outer
+/// dimension, which is the MS end of packed storage for descending and
+/// ascending ranges alike, so filled slots concatenate in slot order. Returns
+/// `None` — callers fall back to the previous behavior — for anything not a
+/// packed type with a dimension or any pattern shape not understood.
+pub(crate) fn pack_packed_vector_pattern(
+    dt: &DataType,
+    expr: &Expression,
+    params: &HashMap<String, Value>,
+    typedef_types: &HashMap<String, DataType>,
+) -> Option<Value> {
+    pack_packed_vector_pattern_env(dt, expr, params, typedef_types)
+}
+
+pub(crate) fn pack_packed_vector_pattern_env(
+    dt: &DataType,
+    expr: &Expression,
+    params: &dyn ParamLookup,
+    typedef_types: &HashMap<String, DataType>,
+) -> Option<Value> {
+    if let ExprKind::TypedPattern { ty, pattern } = &expr.kind {
+        return pack_packed_vector_pattern_env(ty, pattern, params, typedef_types);
+    }
+    pack_packed_dt_pattern(dt, expr, params, None, typedef_types, &[])
+}
+
+/// §10.9: the constant value of the typed pattern `ty'{...}`, packed against
+/// `ty` (a packed array of structs, a struct, or a packed vector).
+fn pack_typed_pattern(
+    ty: &DataType,
+    pattern: &Expression,
+    params: &dyn ParamLookup,
+    typedefs: &HashMap<String, u32>,
+    typedef_types: &HashMap<String, DataType>,
+) -> Option<Value> {
+    pack_packed_array_const_value(ty, pattern, params, typedefs, typedef_types)
+        .or_else(|| pack_struct_const_value(ty, pattern, params, typedefs, typedef_types))
+        .or_else(|| pack_packed_vector_pattern_env(ty, pattern, params, typedef_types))
+}
+
+/// §10.9.1: the constant value of the pattern `expr` for the packed type
+/// `dt`, one outermost dimension at a time: index and positional items first,
+/// then the last type key that matches the element type (`outer_types` are
+/// the keys of enclosing levels), then `default:`.
+fn pack_packed_dt_pattern(
+    dt: &DataType,
+    expr: &Expression,
+    params: &dyn ParamLookup,
+    typedefs: Option<&HashMap<String, u32>>,
+    typedef_types: &HashMap<String, DataType>,
+    outer_types: &[(DataType, Expression)],
+) -> Option<Value> {
+    use crate::ast::expr::AssignmentPatternItem;
+    let ExprKind::AssignmentPattern(items) = &expr.kind else {
+        return None;
+    };
+    let (l, r, elem_dt) = peel_packed_dim_const(dt, params, typedef_types)?;
+    let n = ((l - r).unsigned_abs() + 1) as usize;
+    let elem_w = packed_type_width_const(&elem_dt, params, typedefs, typedef_types).max(1);
+    let empty_td = HashMap::default();
+    let td_ref = typedefs.unwrap_or(&empty_td);
+    let eval_elem = |e: &Expression, context: bool, elem_outer: &[(DataType, Expression)]| -> Option<Value> {
+        if let Some(v) = pack_struct_const_value_with_outer(
+            &elem_dt,
+            e,
+            params,
+            td_ref,
+            typedef_types,
+            elem_outer,
+        ) {
+            return Some(v.resize(elem_w));
+        }
+        if matches!(
+            e.kind,
+            ExprKind::AssignmentPattern(_) | ExprKind::TypedPattern { .. }
+        ) && let Some(v) = pack_packed_dt_pattern(
+            &elem_dt,
+            e,
+            params,
+            typedefs,
+            typedef_types,
+            elem_outer,
+        ) {
+            return Some(v.resize(elem_w));
+        }
+        if !elem_outer.is_empty()
+            && !matches!(
+                e.kind,
+                ExprKind::AssignmentPattern(_) | ExprKind::TypedPattern { .. }
+            )
+            && pattern_slot_is_aggregate(&elem_dt, typedef_types) == Some(true)
+        {
+            let syn = Expression::new(
+                ExprKind::AssignmentPattern(vec![AssignmentPatternItem::Default(e.clone())]),
+                e.span,
+            );
+            if let Some(v) = pack_packed_dt_pattern(
+                &elem_dt,
+                &syn,
+                params,
+                typedefs,
+                typedef_types,
+                elem_outer,
+            ) {
+                return Some(v.resize(elem_w));
+            }
+        }
         let raw = eval_const_expr_val_env(e, &params);
         if raw.is_real {
             let r = raw.to_f64().round() as i64;
@@ -28880,7 +29496,6 @@ fn pack_vector_pattern_dims(
         Some(if context {
             eval_init_for_width(e, params, elem_w)
         } else {
-            // §10.8: default correspondence is self-determined.
             raw.resize_for_assign(elem_w)
         })
     };
@@ -28896,15 +29511,16 @@ fn pack_vector_pattern_dims(
         })
     };
     let mut slots: Vec<Option<Value>> = vec![None; n];
-    let mut default_v: Option<Value> = None;
+    let mut local_types: Vec<(DataType, Expression)> = Vec::new();
+    let mut default_expr: Option<&Expression> = None;
     let mut next_ordered = 0usize;
     for it in items {
+        if let Some((kt, v)) = pattern_item_type_key(it, typedef_types, params, "", &|_| false) {
+            local_types.push((kt, v.clone()));
+            continue;
+        }
         match it {
             AssignmentPatternItem::Ordered(v) => {
-                // §10.9.1: inside an assignment pattern `N{expr…}` replicates
-                // pattern ELEMENTS, not bits — `'{4{8'h7E}}` is four 8-bit
-                // elements. Treating it as one element left the remaining
-                // slots unfilled, so the whole pattern bailed to 0.
                 if let ExprKind::Replication { count, exprs } = &v.kind {
                     let reps = const_eval_i64_with_params_env(count, Some(&params))?;
                     if reps < 0 {
@@ -28915,38 +29531,66 @@ fn pack_vector_pattern_dims(
                             if next_ordered >= n {
                                 return None;
                             }
-                            slots[next_ordered] = Some(eval_elem(e, true)?);
+                            slots[next_ordered] = Some(eval_elem(e, true, outer_types)?);
                             next_ordered += 1;
                         }
                     }
                     continue;
                 }
                 if next_ordered >= n {
-                    return None; // more elements than slots — malformed, bail
+                    return None;
                 }
-                slots[next_ordered] = Some(eval_elem(v, true)?);
+                slots[next_ordered] = Some(eval_elem(v, true, outer_types)?);
                 next_ordered += 1;
             }
             AssignmentPatternItem::Keyed(k, v) => {
                 let idx = const_eval_pattern_index_env(k, Some(&params), (l, r))?;
-                *slots.get_mut(slot_of(idx)?)? = Some(eval_elem(v, true)?);
+                *slots.get_mut(slot_of(idx)?)? = Some(eval_elem(v, true, outer_types)?);
+            }
+            AssignmentPatternItem::Named(id, v) => {
+                let idx =
+                    const_eval_i64_with_params_env(&make_ident_expr(&id.name), Some(&params))?;
+                *slots.get_mut(slot_of(idx)?)? = Some(eval_elem(v, true, outer_types)?);
             }
             AssignmentPatternItem::Default(v) => {
-                default_v = Some(eval_elem(v, false)?);
+                default_expr = Some(v);
             }
-            // `'{member: v}` names struct members and `'{type_t: v}` keys by
-            // type — neither applies to a plain vector.
-            AssignmentPatternItem::Named(..) | AssignmentPatternItem::Typed(..) => return None,
+            AssignmentPatternItem::Typed(..) => return None,
         }
     }
+    let mut combined = local_types;
+    combined.extend(outer_types.iter().cloned());
+    let elem_sig = pattern_type_signature(&elem_dt, typedef_types, params);
+    let matched_type = elem_sig.and_then(|es| {
+        combined.iter().rev().find_map(|(kt, ve)| {
+            (pattern_type_signature(kt, typedef_types, params).as_ref() == Some(&es)).then_some(ve)
+        })
+    });
     let mut parts: Vec<Value> = Vec::with_capacity(n);
+    let mut default_val: Option<Value> = None;
     for s in slots {
-        match (s, &default_v) {
-            (Some(v), _) => parts.push(v.resize(elem_w)),
-            (None, Some(d)) => parts.push(d.clone().resize(elem_w)),
-            // An unfilled slot with no default — incomplete pattern; bail
-            // rather than guess.
-            (None, None) => return None,
+        match s {
+            Some(v) => parts.push(v.resize(elem_w)),
+            None => {
+                if default_val.is_none() {
+                    default_val = if let Some(te) = matched_type {
+                        Some(eval_elem(te, true, &[])?)
+                    } else if let Some(d) = default_expr {
+                        Some(eval_elem(d, false, &combined)?)
+                    } else if !combined.is_empty()
+                        && pattern_slot_is_aggregate(&elem_dt, typedef_types) == Some(true)
+                    {
+                        let empty = Expression::new(
+                            ExprKind::AssignmentPattern(Vec::new()),
+                            expr.span,
+                        );
+                        Some(eval_elem(&empty, false, &combined)?)
+                    } else {
+                        return None;
+                    };
+                }
+                parts.push(default_val.clone()?.resize(elem_w));
+            }
         }
     }
     Some(Value::concat(&parts))
@@ -29007,16 +29651,21 @@ fn eval_param_init(
     } else {
         eval_const_expr_val(init, params).resize_for_assign(width)
     };
-    // §6.20.2, §6.11.2: the declared type, not the initializer, gives a typed
-    // parameter its signedness, and a 2-state type holds x/z as 0. A type
-    // name this scope cannot resolve keeps the value's own representation.
-    if typed
-        && !v.is_real
+    let resolved_type = typed
         && !matches!(
             resolve_typedef_chain(dt, typedef_types),
             DataType::TypeReference { .. }
-        )
-    {
+        );
+    // §6.12.1: a real value of an integral parameter rounds to an integer;
+    // `resize_for_assign` keeps a real for a 64-bit width (`parameter time
+    // P = 9200s;` in a package held the double).
+    if resolved_type && v.is_real {
+        v = real_to_integral(v.to_f64(), width);
+    }
+    // §6.20.2, §6.11.2: the declared type, not the initializer, gives a typed
+    // parameter its signedness, and a 2-state type holds x/z as 0. A type
+    // name this scope cannot resolve keeps the value's own representation.
+    if resolved_type && !v.is_real {
         v.is_signed = is_type_signed_resolved(dt, typedef_types);
         if is_type_two_state_resolved(dt, typedef_types) {
             v = v.to_two_state();
@@ -29904,18 +30553,29 @@ fn emit_struct_member_assigns(
     // evaluation path and yields 0 -- silently, which is why every form of
     // §10.9.2 is bound to its members explicitly (`bind_struct_pattern`):
     // by position, by member name, by type key and by `default:`.
-    let pat_items: Option<Vec<Expression>> = match &peel_unpacked_typed_pattern(rhs).kind {
-        ExprKind::AssignmentPattern(items) => {
-            bind_struct_pattern(items, &flat, typedef_types, params, rhs.span)
-        }
-        _ => None,
-    };
+    let pat_items: Option<Vec<(Expression, Vec<(DataType, Expression)>)>> =
+        match &peel_unpacked_typed_pattern(rhs).kind {
+            ExprKind::AssignmentPattern(items) => bind_struct_pattern(
+                items,
+                &flat,
+                typedef_types,
+                params,
+                ca.origin.as_ref().map_or("", |(_, scope)| scope),
+                rhs.span,
+            ),
+            _ => None,
+        };
     let pat_items = match &peel_unpacked_typed_pattern(rhs).kind {
         ExprKind::AssignmentPattern(items)
             if !struct_pattern_has_array_member(su, typedef_types, typedef_unpacked_dims) =>
         {
             struct_pattern_replication(items, flat.len())
-                .map(|items| items.into_iter().cloned().collect())
+                .map(|items| {
+                    items
+                        .into_iter()
+                        .map(|e| (e.clone(), Vec::new()))
+                        .collect()
+                })
                 .or(pat_items)
         }
         _ => pat_items,
@@ -29926,14 +30586,15 @@ fn emit_struct_member_assigns(
             span: Span::dummy(),
         };
         let mlhs = member_ref_expr(lhs_base, &mident);
-        let mrhs = match &pat_items {
-            Some(items) => items[i].clone(),
-            None => member_ref_expr(rhs, &mident),
+        let (mrhs, m_outer_types) = match &pat_items {
+            Some(items) => (items[i].0.clone(), items[i].1.clone()),
+            None => (member_ref_expr(rhs, &mident), Vec::new()),
         };
         emit_member_elem_assigns(
             mlhs,
             mrhs,
             pat_items.is_some(),
+            &m_outer_types,
             mdt,
             mdims,
             ca,
@@ -29959,6 +30620,7 @@ fn emit_member_elem_assigns(
     lhs: Expression,
     rhs: Expression,
     rhs_is_item: bool,
+    outer_types: &[(DataType, Expression)],
     mdt: &DataType,
     mdims: &[UnpackedDimension],
     ca: &ContinuousAssignment,
@@ -30016,10 +30678,10 @@ fn emit_member_elem_assigns(
             elem_dt: mdt,
             typedef_types,
             params,
-            scope: ca.origin.as_ref().map_or("", |(_, scope)| scope.as_str()),
+            scope: ca.origin.as_ref().map_or("", |(_, scope)| scope),
         };
         if elem
-            .bind(&rhs, &lists, &mut Vec::new(), &mut leaves)
+            .bind(&rhs, &lists, &mut Vec::new(), &mut leaves, outer_types)
             .is_none()
         {
             // Not bindable here: keep the whole-member form.
@@ -30036,6 +30698,170 @@ fn emit_member_elem_assigns(
         let rhs_e = tup.iter().fold(rhs.clone(), |e, &i| index_expr_of(e, i));
         let lhs_e = tup.iter().fold(lhs.clone(), |e, &i| index_expr_of(e, i));
         push_leaf(out, lhs_e, rhs_e);
+    }
+}
+
+/// Whether `expr` is a scoped type reference (`pkg::word_t`, `$unit::word_t`)
+/// in `typedef_types` rather than a value parameter in `params`.
+fn scoped_type_key_of_expr(
+    expr: &Expression,
+    typedef_types: &HashMap<String, DataType>,
+    params: &dyn ParamLookup,
+) -> Option<DataType> {
+    let tn = match &expr.kind {
+        ExprKind::Ident(h) if h.root.is_none() && h.path.iter().all(|s| s.selects.is_empty()) => {
+            if h.path.len() >= 2 {
+                let mut scopes = Vec::with_capacity(h.path.len() - 1);
+                for seg in &h.path[..h.path.len() - 1] {
+                    scopes.push(crate::ast::types::TypeScope {
+                        name: seg.name.clone(),
+                        type_args: Vec::new(),
+                    });
+                }
+                let leaf = h.path.last()?.name.clone();
+                TypeName {
+                    scopes,
+                    name: leaf,
+                    span: expr.span,
+                    bound: Default::default(),
+                }
+            } else if h.path.len() == 1
+                && crate::sv_parser::strip_unit_scope_name(&h.path[0].name.name).is_some()
+            {
+                let bare = crate::sv_parser::strip_unit_scope_name(&h.path[0].name.name)?;
+                let key = if typedef_types.contains_key(&h.path[0].name.name) {
+                    h.path[0].name.name.as_str()
+                } else if typedef_types.contains_key(bare) {
+                    bare
+                } else {
+                    return None;
+                };
+                if params.contains_key(key) {
+                    return None;
+                }
+                return Some(DataType::TypeReference {
+                    name: TypeName {
+                        scopes: Vec::new(),
+                        name: Identifier {
+                            name: key.to_string(),
+                            span: expr.span,
+                        },
+                        span: expr.span,
+                        bound: Default::default(),
+                    },
+                    dimensions: Vec::new(),
+                    type_args: Vec::new(),
+                    span: expr.span,
+                });
+            } else {
+                return None;
+            }
+        }
+        ExprKind::MemberAccess { .. } => {
+            let (scopes, leaf) = member_access_chain_as_scopes(expr)?;
+            if scopes.is_empty() {
+                return None;
+            }
+            TypeName {
+                scopes,
+                name: leaf,
+                span: expr.span,
+                bound: Default::default(),
+            }
+        }
+        _ => return None,
+    };
+    let qualified = tn.qualified();
+    if params.contains_key(&qualified) || !typedef_types.contains_key(&qualified) {
+        return None;
+    }
+    Some(DataType::TypeReference {
+        name: tn,
+        dimensions: Vec::new(),
+        type_args: Vec::new(),
+        span: expr.span,
+    })
+}
+
+/// Whether `name` names a value parameter in `scope` (walking enclosing scopes)
+/// or at module/package scope.
+fn is_param_in_scope(name: &str, scope: &str, params: &dyn ParamLookup) -> bool {
+    if !scope.is_empty() {
+        let mut cur = scope;
+        loop {
+            if params.contains_key(&format!("{cur}.{name}")) {
+                return true;
+            }
+            let Some((outer, _)) = cur.rsplit_once('.') else {
+                break;
+            };
+            cur = outer;
+        }
+    }
+    params.contains_key(name)
+}
+
+/// The `typedef_types` key for an unscoped type identifier `name` in `scope`,
+/// walking enclosing scopes before checking the bare table.
+fn lookup_typedef_key_in_scope(
+    name: &str,
+    scope: &str,
+    typedef_types: &HashMap<String, DataType>,
+) -> Option<String> {
+    if !scope.is_empty() {
+        let mut cur = scope;
+        loop {
+            let key = format!("{cur}.{name}");
+            if typedef_types.contains_key(&key) {
+                return Some(key);
+            }
+            let Some((outer, _)) = cur.rsplit_once('.') else {
+                break;
+            };
+            cur = outer;
+        }
+    }
+    typedef_types.contains_key(name).then(|| name.to_string())
+}
+
+/// Extract `(type_key, value_expr)` when `item` is a pattern type key
+/// (built-in type, unscoped typedef/type parameter, or scoped package/class
+/// typedef), unless `is_excluded(name)` treats a bare name as a member/index.
+fn pattern_item_type_key<'a>(
+    item: &'a AssignmentPatternItem,
+    typedef_types: &HashMap<String, DataType>,
+    params: &dyn ParamLookup,
+    scope: &str,
+    is_excluded: &dyn Fn(&str) -> bool,
+) -> Option<(DataType, &'a Expression)> {
+    match item {
+        AssignmentPatternItem::Typed(t, v) => Some((t.clone(), v)),
+        AssignmentPatternItem::Named(k, v) if !is_excluded(&k.name) => {
+            if is_param_in_scope(&k.name, scope, params) {
+                return None;
+            }
+            let key = lookup_typedef_key_in_scope(&k.name, scope, typedef_types)?;
+            let span = k.span;
+            Some((
+                DataType::TypeReference {
+                    name: TypeName {
+                        scopes: Vec::new(),
+                        name: Identifier { name: key, span },
+                        span,
+                        bound: Default::default(),
+                    },
+                    dimensions: Vec::new(),
+                    type_args: Vec::new(),
+                    span,
+                },
+                v,
+            ))
+        }
+        AssignmentPatternItem::Keyed(k, v) => {
+            let dt = scoped_type_key_of_expr(k, typedef_types, params)?;
+            Some((dt, v))
+        }
+        _ => None,
     }
 }
 
@@ -30056,35 +30882,33 @@ impl PatternKeys {
         &mut self,
         item: &AssignmentPatternItem,
         typedef_types: &HashMap<String, DataType>,
+        params: &dyn ParamLookup,
+        scope: &str,
     ) -> bool {
+        if let Some((dt, v)) =
+            pattern_item_type_key(item, typedef_types, params, scope, &|_| false)
+        {
+            self.types.push((dt, v.clone()));
+            return true;
+        }
         match item {
-            AssignmentPatternItem::Typed(t, v) => self.types.push((t.clone(), v.clone())),
-            // §10.9.2: a `name:` key that names a type is a type key.
-            AssignmentPatternItem::Named(k, v) if typedef_types.contains_key(&k.name) => {
-                let span = k.span;
-                self.types.push((
-                    DataType::TypeReference {
-                        name: TypeName {
-                            scopes: Vec::new(),
-                            name: k.clone(),
-                            span,
-                            bound: Default::default(),
-                        },
-                        dimensions: Vec::new(),
-                        type_args: Vec::new(),
-                        span,
-                    },
-                    v.clone(),
-                ));
-            }
             AssignmentPatternItem::Default(v) => {
                 if self.default.replace(v.clone()).is_some() {
                     return false;
                 }
+                true
             }
-            _ => return false,
+            _ => false,
         }
-        true
+    }
+
+    /// Merge `outer_types` after `self.types` (last match wins, so `outer_types`
+    /// takes precedence over items inside an outer `default:`).
+    fn combined_types(&self, outer_types: &[(DataType, Expression)]) -> Vec<(DataType, Expression)> {
+        let mut out = Vec::with_capacity(self.types.len() + outer_types.len());
+        out.extend(self.types.iter().cloned());
+        out.extend(outer_types.iter().cloned());
+        out
     }
 
     /// The value these keys give one member or element of type `dt`, which
@@ -30099,26 +30923,29 @@ impl PatternKeys {
         &self,
         dt: &DataType,
         is_array: bool,
+        outer_types: &[(DataType, Expression)],
         typedef_types: &HashMap<String, DataType>,
-        params: &HashMap<String, Value>,
+        params: &dyn ParamLookup,
         span: Span,
-    ) -> Option<Expression> {
+    ) -> Option<(Expression, Vec<(DataType, Expression)>)> {
+        let combined = self.combined_types(outer_types);
         let aggregate = is_array || pattern_slot_is_aggregate(dt, typedef_types)?;
         if !is_array {
+            let dt_sig = pattern_type_signature(dt, typedef_types, params);
             let mut typed = None;
-            for (key, v) in &self.types {
-                if pattern_type_signature(key, typedef_types, params)?
-                    == pattern_type_signature(dt, typedef_types, params)?
-                {
-                    typed = Some(v);
+            if let Some(dt_sig) = dt_sig {
+                for (key, v) in &combined {
+                    if pattern_type_signature(key, typedef_types, params).as_ref() == Some(&dt_sig) {
+                        typed = Some(v);
+                    }
                 }
             }
             if let Some(v) = typed {
-                return Some(v.clone());
+                return Some((v.clone(), Vec::new()));
             }
         }
         if !aggregate {
-            return self.default.clone();
+            return self.default.clone().map(|d| (d, Vec::new()));
         }
         if let Some(d) = &self.default
             && matches!(
@@ -30126,20 +30953,43 @@ impl PatternKeys {
                 ExprKind::AssignmentPattern(_)
             )
         {
-            return Some(d.clone());
+            if !is_array && matches!(resolve_typedef_chain(dt, typedef_types), DataType::Struct(_)) {
+                return Some((d.clone(), combined));
+            }
+            if combined.is_empty() {
+                return Some((d.clone(), Vec::new()));
+            }
+            if !is_array {
+                // Packed aggregate: append combined type keys after the default pattern's
+                // items so outer/local type keys still take precedence over `default:`.
+                let mut merged = match &peel_unpacked_typed_pattern(d).kind {
+                    ExprKind::AssignmentPattern(items) => items.clone(),
+                    _ => Vec::new(),
+                };
+                for (t, v) in &combined {
+                    merged.push(AssignmentPatternItem::Typed(t.clone(), v.clone()));
+                }
+                return Some((
+                    Expression::new(ExprKind::AssignmentPattern(merged), d.span),
+                    Vec::new(),
+                ));
+            }
+            return Some((d.clone(), combined));
         }
-        if self.types.is_empty() && self.default.is_none() {
+        if combined.is_empty() && self.default.is_none() {
             return None;
         }
-        let mut items: Vec<AssignmentPatternItem> = self
-            .types
+        let mut items: Vec<AssignmentPatternItem> = combined
             .iter()
             .map(|(t, v)| AssignmentPatternItem::Typed(t.clone(), v.clone()))
             .collect();
         if let Some(d) = &self.default {
             items.push(AssignmentPatternItem::Default(d.clone()));
         }
-        Some(Expression::new(ExprKind::AssignmentPattern(items), span))
+        Some((
+            Expression::new(ExprKind::AssignmentPattern(items), span),
+            Vec::new(),
+        ))
     }
 }
 
@@ -30184,13 +31034,13 @@ fn pattern_slot_is_aggregate(
 fn pattern_type_signature(
     dt: &DataType,
     typedef_types: &HashMap<String, DataType>,
-    params: &HashMap<String, Value>,
+    params: &dyn ParamLookup,
 ) -> Option<String> {
     let bounds = |d: &PackedDimension| -> Option<(i64, i64)> {
         match d {
             PackedDimension::Range { left, right, .. } => Some((
-                const_eval_i64_with_params(left, Some(params))?,
-                const_eval_i64_with_params(right, Some(params))?,
+                const_eval_i64_with_params_env(left, Some(&params))?,
+                const_eval_i64_with_params_env(right, Some(&params))?,
             )),
             PackedDimension::Unsized(_) => None,
         }
@@ -30311,10 +31161,12 @@ fn bind_struct_pattern(
     flat: &[(String, DataType, Vec<UnpackedDimension>)],
     typedef_types: &HashMap<String, DataType>,
     params: &HashMap<String, Value>,
+    scope: &str,
     span: Span,
-) -> Option<Vec<Expression>> {
+) -> Option<Vec<(Expression, Vec<(DataType, Expression)>)>> {
     if let Some(ordered) = ordered_pattern_items(items, params) {
-        return (ordered.len() == flat.len()).then_some(ordered);
+        return (ordered.len() == flat.len())
+            .then(|| ordered.into_iter().map(|e| (e, Vec::new())).collect());
     }
     let mut by_name: HashMap<&str, &Expression> = HashMap::default();
     let mut keys = PatternKeys::default();
@@ -30325,14 +31177,14 @@ fn bind_struct_pattern(
                     return None;
                 }
             }
-            _ if keys.add(item, typedef_types) => {}
+            _ if keys.add(item, typedef_types, params, scope) => {}
             _ => return None,
         }
     }
     flat.iter()
         .map(|(m, mdt, mdims)| match by_name.get(m.as_str()) {
-            Some(v) => Some((*v).clone()),
-            None => keys.value_for(mdt, !mdims.is_empty(), typedef_types, params, span),
+            Some(v) => Some(((*v).clone(), Vec::new())),
+            None => keys.value_for(mdt, !mdims.is_empty(), &[], typedef_types, params, span),
         })
         .collect()
 }
@@ -30391,20 +31243,34 @@ impl ArraySlot<'_> {
         lists: &[Vec<i64>],
         idx: &mut Vec<i64>,
         out: &mut Vec<(Vec<i64>, Expression)>,
+        outer_types: &[(DataType, Expression)],
     ) -> Option<()> {
         let Some((list, rest)) = lists.split_first() else {
-            out.push((idx.clone(), e.clone()));
+            let mut matched = None;
+            for (key_dt, val) in outer_types.iter().rev() {
+                if pattern_type_signature(key_dt, self.typedef_types, self.params)?
+                    == pattern_type_signature(self.elem_dt, self.typedef_types, self.params)?
+                {
+                    matched = Some(val);
+                    break;
+                }
+            }
+            out.push((idx.clone(), matched.unwrap_or(e).clone()));
             return Some(());
         };
-        let elems: Vec<Expression> = match &peel_unpacked_typed_pattern(e).kind {
-            ExprKind::AssignmentPattern(items) => {
-                self.level(items, list, !rest.is_empty(), e.span)?
-            }
-            _ => list.iter().map(|&i| index_expr_of(e.clone(), i)).collect(),
-        };
-        for (&i, x) in list.iter().zip(&elems) {
+        let elems: Vec<(Expression, Vec<(DataType, Expression)>)> =
+            match &peel_unpacked_typed_pattern(e).kind {
+                ExprKind::AssignmentPattern(items) => {
+                    self.level(items, list, !rest.is_empty(), outer_types, e.span)?
+                }
+                _ => list
+                    .iter()
+                    .map(|&i| (index_expr_of(e.clone(), i), outer_types.to_vec()))
+                    .collect(),
+            };
+        for (&i, (x, elem_outer)) in list.iter().zip(&elems) {
             idx.push(i);
-            self.bind(x, rest, idx, out)?;
+            self.bind(x, rest, idx, out, elem_outer)?;
             idx.pop();
         }
         Some(())
@@ -30416,14 +31282,28 @@ impl ArraySlot<'_> {
         items: &[AssignmentPatternItem],
         list: &[i64],
         subarray: bool,
+        outer_types: &[(DataType, Expression)],
         span: Span,
-    ) -> Option<Vec<Expression>> {
+    ) -> Option<Vec<(Expression, Vec<(DataType, Expression)>)>> {
         if let Some(ordered) = ordered_pattern_items(items, self.params) {
-            return (ordered.len() == list.len()).then_some(ordered);
+            return (ordered.len() == list.len()).then(|| {
+                ordered
+                    .into_iter()
+                    .map(|e| (e, outer_types.to_vec()))
+                    .collect()
+            });
         }
         let mut keyed: Vec<Option<&Expression>> = vec![None; list.len()];
         let mut keys = PatternKeys::default();
         for item in items {
+            if let Some((dt, v)) =
+                pattern_item_type_key(item, self.typedef_types, self.params, self.scope, &|n| {
+                    self.param(n).is_some()
+                })
+            {
+                keys.types.push((dt, v.clone()));
+                continue;
+            }
             let (index, v) = match item {
                 AssignmentPatternItem::Keyed(k, v) => (
                     const_eval_pattern_index(
@@ -30437,7 +31317,7 @@ impl ArraySlot<'_> {
                 AssignmentPatternItem::Named(k, v) if self.param(&k.name).is_some() => {
                     (self.param(&k.name)?.to_i64()?, v)
                 }
-                _ if keys.add(item, self.typedef_types) => continue,
+                _ if keys.add(item, self.typedef_types, self.params, self.scope) => continue,
                 _ => return None,
             };
             let pos = list.iter().position(|&i| i == index)?;
@@ -30448,10 +31328,11 @@ impl ArraySlot<'_> {
         keyed
             .into_iter()
             .map(|v| match v {
-                Some(v) => Some(v.clone()),
+                Some(v) => Some((v.clone(), outer_types.to_vec())),
                 None => keys.value_for(
                     self.elem_dt,
                     subarray,
+                    outer_types,
                     self.typedef_types,
                     self.params,
                     span,
@@ -31044,6 +31925,17 @@ fn pack_struct_const_value(
     typedefs: &HashMap<String, u32>,
     typedef_types: &HashMap<String, DataType>,
 ) -> Option<Value> {
+    pack_struct_const_value_with_outer(dt, expr, params, typedefs, typedef_types, &[])
+}
+
+fn pack_struct_const_value_with_outer(
+    dt: &DataType,
+    expr: &Expression,
+    params: &dyn ParamLookup,
+    typedefs: &HashMap<String, u32>,
+    typedef_types: &HashMap<String, DataType>,
+    outer_types: &[(DataType, Expression)],
+) -> Option<Value> {
     // See scoped_type_owner — same bare-name rule as flatten_struct_fields.
     let owner_own;
     let stacked;
@@ -31077,23 +31969,41 @@ fn pack_struct_const_value(
             members.push((mdecl.name.name.clone(), mw, member.data_type.clone()));
         }
     }
-    // Index the pattern: named-by-field, ordered-by-position, and default.
+    let is_member = |name: &str| members.iter().any(|(mn, _, _)| mn == name);
+    // Index the pattern: named-by-field, type keys, ordered-by-position, and default.
     let mut named: HashMap<String, &Expression> = HashMap::default();
+    let mut local_types: Vec<(DataType, Expression)> = Vec::new();
     let mut ordered: Vec<&Expression> = Vec::new();
     let mut default_expr: Option<&Expression> = None;
     for it in items {
+        if let AssignmentPatternItem::Named(id, v) = it
+            && is_member(&id.name)
+        {
+            named.insert(id.name.clone(), v);
+            continue;
+        }
+        if let AssignmentPatternItem::Keyed(k, v) = it
+            && let ExprKind::Ident(h) = &k.kind
+            && h.root.is_none()
+            && h.path.len() == 1
+            && h.path[0].selects.is_empty()
+            && is_member(&h.path[0].name.name)
+        {
+            named.insert(h.path[0].name.name.clone(), v);
+            continue;
+        }
+        if let Some((kt, v)) = pattern_item_type_key(it, typedef_types, params, "", &is_member) {
+            local_types.push((kt, v.clone()));
+            continue;
+        }
         match it {
-            AssignmentPatternItem::Named(id, v) => {
-                named.insert(id.name.clone(), v);
-            }
             AssignmentPatternItem::Ordered(v) => ordered.push(v),
             AssignmentPatternItem::Default(v) => default_expr = Some(v),
-            // `'{<ident>: v}` may parse as Keyed when the key is an identifier
             AssignmentPatternItem::Keyed(k, v) => {
-                if let ExprKind::Ident(h) = &k.kind {
-                    if let Some(last) = h.path.last() {
-                        named.insert(last.name.name.clone(), v);
-                    }
+                if let ExprKind::Ident(h) = &k.kind
+                    && let Some(last) = h.path.last()
+                {
+                    named.insert(last.name.name.clone(), v);
                 }
             }
             _ => {}
@@ -31111,24 +32021,63 @@ fn pack_struct_const_value(
     {
         ordered = expanded;
     }
-    let use_ordered = named.is_empty() && !ordered.is_empty();
+    let mut combined_types = local_types;
+    combined_types.extend(outer_types.iter().cloned());
+    let use_ordered = named.is_empty() && combined_types.is_empty() && !ordered.is_empty();
     // Build MSB-first parts (declaration order) and concat.
     let mut parts: Vec<Value> = Vec::new();
     for (idx, (mn, mw, mdt)) in members.iter().enumerate() {
-        let explicit = if use_ordered {
+        let matched_outer = outer_types.iter().rev().find_map(|(kt, ve)| {
+            let msig = pattern_type_signature(mdt, typedef_types, params)?;
+            (pattern_type_signature(kt, typedef_types, params)? == msig).then_some(ve)
+        });
+        let explicit = if let Some(ov) = matched_outer {
+            Some(ov)
+        } else if let Some(nv) = named.get(mn).copied() {
+            Some(nv)
+        } else if use_ordered {
             ordered.get(idx).copied()
         } else {
-            named.get(mn).copied()
+            combined_types.iter().rev().find_map(|(kt, ve)| {
+                let msig = pattern_type_signature(mdt, typedef_types, params)?;
+                (pattern_type_signature(kt, typedef_types, params)? == msig).then_some(ve)
+            })
         };
-        let ve = explicit.or(default_expr);
+        let empty_pat;
+        let ve = match explicit.or(default_expr) {
+            Some(e) => Some(e),
+            None if !combined_types.is_empty()
+                && pattern_slot_is_aggregate(mdt, typedef_types) == Some(true) =>
+            {
+                empty_pat = Expression::new(ExprKind::AssignmentPattern(Vec::new()), expr.span);
+                Some(&empty_pat)
+            }
+            None => None,
+        };
+        let sub_outer: &[(DataType, Expression)] = if explicit.is_some() {
+            outer_types
+        } else {
+            &combined_types
+        };
         let val = match ve {
             Some(e) => {
-                if let Some(sub) = pack_struct_const_value(mdt, e, params, typedefs, typedef_types)
-                {
+                if let Some(sub) = pack_struct_const_value_with_outer(
+                    mdt,
+                    e,
+                    params,
+                    typedefs,
+                    typedef_types,
+                    sub_outer,
+                ) {
                     sub.resize(*mw)
-                } else if let Some(sub) =
-                    pack_packed_vector_pattern_env(mdt, e, params, typedef_types)
-                {
+                } else if let Some(sub) = pack_packed_dt_pattern(
+                    mdt,
+                    e,
+                    params,
+                    Some(typedefs),
+                    typedef_types,
+                    sub_outer,
+                ) {
                     // A nested pattern on a packed-VECTOR member
                     // (`bit [2:0][3:0] y` given `'{4,5,6}`).
                     sub.resize(*mw)
@@ -31170,7 +32119,17 @@ fn eval_init_for_target(
     if real {
         Value::from_f64(eval_const_expr_val_env(expr, &params).to_f64())
     } else {
-        eval_init_for_width(expr, params, width)
+        // §6.12.1: a real initializer of an integral variable converts to
+        // it, rounded to the nearest integer. `resize_for_assign` leaves a
+        // real as it is for a 64-bit target (a `real` is 64 bits wide too),
+        // so `time t = 9200s;` and `longint l = 3e9;` kept the double and a
+        // shift read its IEEE 754 bits.
+        let v = eval_init_for_width(expr, params, width);
+        if v.is_real {
+            Value::from_real_wrapped(v.to_f64(), width)
+        } else {
+            v
+        }
     }
 }
 
@@ -34450,33 +35409,15 @@ fn is_implicit_block_name(name: &str) -> bool {
         .is_some_and(|n| !n.is_empty() && n.bytes().all(|c| c.is_ascii_digit()))
 }
 
-/// An identifier or call in an inlined sub-instance body that NOTHING in the
-/// design declares is an error — the reference tooling rejects it at
-/// elaboration. The per-module validator only ever saw the TOP module's
-/// blocks; sub-instance bodies are inlined afterwards and were never checked,
-/// so `chk_always(...)` in an RTL module bound to a stale header that lacked
-/// it simply never ran (assertions silently vanished), and a typo'd signal in
-/// a child read x for the whole run.
-///
-/// §23.9, §23.8.1: the binding of a head decides (`head_verdict`). A head the
-/// binder did not walk, or an upward path head, keeps the "declared nowhere"
-/// bar: a bare name is accepted if the instance's own module declares it
-/// (`local_names`, ports, interfaces), the body declares it, any elaborated
-/// table knows it under any scope, or any definition in the design declares it.
-fn validate_inlined_bodies(
-    elab: &ElaboratedModule,
-    definitions: &HashMap<String, Definition>,
-) -> Result<(), String> {
-    let mut known = collect_design_declared_names(definitions, true);
-    // §23.11: instances that compilation-unit binds add.
-    UNIT_BIND_INSTANCES.with(|s| known.extend(s.borrow().names.iter().cloned()));
-    let mut outside_classes = collect_design_declared_names(definitions, false);
+/// Add flattened declaration aliases without retaining a second owned set.
+fn extend_elaborated_decl_leaves(elab: &ElaboratedModule, names: &mut HashSet<String>) {
     // Leaf of every scoped elaboration key: `c.x`, `top.u.arr[3]` → `x`, `arr`.
-    let mut leaves: HashSet<String> = HashSet::default();
     let mut add_key = |k: &str| {
         let leaf = k.rsplit('.').next().unwrap_or(k);
         let base = leaf.split('[').next().unwrap_or(leaf);
-        leaves.insert(base.to_string());
+        if !names.contains(base) {
+            names.insert(base.to_string());
+        }
     };
     for k in elab.signals.keys() {
         add_key(k);
@@ -34539,9 +35480,29 @@ fn validate_inlined_bodies(
             add_key(n);
         }
     }
-    known.extend(leaves.iter().cloned());
-    outside_classes.extend(leaves);
-    let known = known;
+}
+
+/// An identifier or call in an inlined sub-instance body that NOTHING in the
+/// design declares is an error — the reference tooling rejects it at
+/// elaboration. The per-module validator only ever saw the TOP module's
+/// blocks; sub-instance bodies are inlined afterwards and were never checked,
+/// so `chk_always(...)` in an RTL module bound to a stale header that lacked
+/// it simply never ran (assertions silently vanished), and a typo'd signal in
+/// a child read x for the whole run.
+///
+/// §23.9, §23.8.1: the binding of a head decides (`head_verdict`). A head the
+/// binder did not walk, or an upward path head, keeps the "declared nowhere"
+/// bar: a bare name is accepted if the instance's own module declares it
+/// (`local_names`, ports, interfaces), the body declares it, any elaborated
+/// table knows it under any scope, or any definition in the design declares it.
+fn validate_inlined_bodies(
+    elab: &ElaboratedModule,
+    definitions: &HashMap<String, Definition>,
+) -> Result<(), String> {
+    let mut known = collect_design_declared_names(definitions, true);
+    // §23.11: instances that compilation-unit binds add.
+    UNIT_BIND_INSTANCES.with(|s| known.extend(s.borrow().names.iter().cloned()));
+    extend_elaborated_decl_leaves(elab, &mut known);
 
     // §23.6: a named block of any process is a scope the module's other
     // processes may name (`blk.v`).
@@ -34674,7 +35635,7 @@ fn validate_inlined_bodies(
             .unwrap_or_default();
         return Err(format!("Undeclared identifier '{}'{}", name, loc));
     }
-    validate_subroutine_bodies(elab, definitions, &known, &outside_classes)
+    validate_subroutine_bodies(elab, definitions, &known)
 }
 
 /// Names a statement's constructs bind themselves, for the undeclared-name
@@ -34788,7 +35749,6 @@ fn validate_subroutine_bodies(
     elab: &ElaboratedModule,
     definitions: &HashMap<String, Definition>,
     known: &HashSet<String>,
-    outside_classes: &HashSet<String>,
 ) -> Result<(), String> {
     use crate::ast::decl::{ClassItem, ClassMethodKind, PackageItem};
 
@@ -34959,6 +35919,9 @@ fn validate_subroutine_bodies(
         out
     };
     let mut scopes: HashMap<&str, HashSet<String>> = HashMap::default();
+    // Only class methods need the stricter namespace. Most generated designs
+    // have no class methods, so keep their large global-name table singular.
+    let mut outside_classes = None;
     for body in &bodies {
         // Qualified and bare aliases point to one elaborated class, whose
         // declared name indexes the AST's lexical scope maps. Resolve the
@@ -34979,7 +35942,12 @@ fn validate_subroutine_bodies(
             first_undeclared_in_subroutine(body, known, None, &upward)
         } else {
             let scope = scopes.entry(class).or_insert_with(|| class_scope(class));
-            first_undeclared_in_subroutine(body, outside_classes, Some(scope), &upward)
+            let outside = outside_classes.get_or_insert_with(|| {
+                let mut names = collect_design_declared_names(definitions, false);
+                extend_elaborated_decl_leaves(elab, &mut names);
+                names
+            });
+            first_undeclared_in_subroutine(body, outside, Some(scope), &upward)
         };
         if let Some((name, span)) = found {
             return Err(span_error_of(
@@ -35733,7 +36701,7 @@ fn inline_instantiations_inner(
                                             stmt: Statement::new(
                                                 StatementKind::BlockingAssign {
                                                     lvalue: make_ident_expr(&decl.name.name),
-                                                    rvalue: init_expr.clone(),
+                                                    rvalue: init_expr.as_ref().clone(),
                                                 },
                                                 Span::dummy(),
                                             ),
@@ -35798,7 +36766,7 @@ fn inline_instantiations_inner(
                                                 stmt: Statement::new(
                                                     StatementKind::BlockingAssign {
                                                         lvalue: make_ident_expr(&name),
-                                                        rvalue: init_expr.clone(),
+                                                        rvalue: init_expr.as_ref().clone(),
                                                     },
                                                     Span::dummy(),
                                                 ),
@@ -35938,7 +36906,7 @@ fn inline_instantiations_inner(
                                                 stmt: Statement::new(
                                                     StatementKind::BlockingAssign {
                                                         lvalue: make_ident_expr(&decl.name.name),
-                                                        rvalue: init_expr.clone(),
+                                                        rvalue: init_expr.as_ref().clone(),
                                                     },
                                                     Span::dummy(),
                                                 ),
@@ -36101,7 +37069,7 @@ fn inline_instantiations_inner(
                                         stmt: Statement::new(
                                             StatementKind::BlockingAssign {
                                                 lvalue: make_ident_expr(&decl.name.name),
-                                                rvalue: init_expr.clone(),
+                                                rvalue: init_expr.as_ref().clone(),
                                             },
                                             Span::dummy(),
                                         ),
@@ -36145,7 +37113,7 @@ fn inline_instantiations_inner(
                                     }
                                     elab.static_init_blocks.push(InitialBlock {
                                         stmt: Statement::new(
-                                            StatementKind::SeqBlock { name: None, stmts },
+                                            StatementKind::SeqBlock { name: None, stmts: stmts.into() },
                                             Span::dummy(),
                                         ),
                                         scope: String::new(),
@@ -36156,7 +37124,7 @@ fn inline_instantiations_inner(
                                         stmt: Statement::new(
                                             StatementKind::BlockingAssign {
                                                 lvalue: make_ident_expr(&decl.name.name),
-                                                rvalue: init_expr.clone(),
+                                                rvalue: init_expr.as_ref().clone(),
                                             },
                                             Span::dummy(),
                                         ),
@@ -36223,6 +37191,7 @@ fn inline_instantiations_inner(
         &root_defparams,
         &param_scope,
     )?;
+    crate::oom_trace::model("inline.top.ready", elab, Some(cache.prepared.len()));
     if elab_trace_enabled() {
         eprintln!("[xezim][elab] finished inline top={}", module_name);
     }
@@ -36279,6 +37248,7 @@ fn inline_instantiations_inner(
         .keys()
         .cloned()
         .collect::<std::collections::HashSet<_>>();
+    crate::oom_trace::model("inline.local_names.ready", elab, Some(cache.prepared.len()));
     let port_map = HashMap::default();
     let mut interface_map = HashMap::default();
     for name in top_interface_names {
@@ -36286,18 +37256,38 @@ fn inline_instantiations_inner(
     }
     let prefix = "";
 
-    for block in &mut elab.always_blocks {
-        block.stmt = rewrite_stmt(&block.stmt, prefix, &port_map, &local_names, &interface_map);
+    // §9.3/§23.6: an identity rewrite may retain shared root syntax.
+    // Instances, interfaces, specialization and populated contextual
+    // caches still take the complete rewrite and invalidation path.
+    let root_identity = prefix.is_empty() && port_map.is_empty() && interface_map.is_empty();
+    let rewrite_root = |stmt: &Statement| {
+        if root_identity && identity_rewrite::can_preserve_root_stmt(stmt) {
+            stmt.clone()
+        } else {
+            if root_identity && crate::oom_trace::enabled() {
+                identity_rewrite::trace_root_rejection(stmt);
+            }
+            rewrite_stmt(stmt, prefix, &port_map, &local_names, &interface_map)
+        }
+    };
+    for (index, block) in elab.always_blocks.iter_mut().enumerate() {
+        crate::oom_trace::checkpoint("inline.root_always", &[("block_index", index)]);
+        block.stmt = rewrite_root(&block.stmt);
     }
-    for block in &mut elab.initial_blocks {
-        block.stmt = rewrite_stmt(&block.stmt, prefix, &port_map, &local_names, &interface_map);
+    crate::oom_trace::checkpoint("inline.root_always.ready", &[]);
+    for (index, block) in elab.initial_blocks.iter_mut().enumerate() {
+        crate::oom_trace::checkpoint("inline.root_initial", &[("block_index", index)]);
+        block.stmt = rewrite_root(&block.stmt);
     }
     for assign in &mut elab.continuous_assigns {
         assign.lhs = rewrite_expr(&assign.lhs, prefix, &port_map, &local_names, &interface_map);
         assign.rhs = rewrite_expr(&assign.rhs, prefix, &port_map, &local_names, &interface_map);
     }
+    drop(local_names);
+    crate::oom_trace::model("inline.root_rewrites.ready", elab, Some(cache.prepared.len()));
 
     validate_inlined_bodies(elab, definitions)?;
+    crate::oom_trace::model("inline.validation.ready", elab, Some(cache.prepared.len()));
 
     // §8.2: reject illegal `local`/`protected` member access at compile time
     // (the reference simulators report `Illegal access to local/protected
@@ -36687,7 +37677,7 @@ fn rename_item_decls(item: &ModuleItem) -> ModuleItem {
             for d in &mut new_dd.declarators {
                 gen_rename(d.decl, &mut d.name.name);
                 d.dimensions = gen_dims(&d.dimensions);
-                d.init = d.init.as_ref().map(gen_expr);
+                d.init = d.init.as_deref().map(|e| Box::new(gen_expr(e)));
             }
             ModuleItem::DataDeclaration(new_dd)
         }
@@ -36702,12 +37692,12 @@ fn rename_item_decls(item: &ModuleItem) -> ModuleItem {
             .into_iter()
             .flatten()
             {
-                *d = gen_expr(d);
+                **d = gen_expr(d);
             }
             for d in &mut new_nd.declarators {
                 gen_rename(d.decl, &mut d.name.name);
                 d.dimensions = gen_dims(&d.dimensions);
-                d.init = d.init.as_ref().map(gen_expr);
+                d.init = d.init.as_deref().map(|e| Box::new(gen_expr(e)));
             }
             ModuleItem::NetDeclaration(new_nd)
         }
@@ -36969,7 +37959,7 @@ fn rename_item_refs(item: &ModuleItem) -> ModuleItem {
                 .into_iter()
                 .flatten()
             {
-                *d = gen_expr(d);
+                **d = gen_expr(d);
             }
             for s in &mut c.signals {
                 for e in [&mut s.skew, &mut s.bound_to].into_iter().flatten() {
@@ -37051,7 +38041,7 @@ fn rename_class_refs(c: &mut ClassDeclaration) {
                 p.data_type = gen_type(&p.data_type);
                 for d in &mut p.declarators {
                     d.dimensions = gen_dims(&d.dimensions);
-                    d.init = d.init.as_ref().map(gen_expr);
+                    d.init = d.init.as_deref().map(|e| Box::new(gen_expr(e)));
                 }
             }
             ClassItem::Method(m) => match &mut m.kind {
@@ -37068,6 +38058,7 @@ fn rename_class_refs(c: &mut ClassDeclaration) {
                 }
             },
             ClassItem::Constraint(k) => {
+                let k = std::sync::Arc::make_mut(k);
                 k.items = with_gen_part(constraint_takes, || {
                     k.items.iter().map(gen_constraint).collect()
                 });
@@ -38944,13 +39935,14 @@ fn collect_body_driven_names(
 #[derive(Default)]
 struct InlineCache {
     /// Prepared bodies (`prepare_module_items`).
-    prepared: HashMap<param_scope::PreparedKey, Rc<PreparedModuleItems>>,
+    prepared: prepared_bodies::PreparedBodies,
     /// Whether preparation leaves value-parameter references symbolic.
     value_independent: HashMap<(String, usize), bool>,
     /// §23.10 / §27 (#721): the distinct prepared bodies of each definition,
     /// by content. Parameter values that change no generate choice, range or
     /// declaration (an index passed down a generate loop) yield equal bodies;
     /// those instances share one instead of each retaining its own copy.
+    /// It owns no body: one that `prepared` released is gone from here too.
     equal_prepared: HashMap<(String, usize), EqualPrepared>,
     process_bodies: crate::ast_intern::AstInterner<Rc<Statement>>,
     callable_bodies: crate::ast_intern::AstInterner<crate::ast::shared_vec::SharedVec<Statement>>,
@@ -39496,7 +40488,7 @@ fn prepare_module_items(
                     nd.declarators
                         .iter()
                         .filter_map(|d| {
-                            d.init.as_ref().map(|init| {
+                            d.init.as_deref().map(|init| {
                                 (
                                     std::rc::Rc::new(make_ident_expr(&d.name.name)),
                                     std::rc::Rc::new(init.clone()),
@@ -39554,13 +40546,17 @@ fn prepare_module_items(
     prepared
 }
 
-/// The distinct prepared bodies of one definition. The first body is kept
-/// unencoded: most definitions are prepared under one parameter environment
-/// only, and comparison is needed only once a second one appears.
+/// The distinct prepared bodies of one definition that are still held. The
+/// first body is kept unencoded: most definitions are prepared under one
+/// parameter environment only, and comparison is needed only once a second
+/// one appears.
 #[derive(Default)]
 struct EqualPrepared {
-    first: Option<Rc<PreparedModuleItems>>,
-    by_content: HashMap<(u64, usize), Vec<Rc<PreparedModuleItems>>>,
+    first: Option<std::rc::Weak<PreparedModuleItems>>,
+    by_content: HashMap<(u64, usize), Vec<std::rc::Weak<PreparedModuleItems>>>,
+    /// The size of `by_content` at which the released bodies are next
+    /// dropped from it.
+    sweep_at: usize,
 }
 
 /// The canonical copy of a freshly prepared body: an equal body of the same
@@ -39583,34 +40579,45 @@ fn share_equal_prepared(
         bincode::serde::encode_to_vec(PreparedView(p), crate::xez_bincode_config()).ok()
     };
     if entry.first.is_none() && entry.by_content.is_empty() {
-        entry.first = Some(Rc::clone(&fresh));
+        entry.first = Some(Rc::downgrade(&fresh));
         return fresh;
     }
-    if let Some(first) = entry.first.take() {
+    if let Some(first) = entry.first.take().and_then(|first| first.upgrade()) {
         let Some(bytes) = encode(&first) else {
-            entry.first = Some(first);
+            entry.first = Some(Rc::downgrade(&first));
             return fresh;
         };
-        entry.by_content.entry(key(&bytes)).or_default().push(first);
+        entry
+            .by_content
+            .entry(key(&bytes))
+            .or_default()
+            .push(Rc::downgrade(&first));
     }
     let Some(bytes) = encode(&fresh) else {
         return fresh;
     };
+    if entry.by_content.len() >= entry.sweep_at {
+        entry.by_content.retain(|_, bucket| {
+            bucket.retain(|body| body.strong_count() > 0);
+            !bucket.is_empty()
+        });
+        entry.sweep_at = (entry.by_content.len() * 2).max(16);
+    }
     let bucket = entry.by_content.entry(key(&bytes)).or_default();
-    for candidate in bucket.iter() {
+    for candidate in bucket.iter().filter_map(|body| body.upgrade()) {
         let mut compare = crate::ast_intern::CompareWriter::new(&bytes);
         if bincode::serde::encode_into_std_write(
-            PreparedView(candidate),
+            PreparedView(&candidate),
             &mut compare,
             crate::xez_bincode_config(),
         )
         .is_ok()
             && compare.matched()
         {
-            return Rc::clone(candidate);
+            return candidate;
         }
     }
-    bucket.push(Rc::clone(&fresh));
+    bucket.push(Rc::downgrade(&fresh));
     fresh
 }
 
@@ -40743,16 +41750,48 @@ fn inline_module_items(
         let mut scopes = elab.upward_scopes.borrow_mut();
         scopes.declare(&source_def);
         if prefix.is_empty() {
-            scopes
-                .defs
-                .insert(String::new(), source_def.name().to_string());
+            scopes.set_top(source_def.name());
             scopes.packages.extend(elab.packages.iter().cloned());
         }
+    }
+    // This body's signals and processes were already elaborated by its
+    // caller. A flat leaf has no hierarchy work left, so avoid preparing a
+    // second owned copy of its items. Binds and generate constructs still
+    // need the complete preparation and active-scope handling below.
+    let has_hierarchy_work = source_def.items().iter().any(|item| {
+        matches!(
+            item,
+            ModuleItem::ModuleInstantiation(_)
+                | ModuleItem::Bind(_)
+                | ModuleItem::GenerateRegion(_)
+                | ModuleItem::GenerateIf(_)
+                | ModuleItem::GenerateCase(_)
+                | ModuleItem::GenerateFor(_)
+        )
+    }) || elab
+        .resolved_binds
+        .get(prefix.trim_end_matches('.'))
+        .is_some_and(|binds| !binds.is_empty());
+    if !has_hierarchy_work {
+        for pd in source_def
+            .params()
+            .iter()
+            .chain(item_param_decls(source_def.items()))
+        {
+            if let ParameterKind::Data { assignments, .. } = &pd.kind {
+                for a in assignments {
+                    elab.declared_parameters
+                        .insert(format!("{}{}", prefix, a.name.name));
+                }
+            }
+        }
+        return Ok(());
     }
     // §20.6.2/§20.7: this body's declarations answer `$bits` and the array
     // queries in its own constant expressions (generate conditions, widths,
     // the parameter overrides it passes to its children).
     let _decl_shapes = install_decl_shapes(source_def);
+    cache.prepared.enter_instance(prefix);
     let mut prepared_source = prepare_module_items(
         source_def,
         definitions,
@@ -43342,6 +44381,7 @@ fn inline_module_items(
                 }
 
                 let __tp = iprof_now();
+                cache.prepared.enter_instance(&inst_prefix);
                 let prepared_sub = prepare_module_items(
                     sub_mod,
                     definitions,
@@ -43465,7 +44505,15 @@ fn inline_module_items(
                         .iter()
                         .chain(item_param_decls(&prepared_sub.effective_items)),
                     |n| cat2(&inst_prefix, n),
-                    |dt| scope_local_typerefs(dt, &sub_typedef_names_all, &inst_prefix),
+                    |dt| {
+                        instance_decl_type(
+                            &mut cache.decl_types,
+                            dt,
+                            &sub_typedef_names_all,
+                            &inst_prefix,
+                            sub_mod.name(),
+                        )
+                    },
                 );
                 let mut sub_merged_params: HashMap<String, Value> = if local_params.is_empty() {
                     sub_local_params.clone()
@@ -45494,8 +46542,10 @@ fn inline_module_items(
                                         // other instance declaration's (one whole-pattern
                                         // assignment, rewritten into the instance scope).
                                         if let Some(init_expr) = &decl.init {
-                                            deferred_decl_inits
-                                                .push((sig_name.clone(), init_expr.clone()));
+                                            deferred_decl_inits.push((
+                                                sig_name.clone(),
+                                                init_expr.as_ref().clone(),
+                                            ));
                                         }
                                         continue;
                                     }
@@ -45541,7 +46591,7 @@ fn inline_module_items(
                                     // instance scope); it used to be dropped here.
                                     if let Some(init_expr) = &decl.init {
                                         deferred_decl_inits
-                                            .push((sig_name.clone(), init_expr.clone()));
+                                            .push((sig_name.clone(), init_expr.as_ref().clone()));
                                     }
                                     // The ELEMENT type of a child array — the
                                     // top-level path records one and every
@@ -45621,8 +46671,10 @@ fn inline_module_items(
                                     let nettype_net = get_type_name(&dd.data_type)
                                         .is_some_and(|t| elab.nettype_resolvers.contains_key(&t));
                                     if nettype_net && let Some(init_expr) = &decl.init {
-                                        nettype_decl_inits
-                                            .push((decl.name.name.clone(), init_expr.clone()));
+                                        nettype_decl_inits.push((
+                                            decl.name.name.clone(),
+                                            init_expr.as_ref().clone(),
+                                        ));
                                     }
                                     let init_val = if let Some(init_expr) = &decl.init {
                                         // An initializer that is NOT a constant
@@ -45637,8 +46689,10 @@ fn inline_module_items(
                                         // top-level declaration path does.
                                         if !is_const_expr(init_expr, &sub_merged_params) {
                                             if !nettype_net {
-                                                deferred_decl_inits
-                                                    .push((sig_name.clone(), init_expr.clone()));
+                                                deferred_decl_inits.push((
+                                                    sig_name.clone(),
+                                                    init_expr.as_ref().clone(),
+                                                ));
                                             }
                                             default_value_for_type_resolved(
                                                 &dd.data_type,
@@ -46774,6 +47828,7 @@ fn inline_module_items(
                     });
                 let pend_ctx = std::rc::Rc::new(RewriteCtx {
                     prefix: inst_prefix.clone(),
+                    origin_scope: inst_prefix.trim_end_matches('.').into(),
                     port_map: Rc::clone(&rewrite_port_map),
                     local_names: std::rc::Rc::clone(&prepared_sub.local_names),
                     interface_map: sub_interface_map.clone(),
@@ -46858,7 +47913,7 @@ fn inline_module_items(
                     // by the hierarchy group's percent_m_module_init_scope self-test.
                     elab.static_init_blocks.push(InitialBlock {
                         stmt: Statement::new(
-                            StatementKind::SeqBlock { name: None, stmts },
+                            StatementKind::SeqBlock { name: None, stmts: stmts.into() },
                             Span::dummy(),
                         ),
                         scope: inst_prefix.trim_end_matches('.').to_string(),
@@ -47321,14 +48376,17 @@ fn inline_module_items(
                     }
                     if let ModuleItem::ContinuousAssign(ca_item) = sub_item {
                         // #7: Rc-share source ASTs across sibling instances.
-                        let delay_rc = ca_item.delay.as_ref().map(|d| std::rc::Rc::new(d.clone()));
+                        let delay_rc = ca_item
+                            .delay
+                            .as_deref()
+                            .map(|d| std::rc::Rc::new(d.clone()));
                         let delay_fall_rc = ca_item
                             .delay_fall
-                            .as_ref()
+                            .as_deref()
                             .map(|d| std::rc::Rc::new(d.clone()));
                         let delay_off_rc = ca_item
                             .delay_off
-                            .as_ref()
+                            .as_deref()
                             .map(|d| std::rc::Rc::new(d.clone()));
                         if let BodySource::ContAssign(pairs) = body_src {
                             for (lhs_rc, rhs_rc) in pairs {
@@ -47402,11 +48460,13 @@ fn inline_module_items(
                             // the `assign #d` form above. With an assignment
                             // the delay is the ASSIGNMENT's (§10.3.3), not a
                             // net delay; see `net_delay_of`.
-                            let rc = |d: &Option<Expression>| {
-                                d.as_ref().map(|d| std::rc::Rc::new(d.clone()))
-                            };
-                            let (delay_rc, delay_fall_rc, delay_off_rc) =
-                                (rc(&nd.delay), rc(&nd.delay_fall), rc(&nd.delay_off));
+                            let rc =
+                                |d: Option<&Expression>| d.map(|d| std::rc::Rc::new(d.clone()));
+                            let (delay_rc, delay_fall_rc, delay_off_rc) = (
+                                rc(nd.delay.as_deref()),
+                                rc(nd.delay_fall.as_deref()),
+                                rc(nd.delay_off.as_deref()),
+                            );
                             for (lhs_rc, rhs_rc) in inits {
                                 elab.pending_cont_assign.push(PendingContAssign {
                                     lhs_source: std::rc::Rc::clone(lhs_rc),
@@ -50593,6 +51653,148 @@ fn make_net_lhs_expr(name: &str) -> Expression {
     make_ident_expr(name)
 }
 
+/// Qualify unscoped type keys in a resolved-nettype struct driver pattern from
+/// `scope` (for example, a module type parameter or local typedef `T:` inside an
+/// inlined child instance whose folded resolver CA has no origin scope).
+fn qualify_nettype_pattern_types(
+    expr: Expression,
+    struct_members: Option<&[(String, DataType, Vec<UnpackedDimension>)]>,
+    scope: &str,
+    elab: &ElaboratedModule,
+) -> Expression {
+    if scope.is_empty() {
+        return expr;
+    }
+    fn rewrite_pattern(
+        expr: Expression,
+        struct_members: Option<&[(String, DataType, Vec<UnpackedDimension>)]>,
+        scope: &str,
+        elab: &ElaboratedModule,
+    ) -> Expression {
+        let span = expr.span;
+        let kind = match expr.kind {
+            ExprKind::TypedPattern { ty, pattern } => ExprKind::TypedPattern {
+                ty,
+                pattern: Box::new(rewrite_pattern(*pattern, struct_members, scope, elab)),
+            },
+            ExprKind::AssignmentPattern(items) => {
+                let mut pos = 0usize;
+                let out = items
+                    .into_iter()
+                    .map(|item| {
+                        let child_members = |item: &AssignmentPatternItem, pos: usize| {
+                            let ms = struct_members?;
+                            let dt = match item {
+                                AssignmentPatternItem::Named(id, _) => ms
+                                    .iter()
+                                    .find(|(m, _, _)| *m == id.name)
+                                    .map(|(_, dt, dims)| (dt, dims)),
+                                AssignmentPatternItem::Ordered(_) => {
+                                    ms.get(pos).map(|(_, dt, dims)| (dt, dims))
+                                }
+                                _ => None,
+                            }?;
+                            if !dt.1.is_empty() {
+                                return None;
+                            }
+                            match resolve_typedef_chain(dt.0, &elab.typedef_types) {
+                                DataType::Struct(su) if !su.packed => Some(
+                                    su.members
+                                        .iter()
+                                        .flat_map(|m| {
+                                            m.declarators.iter().map(|d| {
+                                                (
+                                                    d.name.name.clone(),
+                                                    m.data_type.clone(),
+                                                    d.dimensions.clone(),
+                                                )
+                                            })
+                                        })
+                                        .collect::<Vec<_>>(),
+                                ),
+                                _ => None,
+                            }
+                        };
+                        let nested_ms = child_members(&item, pos);
+                        if matches!(item, AssignmentPatternItem::Ordered(_)) {
+                            pos += 1;
+                        }
+                        if let AssignmentPatternItem::Named(ref k, ref v) = item {
+                            let is_member = struct_members
+                                .is_some_and(|ms| ms.iter().any(|(m, _, _)| *m == k.name));
+                            if !is_member
+                                && !is_param_in_scope(&k.name, scope, &elab.parameters)
+                                && !is_signal_in_scope(&k.name, scope, elab)
+                                && let Some(key) =
+                                    lookup_typedef_key_in_scope(&k.name, scope, &elab.typedef_types)
+                                && key != k.name
+                            {
+                                let dt = DataType::TypeReference {
+                                    name: TypeName {
+                                        scopes: Vec::new(),
+                                        name: Identifier {
+                                            name: key,
+                                            span: k.span,
+                                        },
+                                        span: k.span,
+                                        bound: Default::default(),
+                                    },
+                                    dimensions: Vec::new(),
+                                    type_args: Vec::new(),
+                                    span: k.span,
+                                };
+                                let v2 =
+                                    rewrite_pattern(v.clone(), nested_ms.as_deref(), scope, elab);
+                                return AssignmentPatternItem::Typed(dt, v2);
+                            }
+                        }
+                        match item {
+                            AssignmentPatternItem::Ordered(v) => AssignmentPatternItem::Ordered(
+                                rewrite_pattern(v, nested_ms.as_deref(), scope, elab),
+                            ),
+                            AssignmentPatternItem::Named(k, v) => AssignmentPatternItem::Named(
+                                k,
+                                rewrite_pattern(v, nested_ms.as_deref(), scope, elab),
+                            ),
+                            AssignmentPatternItem::Typed(t, v) => AssignmentPatternItem::Typed(
+                                t,
+                                rewrite_pattern(v, nested_ms.as_deref(), scope, elab),
+                            ),
+                            AssignmentPatternItem::Default(v) => AssignmentPatternItem::Default(
+                                rewrite_pattern(v, nested_ms.as_deref(), scope, elab),
+                            ),
+                            AssignmentPatternItem::Keyed(k, v) => AssignmentPatternItem::Keyed(
+                                k,
+                                rewrite_pattern(v, nested_ms.as_deref(), scope, elab),
+                            ),
+                        }
+                    })
+                    .collect();
+                ExprKind::AssignmentPattern(out)
+            }
+            other => other,
+        };
+        Expression::new(kind, span)
+    }
+    rewrite_pattern(expr, struct_members, scope, elab)
+}
+
+fn is_signal_in_scope(name: &str, scope: &str, elab: &ElaboratedModule) -> bool {
+    if !scope.is_empty() {
+        let mut cur = scope;
+        loop {
+            if elab.signals.contains_key(&format!("{cur}.{name}")) {
+                return true;
+            }
+            let Some((outer, _)) = cur.rsplit_once('.') else {
+                break;
+            };
+            cur = outer;
+        }
+    }
+    elab.signals.contains_key(name)
+}
+
 pub fn resolve_user_nettype_drivers(elab: &mut ElaboratedModule) -> Result<(), String> {
     if elab.nettype_resolvers.is_empty() {
         return Ok(());
@@ -50728,8 +51930,8 @@ pub fn resolve_user_nettype_drivers(elab: &mut ElaboratedModule) -> Result<(), S
         touch(&mut parent, n);
     }
 
-    // net -> its real drivers with their own delays (§10.3.3).
-    let mut real_drivers: HashMap<String, Vec<(Expression, u64)>> = HashMap::default();
+    // net -> its real drivers with their own delays and origin scope (§10.3.3).
+    let mut real_drivers: HashMap<String, Vec<(Expression, u64, String)>> = HashMap::default();
     let mut order: Vec<String> = Vec::new();
     let mut delays: HashMap<String, u64> = HashMap::default();
     let mut kept: Vec<ContinuousAssignment> = Vec::new();
@@ -50807,17 +52009,22 @@ pub fn resolve_user_nettype_drivers(elab: &mut ElaboratedModule) -> Result<(), S
         if !order.contains(&lhs_name) {
             order.push(lhs_name.clone());
         }
+        let scope = ca
+            .origin
+            .as_ref()
+            .map(|(_, s)| s.to_string())
+            .unwrap_or_default();
         real_drivers
             .entry(lhs_name)
             .or_default()
-            .push((ca.rhs, ca.delay));
+            .push((ca.rhs, ca.delay, scope));
     }
 
     // Component -> its drivers, in first-seen order (deterministic: the emitted
     // CA order is observable through settle ordering). Each driver keeps its
     // OWN delay (§10.3.3: a delay on one continuous assignment delays that
     // driver's contribution alone, before resolution folds the others in).
-    let mut comp_drivers: HashMap<String, Vec<(Expression, u64)>> = HashMap::default();
+    let mut comp_drivers: HashMap<String, Vec<(Expression, u64, String)>> = HashMap::default();
     let mut comp_order: Vec<String> = Vec::new();
     let mut comp_delay: HashMap<String, u64> = HashMap::default();
     for n in &order {
@@ -50938,6 +52145,7 @@ pub fn resolve_user_nettype_drivers(elab: &mut ElaboratedModule) -> Result<(), S
                             mlhs,
                             mrhs,
                             false,
+                            &[],
                             mdt,
                             mdims,
                             &template,
@@ -50999,7 +52207,7 @@ pub fn resolve_user_nettype_drivers(elab: &mut ElaboratedModule) -> Result<(), S
         // collapse exactly onto it.
         let staged = members.is_none()
             && drivers.len() > 1
-            && drivers[1..].iter().any(|(_, d)| *d != drivers[0].1);
+            && drivers[1..].iter().any(|(_, d, _)| *d != drivers[0].1);
         let mut delay = comp_delay.remove(&root).unwrap_or(0);
         if staged {
             delay = 0;
@@ -51051,7 +52259,7 @@ pub fn resolve_user_nettype_drivers(elab: &mut ElaboratedModule) -> Result<(), S
             let mut items: Vec<crate::ast::expr::AssignmentPatternItem> =
                 Vec::with_capacity(drivers.len());
             let mut k: u32 = 0;
-            for (driver, dly) in drivers.iter() {
+            for (driver, dly, driver_scope) in drivers.iter() {
                 let fold = if staged && *dly != 0 {
                     let stage = format!("{root}$drv{k}");
                     k += 1;
@@ -51074,8 +52282,12 @@ pub fn resolve_user_nettype_drivers(elab: &mut ElaboratedModule) -> Result<(), S
                 };
                 let d = match (&members, &fold.kind) {
                     // Already member-wise.
-                    (Some(_), ExprKind::AssignmentPattern(_)) => fold,
-                    (Some(_), ExprKind::TypedPattern { pattern, .. }) => (**pattern).clone(),
+                    (Some(ms), ExprKind::AssignmentPattern(_)) => {
+                        qualify_nettype_pattern_types(fold, Some(ms), driver_scope, elab)
+                    }
+                    (Some(ms), ExprKind::TypedPattern { pattern, .. }) => {
+                        qualify_nettype_pattern_types((**pattern).clone(), Some(ms), driver_scope, elab)
+                    }
                     // Name it member by member instead: '{d.m0, d.m1, ..}
                     (Some(ms), _) => {
                         let span = fold.span;
@@ -54617,16 +55829,10 @@ fn upward_scope_rewrite(hier: &HierarchicalIdentifier, prefix: &str) -> Option<E
         scopes
             .defs
             .get(p)
-            .and_then(|d| scopes.declared.get(d))
+            .and_then(|d| scopes.declared.get(&**d))
             .is_some_and(|names| names.contains(head))
     };
-    let kids_of = |p: &str| scopes.children.get(p).map(Vec::as_slice).unwrap_or(&[]);
-    let child_named = |p: &str| {
-        kids_of(p)
-            .iter()
-            .find(|(l, _)| l == head)
-            .map(|(l, _)| l.as_str())
-    };
+    let child_named = |p: &str| scopes.child_named(p, head);
     let cur = prefix.trim_end_matches('.');
     // Step a: the current design element's own scopes are downward.
     if declares(cur) || child_named(cur).is_some() {
@@ -54636,7 +55842,7 @@ fn upward_scope_rewrite(hier: &HierarchicalIdentifier, prefix: &str) -> Option<E
     // The matched scope and what replaces the head below it: nothing when
     // the head named `p`'s module, the child's name, or the label itself.
     let hit: Option<(&str, Option<&str>)> = loop {
-        if !p.is_empty() && scopes.defs.get(p).is_some_and(|d| d == head) {
+        if !p.is_empty() && scopes.defs.get(p).is_some_and(|d| &**d == head) {
             break Some((p, None));
         }
         if p != cur {
@@ -54689,7 +55895,7 @@ fn upward_subroutine_key(hier: &HierarchicalIdentifier, prefix: &str) -> Option<
     let inst = prefix.trim_end_matches('.');
     let key = scopes.subroutine_key(inst, name)?;
     if bind::audit_enabled() {
-        let def = scopes.parents.get(inst).map_or("", |up| up.def.as_str());
+        let def = scopes.parents.get(inst).map_or("", |up| &*up.def);
         eprintln!(
             "[bind-audit] upward {} {name} in {inst} -> {key}",
             audit_location(def, hier.span)
@@ -55624,7 +56830,16 @@ fn rewrite_expr_impl(
                             Api::Ordered(rewritten)
                         }
                         Api::Named(n, e) => Api::Named(n.clone(), rw(e)),
-                        Api::Typed(t, e) => Api::Typed(t.clone(), rw(e)),
+                        Api::Typed(t, e) => Api::Typed(
+                            rewrite_typed_pattern_type(
+                                t,
+                                prefix,
+                                port_map,
+                                local_names,
+                                interface_map,
+                            ),
+                            rw(e),
+                        ),
                         Api::Default(e) => Api::Default(rw(e)),
                         Api::Keyed(k, e) => Api::Keyed(rw(k), rw(e)),
                     }
@@ -56844,14 +58059,21 @@ fn rewrite_decl_list(
                 true => with_gen_part(local_type_takes, || gen_dims(&d.dimensions)),
                 false => d.dimensions.clone(),
             },
-            init: d
-                .init
-                .as_ref()
-                .map(|e| rewrite_expr(e, prefix, port_map, local_names, interface_map)),
+            init: d.init.as_deref().map(|e| {
+                Box::new(rewrite_expr(
+                    e,
+                    prefix,
+                    port_map,
+                    local_names,
+                    interface_map,
+                ))
+            }),
             span: d.span,
         })
         .collect()
 }
+
+mod identity_rewrite;
 
 fn rewrite_stmt(
     stmt: &Statement,
@@ -56860,6 +58082,19 @@ fn rewrite_stmt(
     local_names: &std::collections::HashSet<String>,
     interface_map: &HashMap<String, String>,
 ) -> Statement {
+    // A changed enclosing block may still contain unchanged block lists.
+    // Reuse only proven root identities; clone keeps explicit Fresh and
+    // Disabled cache ownership in force for every nested statement.
+    if matches!(
+        stmt.kind,
+        StatementKind::SeqBlock { .. } | StatementKind::ParBlock { .. }
+    ) && prefix.is_empty()
+        && port_map.is_empty()
+        && interface_map.is_empty()
+        && identity_rewrite::can_preserve_root_stmt(stmt)
+    {
+        return stmt.clone();
+    }
     let new_kind = match &stmt.kind {
         StatementKind::BlockingAssign { lvalue, rvalue } => StatementKind::BlockingAssign {
             lvalue: rewrite_expr(lvalue, prefix, port_map, local_names, interface_map),
@@ -56873,7 +58108,7 @@ fn rewrite_stmt(
             lvalue: rewrite_expr(lvalue, prefix, port_map, local_names, interface_map),
             delay: delay
                 .as_ref()
-                .map(|d| rewrite_expr(d, prefix, port_map, local_names, interface_map)),
+                .map(|d| Box::new(rewrite_expr(d, prefix, port_map, local_names, interface_map))),
             rvalue: rewrite_expr(rvalue, prefix, port_map, local_names, interface_map),
         },
         StatementKind::Expr(expr) => StatementKind::Expr(rewrite_expr(
@@ -56930,14 +58165,24 @@ fn rewrite_stmt(
                     span: item.span,
                     // §12.6: rewrite constant-expression sub-patterns and the
                     // `&&&` guard; tags and `.v` binding names are not signals.
-                    pattern: item
-                        .pattern
-                        .as_ref()
-                        .map(|p| rewrite_pattern(p, prefix, port_map, local_names, interface_map)),
-                    guard: item
-                        .guard
-                        .as_ref()
-                        .map(|g| rewrite_expr(g, prefix, port_map, local_names, interface_map)),
+                    pattern: item.pattern.as_deref().map(|p| {
+                        Box::new(rewrite_pattern(
+                            p,
+                            prefix,
+                            port_map,
+                            local_names,
+                            interface_map,
+                        ))
+                    }),
+                    guard: item.guard.as_deref().map(|g| {
+                        Box::new(rewrite_expr(
+                            g,
+                            prefix,
+                            port_map,
+                            local_names,
+                            interface_map,
+                        ))
+                    }),
                 })
                 .collect(),
         },
@@ -57244,14 +58489,15 @@ fn rewrite_stmt(
                 inferred_clock: a
                     .inferred_clock
                     .as_ref()
-                    .map(|ev| crate::ast::stmt::EventExpr {
-                        edge: ev.edge,
-                        expr: rewrite_expr(&ev.expr, prefix, port_map, local_names, interface_map),
-                        iff: ev
-                            .iff
-                            .as_ref()
-                            .map(|g| rewrite_expr(g, prefix, port_map, local_names, interface_map)),
-                        span: ev.span,
+                    .map(|ev| {
+                        Box::new(crate::ast::stmt::EventExpr {
+                            edge: ev.edge,
+                            expr: rewrite_expr(&ev.expr, prefix, port_map, local_names, interface_map),
+                            iff: ev.iff.as_ref().map(|g| {
+                                rewrite_expr(g, prefix, port_map, local_names, interface_map)
+                            }),
+                            span: ev.span,
+                        })
                     }),
                 span: a.span,
             })
@@ -57286,7 +58532,7 @@ fn rewrite_stmt(
         },
         StatementKind::SeqBlock { name, stmts } => StatementKind::SeqBlock {
             name: name.clone(),
-            stmts: rewrite_stmt_list_scoped(stmts, prefix, port_map, local_names, interface_map),
+            stmts: rewrite_stmt_list_scoped(stmts, prefix, port_map, local_names, interface_map).into(),
         },
         StatementKind::EventTrigger {
             nonblocking,
@@ -57330,7 +58576,7 @@ fn rewrite_stmt(
             join_type,
         } => StatementKind::ParBlock {
             name: name.clone(),
-            stmts: rewrite_stmt_list_scoped(stmts, prefix, port_map, local_names, interface_map),
+            stmts: rewrite_stmt_list_scoped(stmts, prefix, port_map, local_names, interface_map).into(),
             join_type: *join_type,
         },
 
@@ -57505,6 +58751,13 @@ fn compute_foreign_package_names(
     // Unlike the wildcard case there is no §26.3 ordering rule to honour —
     // the name was never in scope, so a local declaration wins wherever it
     // appears.
+    // No unimported package can collide with a local declaration. Avoid
+    // copying the whole module's names for an empty intersection (§26.3).
+    if !defs.iter().any(|(name, def)| {
+        matches!(def, Definition::Package(_)) && !imported.contains(name.as_str())
+    }) {
+        return std::collections::HashSet::default();
+    }
     let local = collect_local_scope_names(items);
     let mut out = std::collections::HashSet::default();
     for (pkg_name, def) in defs {
@@ -57551,6 +58804,9 @@ fn package_item_names(pi: &PackageItem) -> Vec<String> {
         _ => Vec::new(),
     }
 }
+
+#[cfg(test)]
+mod package_shadow_tests;
 
 /// Names declared LOCALLY in a module scope (§26.3 shadow tracking): params,
 /// vars, nets, ports, typedefs, functions, tasks, classes, instances.
@@ -57616,6 +58872,13 @@ fn compute_wildcard_shadowed(
     params: &[ParameterDeclaration],
     defs: &HashMap<String, Definition>,
 ) -> std::collections::HashSet<String> {
+    // With no wildcard import, there is no imported name to shadow. In
+    // particular, explicit imports follow a different conflict rule (§26.3).
+    if !items.iter().any(|item| matches!(item,
+        ModuleItem::ImportDeclaration(imp) if imp.items.iter().any(|ii| ii.item.is_none())))
+    {
+        return std::collections::HashSet::default();
+    }
     // §26.3 ordering rule: a local declaration only legally SHADOWS a
     // wildcard-imported name if it precedes any use of that name. A name that a
     // procedural/continuous-assign block references BEFORE its local
@@ -59465,7 +60728,9 @@ mod prepared_process_ownership_tests {
         let crate::ast::Description::Module(module) = &parsed.source.descriptions[0] else {
             panic!("module expected");
         };
-        let original = format!("{:?}", module.items);
+        // Compare source syntax, not immutable literal memoization that
+        // shared bodies may populate during preparation.
+        let original = bincode::serde::encode_to_vec(&module.items, crate::xez_bincode_config()).unwrap();
         let definitions = HashMap::from_iter([("leaf".to_string(), Definition::Module(module))]);
         let params = HashMap::default();
         let scope = param_scope::ParamScope::new(
@@ -59555,7 +60820,7 @@ mod prepared_process_ownership_tests {
             }
         }
         assert_eq!(
-            format!("{:?}", module.items),
+            bincode::serde::encode_to_vec(&module.items, crate::xez_bincode_config()).unwrap(),
             original,
             "preparing an instance must not consume or mutate its source definition"
         );
