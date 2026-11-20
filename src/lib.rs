@@ -251,7 +251,12 @@ pub use value::Value;
 ///         (§7.4.2), nested classes named through a specialized host by their renamed spelling
 ///         (§8.23), class-local typedef property widths (§6.18) and package sequences and
 ///         properties under `pkg::name` keys (§16.8, §26.3).
-pub const XEZIM_BYTECODE_MAGIC: &[u8; 8] = b"XEZIMBC\x4c";
+/// \x4d = \x4c + real initializers of 64-bit integral variables and typed package parameters
+///         held as integers (§6.12.1), and time literals and delays scaled to the unit,
+///         precision and tick by exact powers of ten (§5.8, §3.14.1).
+/// \x4d = \x4c + assignment pattern type keys bound at every array dimension in
+///         continuous assignments, nettype drivers and parameter values (§10.9.1, §10.9.2).
+pub const XEZIM_BYTECODE_MAGIC: &[u8; 8] = b"XEZIMBC\x4e";
 
 /// Name of the synthetic root that instantiates every top of a multi-top
 /// design (§23.3.3), each instance named after its module. It is not part of
@@ -1850,6 +1855,10 @@ fn parse_and_elaborate(
     String,
 > {
     let _oom_prepare = oom_trace::scope("prepare definitions", "", "", "");
+    // Generated text and token batches have been dropped at this boundary.
+    // Return their unused pages before allocating the definition indexes.
+    release_free_memory();
+    oom_trace::checkpoint("prepare.memory_released", &[]);
     let _name_registry = shared_names::registry_scope();
     let _declaration_order_scope = elaborate::declaration_order_scope();
     // Every elaboration starts from the same state, whatever the thread
@@ -1871,13 +1880,18 @@ fn parse_and_elaborate(
     // §26.3: a type name declared by two packages (or a package and $unit / a
     // module) gets its package-qualified spelling before anything keys the
     // flat per-design type tables by it (#300).
+    oom_trace::checkpoint("prepare.body_types.begin", &[]);
     body_type_params::normalize(&mut all_descriptions);
+    oom_trace::checkpoint("prepare.body_types.ready", &[]);
     pkg_scope::qualify_colliding_package_types(&mut all_descriptions)?;
+    oom_trace::checkpoint("prepare.package_types.ready", &[]);
     // §8.25.1: the parameterized classes whose typedefs name a member of a
     // type parameter, for `Cls#(args)::t` lookups.
     elaborate::class_scope_types::install(&all_descriptions);
     pkg_scope::stamp_automatic_subroutines(&mut all_descriptions);
+    oom_trace::checkpoint("prepare.automatic.ready", &[]);
     scope_tree::build_design(&mut all_descriptions);
+    oom_trace::checkpoint("prepare.scope_tree.ready", &[]);
     let cli = module_timescale_cli();
     // Deterministic: `module_timescale_exp` is filled by walking this map,
     // and its serialized order follows the order entries are inserted in.
@@ -2149,6 +2163,14 @@ fn parse_and_elaborate(
                     m: &mut ast::module::ModuleDeclaration,
                     out: &mut Vec<ast::module::ModuleDeclaration>,
                 ) {
+                    // Flat generated modules need no replacement item buffer.
+                    if !m
+                        .items
+                        .iter()
+                        .any(|item| matches!(item, ast::decl::ModuleItem::NestedModule(_)))
+                    {
+                        return;
+                    }
                     let mut kept = Vec::with_capacity(m.items.len());
                     for item in m.items.drain(..) {
                         if let ast::decl::ModuleItem::NestedModule(inner) = item {
@@ -2880,11 +2902,11 @@ fn parse_and_elaborate(
                         })
                     });
                     if !own {
-                        items.insert(0, ast::decl::ModuleItem::DPIImport(di.clone()));
+                        items.insert(0, ast::decl::ModuleItem::DPIImport(Box::new(di.clone())));
                     }
                 }
                 for e in top_level_dpi_exports.iter() {
-                    items.push(ast::decl::ModuleItem::DPIExport(e.clone()));
+                    items.push(ast::decl::ModuleItem::DPIExport(Box::new(e.clone())));
                 }
                 // A module's own property or sequence of the same name
                 // shadows the $unit one.
@@ -3033,14 +3055,14 @@ fn parse_and_elaborate(
                         }
                         if let Some(init) = &mut decl.init {
                             let stmt = ast::stmt::Statement::new(
-                                ast::stmt::StatementKind::Expr(init.clone()),
+                                ast::stmt::StatementKind::Expr(init.as_ref().clone()),
                                 init.span,
                             );
                             if let ast::stmt::StatementKind::Expr(expr) =
                                 elaborate::substitute_bare_idents_stmt(&stmt, &shadowed_unit_vars)
                                     .kind
                             {
-                                *init = expr;
+                                **init = expr;
                             }
                         }
                     }
@@ -3736,6 +3758,12 @@ fn parse_and_elaborate(
         elab.timeunit_exp = u;
         elab.timeprecision_exp = p;
     }
+
+    // The top's temporary declaration and constant-evaluation indexes are
+    // no longer live. Release their pages before root rewriting and its
+    // validation tables allocate another view of a large flat design.
+    release_free_memory();
+    oom_trace::checkpoint("elaborate.memory_released", &[]);
 
     // §23.11: bind selection uses the finished hierarchy and declaration
     // scope. Re-elaborate only designs with newly resolved bindings; ordinary
