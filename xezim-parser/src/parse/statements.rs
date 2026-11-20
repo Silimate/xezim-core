@@ -1,6 +1,6 @@
 //! Statement parsing (IEEE 1800-2017 §A.6)
 
-use super::Parser;
+use super::{Parser, compact_syntax_list};
 use crate::ast::expr::{BinaryOp, ExprKind, Expression, NumberBase, NumberLiteral};
 use crate::ast::stmt::*;
 use crate::ast::types::{DataType, Lifetime, SimpleType};
@@ -60,7 +60,7 @@ impl Parser {
                 return Statement::new(
                     StatementKind::SeqBlock {
                         name: Some(label),
-                        stmts: vec![inner],
+                        stmts: vec![inner].into(),
                     },
                     span,
                 );
@@ -106,7 +106,7 @@ impl Parser {
                             decl: crate::ast::binding::Bound::UNSET,
                             name: a.name,
                             dimensions: a.dimensions,
-                            init: a.init,
+                            init: a.init.map(Box::new),
                             span: a.span,
                         })
                         .collect();
@@ -284,7 +284,7 @@ impl Parser {
                         decl: crate::ast::binding::Bound::UNSET,
                         name,
                         dimensions,
-                        init,
+                        init: init.map(Box::new),
                         span: self.span_from(ds),
                     });
                     if self.eat(TokenKind::Comma).is_none() {
@@ -690,7 +690,7 @@ impl Parser {
                 Statement::new(
                     StatementKind::SeqBlock {
                         name: None,
-                        stmts: vec![wait_stmt, stmt],
+                        stmts: vec![wait_stmt, stmt].into(),
                     },
                     self.span_from(start),
                 )
@@ -751,7 +751,7 @@ impl Parser {
                         decl: crate::ast::binding::Bound::UNSET,
                         name,
                         dimensions,
-                        init,
+                        init: init.map(Box::new),
                         span: self.span_from(ds),
                     });
                     if self.eat(TokenKind::Comma).is_none() {
@@ -794,7 +794,7 @@ impl Parser {
                         decl: crate::ast::binding::Bound::UNSET,
                         name,
                         dimensions,
-                        init,
+                        init: init.map(Box::new),
                         span: self.span_from(ds),
                     });
                     if self.eat(TokenKind::Comma).is_none() {
@@ -839,7 +839,7 @@ impl Parser {
                         decl: crate::ast::binding::Bound::UNSET,
                         name,
                         dimensions,
-                        init,
+                        init: init.map(Box::new),
                         span: self.span_from(ds),
                     });
                     if self.eat(TokenKind::Comma).is_none() {
@@ -893,7 +893,7 @@ impl Parser {
                         decl: crate::ast::binding::Bound::UNSET,
                         name,
                         dimensions,
-                        init,
+                        init: init.map(Box::new),
                         span: self.span_from(ds),
                     });
                     if self.eat(TokenKind::Comma).is_none() {
@@ -974,7 +974,7 @@ impl Parser {
                         decl: crate::ast::binding::Bound::UNSET,
                         name,
                         dimensions,
-                        init,
+                        init: init.map(Box::new),
                         span: self.span_from(ds),
                     });
                     if self.eat(TokenKind::Comma).is_none() {
@@ -1247,8 +1247,11 @@ impl Parser {
                 }
             }
         }
+        // Freeze only the used statement slots. Growth capacity is useful
+        // while parsing, but otherwise stays resident in every shared block.
+        let stmts = compact_syntax_list(stmts);
         Statement::new(
-            StatementKind::SeqBlock { name, stmts },
+            StatementKind::SeqBlock { name, stmts: stmts.into() },
             self.span_from(start),
         )
     }
@@ -1301,11 +1304,12 @@ impl Parser {
                 }
             }
         }
+        let stmts = compact_syntax_list(stmts);
         Statement::new(
             StatementKind::ParBlock {
                 name,
                 join_type,
-                stmts,
+                stmts: stmts.into(),
             },
             self.span_from(start),
         )
@@ -1449,8 +1453,8 @@ impl Parser {
                         is_default: false,
                         stmt,
                         span: self.span_from(istart),
-                        pattern: Some(pattern),
-                        guard,
+                        pattern: Some(Box::new(pattern)),
+                        guard: guard.map(Box::new),
                     });
                 }
                 if self.pos == before {
@@ -2224,13 +2228,13 @@ impl Parser {
                 });
                 inner = stmt(StatementKind::SeqBlock {
                     name: None,
-                    stmts: vec![cycles, inner],
+                    stmts: vec![cycles, inner].into(),
                 });
             }
         }
         Some(stmt(StatementKind::SeqBlock {
             name: None,
-            stmts: vec![wait, inner],
+            stmts: vec![wait, inner].into(),
         }))
     }
 
@@ -2529,7 +2533,7 @@ impl Parser {
                     rs_rewrite_return_as_rsreturn(s);
                 }
                 let span = self.span_from(start);
-                let inner = Statement::new(StatementKind::SeqBlock { name: None, stmts }, span);
+                let inner = Statement::new(StatementKind::SeqBlock { name: None, stmts: stmts.into() }, span);
                 RsProd::Block(Statement::new(
                     StatementKind::RsAction {
                         body: Box::new(inner),
@@ -2756,7 +2760,7 @@ fn expand_seq(prods: &ProdMap, seq: &RsSeq, depth: &mut u32, span: crate::ast::S
         .iter()
         .map(|p| expand_prod(prods, p, depth, span))
         .collect();
-    Statement::new(StatementKind::SeqBlock { name: None, stmts }, span)
+    Statement::new(StatementKind::SeqBlock { name: None, stmts: stmts.into() }, span)
 }
 
 fn expand_prod(prods: &ProdMap, p: &RsProd, depth: &mut u32, span: crate::ast::Span) -> Statement {
@@ -2782,7 +2786,7 @@ fn expand_prod(prods: &ProdMap, p: &RsProd, depth: &mut u32, span: crate::ast::S
                         span,
                     },
                     dimensions: Vec::new(),
-                    init: Some(arg.clone()),
+                    init: Some(Box::new(arg.clone())),
                     span,
                 };
                 stmts.push(Statement::new(
@@ -2795,7 +2799,7 @@ fn expand_prod(prods: &ProdMap, p: &RsProd, depth: &mut u32, span: crate::ast::S
                 ));
             }
             stmts.push(body);
-            Statement::new(StatementKind::SeqBlock { name: None, stmts }, span)
+            Statement::new(StatementKind::SeqBlock { name: None, stmts: stmts.into() }, span)
         }
         RsProd::If(cond, then_a, else_a) => {
             *depth += 1;
@@ -2866,7 +2870,7 @@ fn expand_prod(prods: &ProdMap, p: &RsProd, depth: &mut u32, span: crate::ast::S
                 .iter()
                 .map(|p| expand_prod(prods, p, depth, span))
                 .collect();
-            Statement::new(StatementKind::SeqBlock { name: None, stmts }, span)
+            Statement::new(StatementKind::SeqBlock { name: None, stmts: stmts.into() }, span)
         }
         RsProd::Break => Statement::new(StatementKind::Break, span),
         RsProd::Return => Statement::new(StatementKind::Return(None), span),
