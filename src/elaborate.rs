@@ -57599,7 +57599,7 @@ fn substitute_type_params_stmt(stmt: Statement, binds: &HashMap<String, DataType
         StatementKind::Forever { body } => StatementKind::Forever { body: sub(body) },
         StatementKind::SeqBlock { name, stmts } => StatementKind::SeqBlock {
             name,
-            stmts: substitute_type_params_block(stmts, binds),
+            stmts: substitute_type_params_block(stmts.into_vec(), binds).into(),
         },
         StatementKind::ParBlock {
             name,
@@ -57608,7 +57608,7 @@ fn substitute_type_params_stmt(stmt: Statement, binds: &HashMap<String, DataType
         } => StatementKind::ParBlock {
             name,
             join_type,
-            stmts: substitute_type_params_block(stmts, binds),
+            stmts: substitute_type_params_block(stmts.into_vec(), binds).into(),
         },
         StatementKind::TimingControl { control, stmt } => StatementKind::TimingControl {
             control,
