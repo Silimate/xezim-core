@@ -913,6 +913,12 @@ pub fn qualify_colliding_package_types(descs: &mut [Description]) -> Result<(), 
 /// Gather every package's type names and imports; `None` when no type name
 /// is declared by a package and anywhere else (nothing to do).
 fn collect(descs: &[Description]) -> Option<Info> {
+    let all_classes = design_classes(descs);
+    // Classes also need qualification without packages. Otherwise a design
+    // with no packages cannot contribute any colliding names to this pass.
+    if all_classes.is_empty() && !descs.iter().any(|d| matches!(d, Description::Package(_))) {
+        return None;
+    }
     let mut pkgs: HashMap<String, PkgInfo> = HashMap::default();
     let mut other: HashSet<String> = HashSet::default();
     let mut other_members: HashSet<String> = HashSet::default();
@@ -1082,7 +1088,6 @@ fn collect(descs: &[Description]) -> Option<Info> {
     };
     // §8.3: a class is a scope of its own; a type name a class declares
     // collides when it is declared anywhere else as well.
-    let all_classes = design_classes(descs);
     let mut lexical_counts: HashMap<&str, usize> = HashMap::default();
     for (scope, c) in &all_classes {
         if !matches!(scope, ClassScope::Package(_)) {
@@ -2589,7 +2594,9 @@ impl Rw<'_> {
                 rvalue,
             } => {
                 self.expr(lvalue);
-                self.opt(delay);
+                if let Some(delay) = delay {
+                    self.expr(delay);
+                }
                 self.expr(rvalue);
             }
             StatementKind::If {
@@ -2611,7 +2618,7 @@ impl Rw<'_> {
                     if let Some(p) = &mut it.pattern {
                         self.pattern(p);
                     }
-                    self.opt(&mut it.guard);
+                    self.opt_box(&mut it.guard);
                     self.stmt(&mut it.stmt);
                 }
             }
@@ -2803,7 +2810,7 @@ impl Rw<'_> {
     fn declarators(&mut self, ds: &mut [VarDeclarator]) {
         for d in ds {
             self.unpacked(&mut d.dimensions);
-            self.opt(&mut d.init);
+            self.opt_box(&mut d.init);
         }
     }
 
@@ -3101,7 +3108,10 @@ impl Rw<'_> {
                     | ClassMethodKind::Extern(fd) => self.function(fd),
                     ClassMethodKind::Task(td) => self.task(td),
                 },
-                ClassItem::Constraint(cc) => cc.items.iter_mut().for_each(|i| self.constraint(i)),
+                ClassItem::Constraint(cc) => std::sync::Arc::make_mut(cc)
+                    .items
+                    .iter_mut()
+                    .for_each(|i| self.constraint(i)),
                 ClassItem::Typedef(td) => {
                     // §8.3/§6.18: a class typedef whose name is declared
                     // elsewhere too is renamed to its class-qualified spelling.
@@ -3232,12 +3242,12 @@ impl Rw<'_> {
             }
             ModuleItem::NetDeclaration(n) => {
                 self.dtype(&mut n.data_type);
-                self.opt(&mut n.delay);
-                self.opt(&mut n.delay_fall);
-                self.opt(&mut n.delay_off);
+                self.opt_box(&mut n.delay);
+                self.opt_box(&mut n.delay_fall);
+                self.opt_box(&mut n.delay_off);
                 for d in &mut n.declarators {
                     self.unpacked(&mut d.dimensions);
-                    self.opt(&mut d.init);
+                    self.opt_box(&mut d.init);
                 }
             }
             ModuleItem::DataDeclaration(d) => {
@@ -3261,9 +3271,9 @@ impl Rw<'_> {
             ModuleItem::InitialConstruct(i) => self.body(&mut i.stmt),
             ModuleItem::FinalConstruct(f) => self.body(&mut f.stmt),
             ModuleItem::ContinuousAssign(ca) => {
-                self.opt(&mut ca.delay);
-                self.opt(&mut ca.delay_fall);
-                self.opt(&mut ca.delay_off);
+                self.opt_box(&mut ca.delay);
+                self.opt_box(&mut ca.delay_fall);
+                self.opt_box(&mut ca.delay_off);
                 for (l, r) in &mut ca.assignments {
                     self.expr(l);
                     self.expr(r);
@@ -3334,8 +3344,8 @@ impl Rw<'_> {
             }
             ModuleItem::CovergroupDeclaration(cg) => self.covergroup(cg),
             ModuleItem::ClockingDeclaration(cd) => {
-                self.opt(&mut cd.default_input_skew);
-                self.opt(&mut cd.default_output_skew);
+                self.opt_box(&mut cd.default_input_skew);
+                self.opt_box(&mut cd.default_output_skew);
                 for s in &mut cd.signals {
                     self.opt(&mut s.skew);
                     self.opt(&mut s.bound_to);
@@ -3448,7 +3458,7 @@ impl Rw<'_> {
                 self.dtype(&mut nd.data_type);
                 for d in &mut nd.declarators {
                     self.unpacked(&mut d.dimensions);
-                    self.opt(&mut d.init);
+                    self.opt_box(&mut d.init);
                     if let Some(p) = pkg {
                         if self.info.mangled_vars.contains(&d.name.name) {
                             d.name.name = mangle(p, &d.name.name);
@@ -3693,7 +3703,7 @@ endmodule
                     StatementKind::SeqBlock { stmts, .. } => stmts,
                     _ => panic!("expected a block"),
                 },
-                ModuleItem::FunctionDeclaration(f) => f.items.into_vec(),
+                ModuleItem::FunctionDeclaration(f) => f.items,
                 _ => continue,
             };
             assert_eq!(declared_type(&stmts[0]), "copper::word_t");
