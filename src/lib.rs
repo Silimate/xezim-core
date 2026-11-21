@@ -254,9 +254,20 @@ pub use value::Value;
 /// \x4d = \x4c + real initializers of 64-bit integral variables and typed package parameters
 ///         held as integers (§6.12.1), and time literals and delays scaled to the unit,
 ///         precision and tick by exact powers of ten (§5.8, §3.14.1).
-/// \x4d = \x4c + assignment pattern type keys bound at every array dimension in
+/// \x4e = \x4d + assignment pattern type keys bound at every array dimension in
 ///         continuous assignments, nettype drivers and parameter values (§10.9.1, §10.9.2).
-pub const XEZIM_BYTECODE_MAGIC: &[u8; 8] = b"XEZIMBC\x4e";
+/// \x4f = \x4e + a named assignment pattern key carries its lexically bound type name, real and
+///         realtime type keys are one type (§10.9.1, §26.3, §6.12), and aliased nets of a
+///         user-defined nettype resolve as one net (§10.11, §6.6.7).
+///         Also typedefs of real classified as real, UDP instance delays in the holding
+///         module's time unit, the declared types of packed-array and structure ports, and
+///         the default actual arguments of named sequences and properties kept in the
+///         elaborated design (§6.18, §3.14.2, §7.4.1, §16.8, §16.12).
+/// Driver contributions, net-cell resolution, delayed structures, interface-array
+/// bounds, sampled input nets and fill-literal state are preserved in this format.
+/// \x56 retains sampled input-formal identities through simulator aliasing (§16.5.1).
+// §10.9.1: continuous packed array defaults retain their element type.
+pub const XEZIM_BYTECODE_MAGIC: &[u8; 8] = b"XEZIMBC\x57";
 
 /// Name of the synthetic root that instantiates every top of a multi-top
 /// design (§23.3.3), each instance named after its module. It is not part of
@@ -2170,6 +2181,7 @@ fn parse_and_elaborate(
                     for item in m.items.drain(..) {
                         if let ast::decl::ModuleItem::NestedModule(inner) = item {
                             let mut inner = *inner;
+                            inner.lexical_parent = Some(m.name.name.clone());
                             hoist_nested(&mut inner, out);
                             out.push(inner);
                         } else {
@@ -2333,6 +2345,7 @@ fn parse_and_elaborate(
             }
             ast::Description::PackageItem(ast::decl::PackageItem::Checker(c)) => {
                 let m = ast::module::ModuleDeclaration {
+                    lexical_parent: None,
                     attrs: Vec::new(),
                     kind: ast::module::ModuleKind::Module,
                     lifetime: None,
@@ -3133,6 +3146,45 @@ fn parse_and_elaborate(
         }
     }
 
+    // §29.8, §28.16: the delays of a UDP instance count the time unit of the
+    // definition holding the instance. Only now is every primitive known
+    // (one may be defined after its first instance, or come from a library).
+    {
+        let udps: std::collections::HashSet<String> = definitions
+            .iter()
+            .filter(|(_, d)| matches!(d, SourceDefinition::Udp(_)))
+            .map(|(n, _)| n.clone())
+            .collect();
+        if !udps.is_empty() {
+            let is_udp = |n: &str| udps.contains(n);
+            for (name, def) in definitions.iter_mut() {
+                let (unit_s, prec_s) = module_timescale_exp
+                    .get(name)
+                    .map(|&(u, p)| (elaborate::exp_to_secs(u), elaborate::exp_to_secs(p)))
+                    .unwrap_or((tick_s, tick_s));
+                match def {
+                    SourceDefinition::Module(rc)
+                        if elaborate::instantiates_udp(&rc.items, &is_udp) =>
+                    {
+                        let m = Rc::make_mut(rc);
+                        elaborate::rewrite_udp_instance_delays(
+                            &mut m.items, &is_udp, unit_s, prec_s, tick_s,
+                        );
+                    }
+                    SourceDefinition::Interface(rc)
+                        if elaborate::instantiates_udp(&rc.items, &is_udp) =>
+                    {
+                        let i = Rc::make_mut(rc);
+                        elaborate::rewrite_udp_instance_delays(
+                            &mut i.items, &is_udp, unit_s, prec_s, tick_s,
+                        );
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
     warn_unapplied_param_overrides(&param_override_hits);
 
     // §6.18 + §3.12.1: a $unit typedef's DIMENSIONS are evaluated in the
@@ -3841,6 +3893,7 @@ fn parse_and_elaborate(
     // §6.6.7: fold user-defined nettype drivers — after inlining, so drivers
     // arriving from several instances through ports resolve together with any
     // written in the parent. Must precede the bitwise fold below.
+    elaborate::stage_vpi_net_drivers(&mut elab);
     elaborate::resolve_user_nettype_drivers(&mut elab)?;
     elab_phase("switches and nettype drivers", &mut phase_t);
     // §7.2.2: a whole-struct continuous assign that arrived through inlining
@@ -4296,6 +4349,7 @@ fn make_multi_top_wrapper(modules: &[String]) -> ast::module::ModuleDeclaration 
         })
         .collect();
     ast::module::ModuleDeclaration {
+        lexical_parent: None,
         attrs: vec![],
         kind: ast::module::ModuleKind::Module,
         lifetime: None,
