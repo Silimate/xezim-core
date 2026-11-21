@@ -1845,7 +1845,7 @@ impl<'a> Binder<'a> {
                         }
                         AssignmentPatternItem::Named(id, v) => {
                             if id.type_key.is_none() {
-                                id.bound = self.resolve(&id.name).bound();
+                                id.bound = self.resolve(&id.name, true).bound();
                             }
                             self.expr(v);
                         }
