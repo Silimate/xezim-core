@@ -2372,9 +2372,18 @@ impl Rw<'_> {
             ExprKind::AssignmentPattern(items) => {
                 for it in items {
                     match it {
-                        AssignmentPatternItem::Ordered(x)
-                        | AssignmentPatternItem::Named(_, x)
-                        | AssignmentPatternItem::Default(x) => self.expr(x),
+                        AssignmentPatternItem::Ordered(x) | AssignmentPatternItem::Default(x) => {
+                            self.expr(x)
+                        }
+                        AssignmentPatternItem::Named(id, x) => {
+                            // §10.9.1/§10.9.2/§26.3: record a lexically resolved
+                            // colliding package/class typedef on `type_key` while
+                            // preserving `id.ident` for struct member matching.
+                            if let Res::To(m) = self.resolve(&id.name) {
+                                id.type_key = Some(m.into_boxed_str());
+                            }
+                            self.expr(x);
+                        }
                         AssignmentPatternItem::Typed(t, x) => {
                             self.dtype(t);
                             self.expr(x);
@@ -3197,9 +3206,15 @@ impl Rw<'_> {
         items: &mut [ModuleItem],
     ) {
         // §23.2/§6.5: body classes are not visible in header defaults.
+        // §26.3: only module-header imports (leading ImportDeclarations before
+        // body items) are visible in parameter/port headers; body imports take
+        // effect at their declaration point.
         let mut f = Self::module_frame(params, ports, &[]);
         f.module = Some(name.to_string());
-        for it in items.iter() {
+        for it in items
+            .iter()
+            .take_while(|it| matches!(it, ModuleItem::ImportDeclaration(_)))
+        {
             if let ModuleItem::ImportDeclaration(imp) = it {
                 f.add_imports(imp);
             }
@@ -3214,6 +3229,10 @@ impl Rw<'_> {
                 self.unpacked(&mut p.dimensions);
                 self.opt(&mut p.default);
             }
+        }
+        if let Some(hdr) = self.frames.last_mut() {
+            hdr.explicit.clear();
+            hdr.wild.clear();
         }
         let mut body = Frame::default();
         // §23.2/§26.3: the header and body form one module scope.
@@ -3321,7 +3340,12 @@ impl Rw<'_> {
             }
             ModuleItem::FunctionDeclaration(f) => self.function(f),
             ModuleItem::TaskDeclaration(t) => self.task(t),
-            ModuleItem::ImportDeclaration(imp) => self.import_decl(imp),
+            ModuleItem::ImportDeclaration(imp) => {
+                if let Some(f) = self.frames.last_mut() {
+                    f.add_imports(imp);
+                }
+                self.import_decl(imp);
+            }
             ModuleItem::ClassDeclaration(c) => {
                 if self.info.hiding.contains(&c.name.name)
                     && let Res::To(named) = self.resolve(&c.name.name)
@@ -3635,7 +3659,7 @@ fn module_item_names(items: &[ModuleItem], f: &mut Frame) {
             ModuleItem::SequenceDeclaration(s) => {
                 f.values.insert(s.name.name.clone());
             }
-            ModuleItem::ImportDeclaration(imp) => f.add_imports(imp),
+            ModuleItem::ImportDeclaration(_) => {}
             ModuleItem::GenerateRegion(g) => module_item_names(&g.items, f),
             _ => {}
         }
