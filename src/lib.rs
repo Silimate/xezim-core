@@ -254,9 +254,20 @@ pub use value::Value;
 /// \x4d = \x4c + real initializers of 64-bit integral variables and typed package parameters
 ///         held as integers (§6.12.1), and time literals and delays scaled to the unit,
 ///         precision and tick by exact powers of ten (§5.8, §3.14.1).
-/// \x4d = \x4c + assignment pattern type keys bound at every array dimension in
+/// \x4e = \x4d + assignment pattern type keys bound at every array dimension in
 ///         continuous assignments, nettype drivers and parameter values (§10.9.1, §10.9.2).
-pub const XEZIM_BYTECODE_MAGIC: &[u8; 8] = b"XEZIMBC\x4e";
+/// \x4f = \x4e + a named assignment pattern key carries its lexically bound type name, real and
+///         realtime type keys are one type (§10.9.1, §26.3, §6.12), and aliased nets of a
+///         user-defined nettype resolve as one net (§10.11, §6.6.7).
+///         Also typedefs of real classified as real, UDP instance delays in the holding
+///         module's time unit, the declared types of packed-array and structure ports, and
+///         the default actual arguments of named sequences and properties kept in the
+///         elaborated design (§6.18, §3.14.2, §7.4.1, §16.8, §16.12).
+/// Driver contributions, net-cell resolution, delayed structures, interface-array
+/// bounds, sampled input nets and fill-literal state are preserved in this format.
+/// \x56 retains sampled input-formal identities through simulator aliasing (§16.5.1).
+// §10.9.1: continuous packed array defaults retain their element type.
+pub const XEZIM_BYTECODE_MAGIC: &[u8; 8] = b"XEZIMBC\x57";
 
 /// Name of the synthetic root that instantiates every top of a multi-top
 /// design (§23.3.3), each instance named after its module. It is not part of
@@ -842,6 +853,16 @@ fn adopted_lib_files_cell() -> &'static std::sync::Mutex<Vec<(std::path::PathBuf
     ADOPTED_LIB_FILES.get_or_init(|| std::sync::Mutex::new(Vec::new()))
 }
 
+/// A library file's text, decoded as source files and `include`d files are:
+/// a byte sequence that is not UTF-8 (a Latin-1 `®` in a comment) becomes
+/// U+FFFD instead of failing the read, which dropped the whole file.
+fn read_library_file(path: &std::path::Path) -> std::io::Result<String> {
+    std::fs::read(path).map(|bytes| {
+        String::from_utf8(bytes)
+            .unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned())
+    })
+}
+
 pub(crate) fn record_adopted_lib_file(path: std::path::PathBuf, module: &str) {
     if let Ok(mut v) = adopted_lib_files_cell().lock() {
         if let Some((_, mods)) = v.iter_mut().find(|(p, _)| *p == path) {
@@ -863,59 +884,36 @@ pub fn adopted_lib_files() -> Vec<(std::path::PathBuf, Vec<String>)> {
         .unwrap_or_default()
 }
 
-/// The preprocessing context `-v`/`-y` indexing ran under: the include dirs
-/// and the macro snapshot taken AFTER the primary sources (so a library file
-/// sees defines from the design, exactly as `index_library_file` did).
-/// Recorded once per run by `resolve_library_modules`; consumed by
-/// `preprocess_adopted_lib` so `--dump-merged-sv` can append library text
-/// with includes/macros resolved instead of raw bytes (raw text broke
-/// standalone re-compiles of the merged file the moment it left the original
-/// directory).
-static ADOPTED_LIB_PP_CONTEXT: std::sync::OnceLock<
-    std::sync::Mutex<Option<(Vec<String>, Vec<(String, preprocessor::MacroDef)>)>>,
+/// The text each adopted library file's definitions were parsed from, as
+/// `-v`/`-y` indexing preprocessed it (§22.5.1: from the design's macros and
+/// those of the library files read before it), or `None` when that
+/// preprocessing reported errors. Only adopted files are kept, the first
+/// read of a file named twice; recorded by `resolve_library_modules` and
+/// consumed by `preprocess_adopted_lib`, so `--dump-merged-sv` can append
+/// library text with includes and macros resolved instead of raw bytes (raw
+/// text broke standalone re-compiles of the merged file the moment it left
+/// the original directory).
+static ADOPTED_LIB_TEXTS: std::sync::OnceLock<
+    std::sync::Mutex<
+        std::collections::HashMap<std::path::PathBuf, Option<std::sync::Arc<str>>>,
+    >,
 > = std::sync::OnceLock::new();
 
-fn adopted_lib_pp_context_cell()
--> &'static std::sync::Mutex<Option<(Vec<String>, Vec<(String, preprocessor::MacroDef)>)>> {
-    ADOPTED_LIB_PP_CONTEXT.get_or_init(|| std::sync::Mutex::new(None))
+fn adopted_lib_texts_cell() -> &'static std::sync::Mutex<
+    std::collections::HashMap<std::path::PathBuf, Option<std::sync::Arc<str>>>,
+> {
+    ADOPTED_LIB_TEXTS.get_or_init(Default::default)
 }
 
-pub(crate) fn record_adopted_lib_pp_context(
-    include_dirs: &[String],
-    lib_defines: &std::collections::HashMap<String, preprocessor::MacroDef>,
-) {
-    if let Ok(mut g) = adopted_lib_pp_context_cell().lock() {
-        *g = Some((
-            include_dirs.to_vec(),
-            lib_defines
-                .iter()
-                .map(|(k, v)| (k.clone(), v.clone()))
-                .collect(),
-        ));
-    }
-}
-
-/// Preprocess one adopted library file exactly as the `-v`/`-y` indexing pass
-/// did: a FRESH preprocessor per file with the recorded include dirs and the
-/// post-primary-source macro snapshot, resolving includes relative to the
-/// file itself. Returns None when no context was recorded (no library pass
-/// ran) or when preprocessing reports errors — callers fall back to the raw
-/// bytes so the merged dump still contains the file either way.
+/// One adopted library file's text exactly as the `-v`/`-y` indexing pass
+/// preprocessed it: includes resolved relative to the file, the recorded
+/// include dirs, and the macros that file started from. Returns None for a
+/// file no library pass adopted or whose preprocessing reported errors —
+/// callers fall back to the raw bytes so the merged dump still contains the
+/// file either way.
 pub fn preprocess_adopted_lib(path: &std::path::Path) -> Option<String> {
-    let ctx = adopted_lib_pp_context_cell().lock().ok()?.clone()?;
-    let source = std::fs::read_to_string(path).ok()?;
-    let mut pp = preprocessor::Preprocessor::new();
-    for dir in &ctx.0 {
-        pp.add_include_dir(std::path::PathBuf::from(dir));
-    }
-    for (name, def) in &ctx.1 {
-        pp.define(name.clone(), def.clone());
-    }
-    let text = pp.preprocess_file(&source, Some(path));
-    if !pp.errors().is_empty() {
-        return None;
-    }
-    Some(text)
+    let texts = adopted_lib_texts_cell().lock().ok()?;
+    texts.get(path)?.as_deref().map(str::to_string)
 }
 
 static MODULE_TIMESCALE_CLI: std::sync::OnceLock<std::sync::Mutex<ModuleTimescaleCli>> =
@@ -1468,20 +1466,28 @@ pub fn parse_and_elaborate_multi_preprocessed(
                 _ => None,
             })
             .collect();
+        // §22.5.1: the module pass (`resolve_library_modules`) reads the
+        // `-v` files in this order, each from the macros the design and the
+        // files before it left. Read them the same way here, files without
+        // packages included, so a `` `define `` in one library file picks
+        // the same `` `ifdef `` branch of a later one in both passes: the
+        // package compiled here is then the one the adopted module imports.
+        let mut lib_macros = lib_defines.clone();
         for file in lib_files {
             let path = std::path::PathBuf::from(&file);
             // An unreadable file is reported when the library is indexed.
-            let Ok(text) = std::fs::read_to_string(&path) else {
+            let Ok(text) = read_library_file(&path) else {
                 continue;
             };
             let mut lpp = preprocessor::Preprocessor::new();
             for dir in include_dirs {
                 lpp.add_include_dir(std::path::PathBuf::from(dir));
             }
-            for (name, def) in &lib_defines {
+            for (name, def) in &lib_macros {
                 lpp.define(name.clone(), def.clone());
             }
             let preprocessed = lpp.preprocess_file(&text, Some(&path));
+            lib_macros = lpp.snapshot_defines();
             let line_map = lpp.take_line_map();
             let result = sv_parser::parse(&preprocessed);
             let line_map = line_map.filter(|_| result.source_text == preprocessed);
@@ -2172,6 +2178,7 @@ fn parse_and_elaborate(
                     for item in m.items.drain(..) {
                         if let ast::decl::ModuleItem::NestedModule(inner) = item {
                             let mut inner = *inner;
+                            inner.lexical_parent = Some(m.name.name.clone());
                             hoist_nested(&mut inner, out);
                             out.push(inner);
                         } else {
@@ -2335,6 +2342,7 @@ fn parse_and_elaborate(
             }
             ast::Description::PackageItem(ast::decl::PackageItem::Checker(c)) => {
                 let m = ast::module::ModuleDeclaration {
+                    lexical_parent: None,
                     attrs: Vec::new(),
                     kind: ast::module::ModuleKind::Module,
                     lifetime: None,
@@ -3135,6 +3143,45 @@ fn parse_and_elaborate(
         }
     }
 
+    // §29.8, §28.16: the delays of a UDP instance count the time unit of the
+    // definition holding the instance. Only now is every primitive known
+    // (one may be defined after its first instance, or come from a library).
+    {
+        let udps: std::collections::HashSet<String> = definitions
+            .iter()
+            .filter(|(_, d)| matches!(d, SourceDefinition::Udp(_)))
+            .map(|(n, _)| n.clone())
+            .collect();
+        if !udps.is_empty() {
+            let is_udp = |n: &str| udps.contains(n);
+            for (name, def) in definitions.iter_mut() {
+                let (unit_s, prec_s) = module_timescale_exp
+                    .get(name)
+                    .map(|&(u, p)| (elaborate::exp_to_secs(u), elaborate::exp_to_secs(p)))
+                    .unwrap_or((tick_s, tick_s));
+                match def {
+                    SourceDefinition::Module(rc)
+                        if elaborate::instantiates_udp(&rc.items, &is_udp) =>
+                    {
+                        let m = Rc::make_mut(rc);
+                        elaborate::rewrite_udp_instance_delays(
+                            &mut m.items, &is_udp, unit_s, prec_s, tick_s,
+                        );
+                    }
+                    SourceDefinition::Interface(rc)
+                        if elaborate::instantiates_udp(&rc.items, &is_udp) =>
+                    {
+                        let i = Rc::make_mut(rc);
+                        elaborate::rewrite_udp_instance_delays(
+                            &mut i.items, &is_udp, unit_s, prec_s, tick_s,
+                        );
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
     warn_unapplied_param_overrides(&param_override_hits);
 
     // §6.18 + §3.12.1: a $unit typedef's DIMENSIONS are evaluated in the
@@ -3843,6 +3890,7 @@ fn parse_and_elaborate(
     // §6.6.7: fold user-defined nettype drivers — after inlining, so drivers
     // arriving from several instances through ports resolve together with any
     // written in the parent. Must precede the bitwise fold below.
+    elaborate::stage_vpi_net_drivers(&mut elab);
     elaborate::resolve_user_nettype_drivers(&mut elab)?;
     elab_phase("switches and nettype drivers", &mut phase_t);
     // §7.2.2: a whole-struct continuous assign that arrived through inlining
@@ -4298,6 +4346,7 @@ fn make_multi_top_wrapper(modules: &[String]) -> ast::module::ModuleDeclaration 
         })
         .collect();
     ast::module::ModuleDeclaration {
+        lexical_parent: None,
         attrs: vec![],
         kind: ast::module::ModuleKind::Module,
         lifetime: None,
@@ -4320,9 +4369,6 @@ fn resolve_library_modules(
     lib_cli: &LibraryCli,
     unit_binds: &[ast::decl::BindDirective],
 ) -> Result<(), String> {
-    // Remember this pass's preprocessing context so --dump-merged-sv can
-    // re-preprocess ADOPTED files identically (see preprocess_adopted_lib).
-    record_adopted_lib_pp_context(include_dirs, lib_defines);
     fn collect_sv_files(
         dir: &std::path::Path,
         exts: &[String],
@@ -4370,6 +4416,9 @@ fn resolve_library_modules(
         if path.is_dir() {
             let mut found = Vec::new();
             collect_sv_files(path, &exts, &mut found)?;
+            // Directory order is the filesystem's; the files are read, and
+            // their macros defined, in a fixed order instead.
+            found.sort();
             pending.extend(found);
         }
     }
@@ -4401,12 +4450,18 @@ fn resolve_library_modules(
     // name), so a diagnostic inside an ADOPTED definition names its own file;
     // and the packages library files declared, which are never compiled.
     let mut lib_sources = elaborate::LibrarySources::default();
+    // Per entry of `lib_sources.files`: its file, and whether it preprocessed
+    // without errors (see `preprocess_adopted_lib`).
+    let mut indexed: Vec<(std::path::PathBuf, bool)> = Vec::new();
+    // The macros defined so far: the design's, then each library file's as
+    // it is read (see `index_library_file`).
+    let mut lib_macros = lib_defines.clone();
     #[allow(clippy::too_many_arguments)]
     fn index_library_file(
         path: std::path::PathBuf,
         explicit_v: bool,
         include_dirs: &[String],
-        lib_defines: &std::collections::HashMap<String, preprocessor::MacroDef>,
+        lib_defines: &mut std::collections::HashMap<String, preprocessor::MacroDef>,
         lib_cli: &LibraryCli,
         lib: &mut crate::hasher::HashMap<String, SourceDefinition>,
         lib_typedefs: &mut Vec<Rc<ast::decl::TypedefDeclaration>>,
@@ -4414,8 +4469,9 @@ fn resolve_library_modules(
         parse_issue_files: &mut Vec<std::path::PathBuf>,
         lib_origins: &mut crate::hasher::HashMap<String, (std::path::PathBuf, bool, &'static str)>,
         lib_sources: &mut elaborate::LibrarySources,
+        indexed: &mut Vec<(std::path::PathBuf, bool)>,
     ) {
-        let source = match std::fs::read_to_string(&path) {
+        let source = match read_library_file(&path) {
             Ok(s) => s,
             Err(e) => {
                 eprintln!(
@@ -4431,16 +4487,25 @@ fn resolve_library_modules(
         for dir in include_dirs {
             pp.add_include_dir(std::path::PathBuf::from(dir));
         }
-        for (name, def) in lib_defines {
+        for (name, def) in lib_defines.iter() {
             pp.define(name.clone(), def.clone());
         }
         let preprocessed = pp.preprocess_file(&source, Some(&path));
+        // §22.5.1, §3.12.1: a library file is read as part of the one
+        // compilation, so a macro it defines (or an `include` of the
+        // design's headers defines) stays defined for every library file
+        // read after it, and one it undefines is gone. Each file started
+        // from only the design's macros, so a library module that included
+        // the headers did not share them with the library modules it
+        // instantiates.
+        *lib_defines = pp.snapshot_defines();
         let line_map = pp.take_line_map();
         // A missing `include or illegal directive in a library file: nothing
         // else reports the preprocessor's list on this path.
         for e in pp.errors() {
             eprintln!("{}", e);
         }
+        let preprocessed_cleanly = pp.errors().is_empty();
         let result = sv_parser::parse(&preprocessed);
         // Spans index the re-parsed text; it is the preprocessed text again
         // (nothing is left to expand), so the map applies to it.
@@ -4619,7 +4684,8 @@ fn resolve_library_modules(
             }
             lib_sources
                 .files
-                .push((file_label, result.source_text, line_map));
+                .push((file_label, result.source_text.into(), line_map));
+            indexed.push((path, preprocessed_cleanly));
         }
     }
 
@@ -4628,7 +4694,7 @@ fn resolve_library_modules(
             path,
             explicit_v,
             include_dirs,
-            lib_defines,
+            &mut lib_macros,
             lib_cli,
             &mut lib,
             &mut lib_typedefs,
@@ -4636,6 +4702,7 @@ fn resolve_library_modules(
             &mut parse_issue_files,
             &mut lib_origins,
             &mut lib_sources,
+            &mut indexed,
         );
     }
 
@@ -4678,7 +4745,10 @@ fn resolve_library_modules(
         }
         seed.extend(names);
     }
+    // Resolved in a fixed order: library files are read, and their macros
+    // defined (§22.5.1), in the order their modules are resolved.
     let mut work: Vec<String> = seed.into_iter().collect();
+    work.sort_unstable_by(|a, b| b.cmp(a));
     let mut unresolved: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     let mut adopted_from_v = 0usize;
     let mut adopted: std::collections::HashSet<String> = std::collections::HashSet::new();
@@ -4706,7 +4776,7 @@ fn resolve_library_modules(
                     path,
                     false,
                     include_dirs,
-                    lib_defines,
+                    &mut lib_macros,
                     lib_cli,
                     &mut lib,
                     &mut lib_typedefs,
@@ -4714,6 +4784,7 @@ fn resolve_library_modules(
                     &mut parse_issue_files,
                     &mut lib_origins,
                     &mut lib_sources,
+                    &mut indexed,
                 );
             }
             if !lib.contains_key(&name) && !full_scan_done {
@@ -4723,7 +4794,7 @@ fn resolve_library_modules(
                         path,
                         false,
                         include_dirs,
-                        lib_defines,
+                        &mut lib_macros,
                         lib_cli,
                         &mut lib,
                         &mut lib_typedefs,
@@ -4731,6 +4802,7 @@ fn resolve_library_modules(
                         &mut parse_issue_files,
                         &mut lib_origins,
                         &mut lib_sources,
+                        &mut indexed,
                     );
                 }
             }
@@ -4755,6 +4827,8 @@ fn resolve_library_modules(
             }
             let mut more = std::collections::HashSet::new();
             instantiations(def, &mut more);
+            let mut more: Vec<String> = more.into_iter().collect();
+            more.sort_unstable_by(|a, b| b.cmp(a));
             let mut def = def.clone();
             scope_tree::adopt(&mut def);
             definitions.insert(name.clone(), def);
@@ -4837,7 +4911,7 @@ fn resolve_library_modules(
             let prim_pat = format!("primitive {}", name);
             let prim_pat2 = format!("primitive  {}", name);
             if let Some(f) = scanned_paths.iter().find(|p| {
-                std::fs::read_to_string(p)
+                read_library_file(p)
                     .map(|s| s.contains(&prim_pat) || s.contains(&prim_pat2))
                     .unwrap_or(false)
             }) {
@@ -4872,7 +4946,7 @@ fn resolve_library_modules(
                 path,
                 false,
                 include_dirs,
-                lib_defines,
+                &mut lib_macros,
                 lib_cli,
                 &mut lib,
                 &mut lib_typedefs,
@@ -4880,6 +4954,7 @@ fn resolve_library_modules(
                 &mut parse_issue_files,
                 &mut lib_origins,
                 &mut lib_sources,
+                &mut indexed,
             );
         }
     }
@@ -4893,13 +4968,20 @@ fn resolve_library_modules(
         }
     }
     // Publish only the files an adopted definition came from.
-    let mut slots: Vec<Option<(String, String, Option<sv_parser::source_map::LineMap>)>> =
-        std::mem::take(&mut lib_sources.files)
-            .into_iter()
-            .map(Some)
-            .collect();
+    #[allow(clippy::type_complexity)]
+    let mut slots: Vec<
+        Option<(String, std::sync::Arc<str>, Option<sv_parser::source_map::LineMap>)>,
+    > = std::mem::take(&mut lib_sources.files)
+        .into_iter()
+        .map(Some)
+        .collect();
     let mut renumber: crate::hasher::HashMap<u32, u32> = Default::default();
     let mut def_file: crate::hasher::HashMap<String, u32> = Default::default();
+    #[allow(clippy::type_complexity)]
+    let mut adopted_texts: std::collections::HashMap<
+        std::path::PathBuf,
+        (u32, Option<std::sync::Arc<str>>),
+    > = Default::default();
     for (name, i) in std::mem::take(&mut lib_sources.def_file) {
         if !adopted.contains(&name) {
             continue;
@@ -4910,6 +4992,21 @@ fn resolve_library_modules(
                 let Some(file) = slots.get_mut(i as usize).and_then(Option::take) else {
                     continue;
                 };
+                // `preprocess_adopted_lib`'s text: of the first read that an
+                // adopted definition came from, for a file named twice.
+                if let Some((path, clean)) = indexed.get(i as usize) {
+                    let text = clean.then(|| file.1.clone());
+                    match adopted_texts.entry(path.clone()) {
+                        std::collections::hash_map::Entry::Occupied(mut e) => {
+                            if i < e.get().0 {
+                                e.insert((i, text));
+                            }
+                        }
+                        std::collections::hash_map::Entry::Vacant(e) => {
+                            e.insert((i, text));
+                        }
+                    }
+                }
                 let j = lib_sources.files.len() as u32;
                 lib_sources.files.push(file);
                 renumber.insert(i, j);
@@ -4919,6 +5016,9 @@ fn resolve_library_modules(
         def_file.insert(name, j);
     }
     lib_sources.def_file = def_file;
+    if let Ok(mut g) = adopted_lib_texts_cell().lock() {
+        g.extend(adopted_texts.into_iter().map(|(p, (_, t))| (p, t)));
+    }
     elaborate::set_elab_library_sources(lib_sources);
     Ok(())
 }
