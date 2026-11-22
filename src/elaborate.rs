@@ -45240,7 +45240,7 @@ fn inline_instantiation_items(
                                 if is_if_port {
                                     if !parent_declares_interface(
                                         source_def,
-                                        &prepared_source.effective_items,
+                                        items,
                                         definitions,
                                         interface_map,
                                         &name,
