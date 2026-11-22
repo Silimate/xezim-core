@@ -106,3 +106,22 @@ fn generate_constructor_initializer_is_scheduled_before_initial_blocks() {
         "constructor initializer was discarded"
     );
 }
+
+#[test]
+fn inherited_cast_size_shadows_wildcard_typedefs() {
+    elaborate(
+        r#"
+        package a; typedef logic [2:0] W; endpackage
+        package b; typedef logic [3:0] W; endpackage
+        module top;
+          import a::*; import b::*;
+          class Base; localparam int W = 8; endclass
+          class Middle extends Base; endclass
+          class Child extends Middle;
+            function int narrow(int value); return W'(value); endfunction
+          endclass
+        endmodule
+        "#,
+    )
+    .expect("the inherited localparam supplies the cast size");
+}
