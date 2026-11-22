@@ -40512,16 +40512,22 @@ fn collect_effective_items(
 }
 
 /// §23.3.2.4: whether the instantiating definition `def` holds an
-/// interface named `name` for a `.*` connection to an interface port: an
-/// interface port of its own (bound for this instance in `interface_map`,
-/// or in its header; a non-ANSI header names it without a type), or an
-/// interface instance anywhere in its items or in `items`, the items this
-/// instance elaborates, which include instances a `bind` adds (§23.11).
+/// interface named `name` for a `.*` connection to an interface port of an
+/// instance in generate scope `scope` (`""` at module level, else `g` or
+/// `g.h`): an interface port of its own (bound for this instance in
+/// `interface_map`, or in its header; a non-ANSI header names it without a
+/// type), an interface instance in that scope or one enclosing it among
+/// `items`, the items this instance elaborates (generate conditions applied,
+/// a scope's instances named `g.bus`, plus instances a `bind` adds,
+/// §23.11), or one at module level in `def`'s own items. An interface in
+/// a branch generate did not take, or in another scope, is not visible
+/// (§27.5).
 fn parent_declares_interface(
     def: Definition,
     items: &[ModuleItem],
     definitions: &HashMap<String, Definition>,
     interface_map: &HashMap<String, String>,
+    scope: &str,
     name: &str,
 ) -> bool {
     fn instantiates(
@@ -40570,7 +40576,36 @@ fn parent_declares_interface(
         }
         PortList::Empty => {}
     }
-    instantiates(items, definitions, name) || instantiates(def.items(), definitions, name)
+    // The instance's scope and each scope enclosing it, innermost first.
+    let mut scopes = vec![scope];
+    let mut s = scope;
+    while let Some((outer, _)) = s.rsplit_once('.') {
+        scopes.push(outer);
+        s = outer;
+    }
+    if !scope.is_empty() {
+        scopes.push("");
+    }
+    let visible = scopes.iter().any(|s| {
+        let qualified = if s.is_empty() {
+            name.to_string()
+        } else {
+            format!("{s}.{name}")
+        };
+        instantiates(items, definitions, &qualified)
+    });
+    // `def`'s own items are not generate-expanded: only its module-level
+    // interface instances are seen there, never one inside a generate block.
+    visible
+        || def.items().iter().any(|it| match it {
+            ModuleItem::ModuleInstantiation(mi) => {
+                matches!(
+                    definitions.get(&mi.module_name.name),
+                    Some(Definition::Interface(_))
+                ) && mi.instances.iter().any(|hi| hi.name.name == name)
+            }
+            _ => false,
+        })
 }
 
 fn is_interface_type(dt: &DataType, definitions: &HashMap<String, Definition>) -> bool {
@@ -45283,6 +45318,7 @@ fn inline_instantiation_items(
                                         items,
                                         definitions,
                                         interface_map,
+                                        inst_name.rsplit_once('.').map_or("", |(s, _)| s),
                                         &name,
                                     ) {
                                         wild_missing.insert(name.clone());

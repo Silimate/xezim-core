@@ -39,6 +39,10 @@ fn an_unconnected_interface_port_is_an_error_unless_relaxed() {
         ("gen g (.o(o));", "bus"),
         // `.*` with no interface named `bus` in the parent (§23.3.2.4).
         ("gen g (.*);", "bus"),
+        // §27.5: an interface in a branch generate did not take, or in
+        // another generate scope, is not visible to the instance.
+        ("if (0) begin : g0 mem_if bus (); end gen g (.*);", "bus"),
+        ("if (1) begin : g1 mem_if bus (); end gen g (.*);", "bus"),
     ] {
         let err = elaborate(inst).expect_err(inst);
         assert!(
@@ -54,6 +58,10 @@ fn an_unconnected_interface_port_is_an_error_unless_relaxed() {
         "dut u (.*);",
         "dut u (.clk, .mem, .q);",
         "gen g (.bus(mem), .o(o));",
+        // The interface in the instance's own generate scope, or one
+        // enclosing it, fills the `.*` port.
+        "if (1) begin : g1 mem_if bus (); gen g (.*); end",
+        "mem_if bus (); if (1) begin : g1 gen g (.*); end",
     ] {
         elaborate(inst).unwrap_or_else(|e| panic!("{inst}: {e}"));
     }
