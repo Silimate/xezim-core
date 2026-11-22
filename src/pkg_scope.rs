@@ -34,8 +34,6 @@
 //! Names declared in one place only are left alone, so a design without
 //! such a collision is not touched at all.
 
-use std::collections::BTreeSet;
-
 use crate::hasher::{HashMap, HashSet};
 
 use crate::ast::Description;
@@ -746,6 +744,15 @@ fn mangle(pkg: &str, name: &str) -> String {
     format!("{}::{}", pkg, name)
 }
 
+/// `'a' and 'b'`, `'a', 'b' and 'c'`.
+fn quoted_list(names: &[String]) -> String {
+    let q: Vec<String> = names.iter().map(|n| format!("'{n}'")).collect();
+    match q.split_last() {
+        Some((last, rest)) if !rest.is_empty() => format!("{} and {last}", rest.join(", ")),
+        _ => q.join(""),
+    }
+}
+
 /// One lexical scope's names, innermost last on the walker's stack.
 #[derive(Default)]
 struct Frame {
@@ -794,7 +801,17 @@ impl Frame {
 enum Res {
     Keep,
     To(String),
-    Ambiguous(Vec<String>),
+    /// The declaring packages, and the scope that imports them.
+    Ambiguous(Vec<String>, String),
+}
+
+/// What the wildcard imports of one scope offer for a name (see
+/// `Rw::wild_candidate`).
+enum Wild {
+    None,
+    One(String),
+    /// The declaring packages, in the order of the imports.
+    Many(Vec<String>),
 }
 
 struct Rw<'a> {
@@ -807,6 +824,10 @@ struct Rw<'a> {
     in_const: u32,
     /// Nesting of `inline_type` replacements being walked (a guard).
     inline_depth: u32,
+    /// (scope, name, packages in import order) already warned about under
+    /// --relax-wildcard-import-conflict. Two scopes that share a label but
+    /// import in another order pick another package, so warn again.
+    warned: std::cell::RefCell<HashSet<(String, String, Vec<String>)>>,
 }
 
 /// A name looked up in a class and its bases.
@@ -876,6 +897,7 @@ pub fn qualify_colliding_package_types(descs: &mut [Description]) -> Result<(), 
         errors: Vec::new(),
         in_const: 0,
         inline_depth: 0,
+        warned: Default::default(),
     };
     let unit = unit_frame(descs);
     rw.frames.push(unit);
@@ -891,6 +913,12 @@ pub fn qualify_colliding_package_types(descs: &mut [Description]) -> Result<(), 
 /// Gather every package's type names and imports; `None` when no type name
 /// is declared by a package and anywhere else (nothing to do).
 fn collect(descs: &[Description]) -> Option<Info> {
+    let all_classes = design_classes(descs);
+    // Classes also need qualification without packages. Otherwise a design
+    // with no packages cannot contribute any colliding names to this pass.
+    if all_classes.is_empty() && !descs.iter().any(|d| matches!(d, Description::Package(_))) {
+        return None;
+    }
     let mut pkgs: HashMap<String, PkgInfo> = HashMap::default();
     let mut other: HashSet<String> = HashSet::default();
     let mut other_members: HashSet<String> = HashSet::default();
@@ -1060,7 +1088,6 @@ fn collect(descs: &[Description]) -> Option<Info> {
     };
     // §8.3: a class is a scope of its own; a type name a class declares
     // collides when it is declared anywhere else as well.
-    let all_classes = design_classes(descs);
     let mut lexical_counts: HashMap<&str, usize> = HashMap::default();
     for (scope, c) in &all_classes {
         if !matches!(scope, ClassScope::Package(_)) {
@@ -1415,6 +1442,71 @@ impl Rw<'_> {
         }
     }
 
+    /// §26.3: the packages whose declaration of `n` the wildcard imports of
+    /// `f` offer (`owner` maps an imported package to the one declaring `n`
+    /// there). One is the binding, which `bound` records; more than one
+    /// makes `n` invisible here. With --relax-wildcard-import-conflict the
+    /// first of them in the order of the imports is the binding instead,
+    /// with a warning naming them.
+    fn wild_candidate(&self, f: &Frame, n: &str, owner: impl Fn(&str) -> Option<String>) -> Wild {
+        let mut cands: Vec<String> = Vec::new();
+        for q in &f.wild {
+            if let Some(o) = owner(q.as_str())
+                && !cands.contains(&o)
+            {
+                cands.push(o);
+            }
+        }
+        if cands.len() > 1 && !crate::sv_parser::RELAX_WILDCARD_IMPORT_CONFLICT.get() {
+            return Wild::Many(cands);
+        }
+        let Some(first) = cands.first().cloned() else {
+            return Wild::None;
+        };
+        if cands.len() > 1 {
+            self.warn_conflict(f, n, &cands);
+        }
+        Self::bind_wild(f, n, |q| owner(q).is_some());
+        Wild::One(first)
+    }
+
+    /// The scope a frame belongs to, in a diagnostic: the nearest package or
+    /// module at or around it (a module's body is a frame of its own).
+    fn scope_label(&self, f: &Frame) -> String {
+        let at = self
+            .frames
+            .iter()
+            .position(|g| std::ptr::eq(g, f))
+            .unwrap_or(0);
+        for g in self.frames[..=at].iter().rev() {
+            if let Some(p) = &g.pkg {
+                return format!("package '{p}'");
+            }
+            if let Some(m) = &g.module {
+                return format!("'{m}'");
+            }
+        }
+        "the compilation unit".to_string()
+    }
+
+    fn warn_conflict(&self, f: &Frame, n: &str, pkgs: &[String]) {
+        let scope = self.scope_label(f);
+        if !self
+            .warned
+            .borrow_mut()
+            .insert((scope.clone(), n.to_string(), pkgs.to_vec()))
+        {
+            return;
+        }
+        crate::elab_diag(format!(
+            "[xezim][warning] '{n}' is declared by {}, all wildcard-imported into {scope}, \
+             so it is not visible there (IEEE 1800-2023 §26.3); using '{}::{n}', the first \
+             import, because --relax-wildcard-import-conflict is in effect",
+            quoted_list(pkgs),
+            pkgs[0],
+        ));
+    }
+
     fn resolve(&self, n: &str) -> Res {
         let pkg_col = self.info.colliding.contains(n);
         let cls_col = self.info.class_colliding.contains(n);
@@ -1462,21 +1554,39 @@ impl Rw<'_> {
                     None => Res::Keep,
                 };
             }
-            let cands: BTreeSet<String> = f
-                .wild
-                .iter()
-                .filter_map(|q| self.info.owner(q, n, 0))
-                .collect();
-            if cands.len() == 1 {
-                Self::bind_wild(f, n, |q| self.info.owner(q, n, 0).is_some());
-            }
-            match cands.len() {
-                0 => {}
-                1 => return Res::To(mangle(cands.first().unwrap(), n)),
-                _ => return Res::Ambiguous(cands.into_iter().collect()),
+            match self.wild_candidate(f, n, |q| self.info.owner(q, n, 0)) {
+                Wild::None => {}
+                Wild::One(o) => return Res::To(mangle(&o, n)),
+                Wild::Many(c) => return Res::Ambiguous(c, self.scope_label(f)),
             }
         }
         Res::Keep
+    }
+
+    /// --relax-wildcard-import-conflict, and `n` is an enum member that the
+    /// wildcard imports of the nearest scope offering it provide from more
+    /// than one package.
+    fn relaxed_member(&self, n: &str) -> bool {
+        if !crate::sv_parser::RELAX_WILDCARD_IMPORT_CONFLICT.get()
+            || !self.info.colliding_members.contains(n)
+        {
+            return false;
+        }
+        self.frames
+            .iter()
+            .rev()
+            .find_map(|f| {
+                let mut owners: Vec<String> = Vec::new();
+                for q in &f.wild {
+                    if let Some(o) = self.info.member_owner(q, n, 0)
+                        && !owners.contains(&o)
+                    {
+                        owners.push(o);
+                    }
+                }
+                (!owners.is_empty()).then_some(owners.len() > 1)
+            })
+            .unwrap_or(false)
     }
 
     /// The package whose enum member a bare `n` denotes, when that is not
@@ -1502,19 +1612,11 @@ impl Rw<'_> {
             if let Some(q) = f.explicit.get(n).or(f.bound.borrow().get(n)) {
                 return self.info.member_owner(q, n, 0);
             }
-            let cands: BTreeSet<String> = f
-                .wild
-                .iter()
-                .filter_map(|q| self.info.member_owner(q, n, 0))
-                .collect();
-            if cands.len() == 1 {
-                Self::bind_wild(f, n, |q| self.info.member_owner(q, n, 0).is_some());
-            }
-            match cands.len() {
-                0 => {}
-                1 => return cands.into_iter().next(),
+            match self.wild_candidate(f, n, |q| self.info.member_owner(q, n, 0)) {
+                Wild::None => {}
+                Wild::One(o) => return Some(o),
                 // Not visible (§26.3); left to the existing diagnostics.
-                _ => return None,
+                Wild::Many(_) => return None,
             }
         }
         None
@@ -1563,18 +1665,10 @@ impl Rw<'_> {
             if let Some(q) = f.explicit.get(n).or(f.bound.borrow().get(n)) {
                 return self.info.value_owner(q, n, 0);
             }
-            let cands: BTreeSet<String> = f
-                .wild
-                .iter()
-                .filter_map(|q| self.info.value_owner(q, n, 0))
-                .collect();
-            if cands.len() == 1 {
-                Self::bind_wild(f, n, |q| self.info.value_owner(q, n, 0).is_some());
-            }
-            match cands.len() {
-                0 => {}
-                1 => return cands.into_iter().next(),
-                _ => return None,
+            match self.wild_candidate(f, n, |q| self.info.value_owner(q, n, 0)) {
+                Wild::None => {}
+                Wild::One(o) => return Some(o),
+                Wild::Many(_) => return None,
             }
         }
         None
@@ -1612,24 +1706,10 @@ impl Rw<'_> {
                     .filter(|o| declares(o))
                     .map(|o| mangle(&o, n));
             }
-            let cands: BTreeSet<String> = f
-                .wild
-                .iter()
-                .filter_map(|q| self.info.value_owner(q, n, 0))
-                .collect();
-            if cands.len() == 1 {
-                Self::bind_wild(f, n, |q| self.info.value_owner(q, n, 0).is_some());
-            }
-            match cands.len() {
-                0 => {}
-                1 => {
-                    return cands
-                        .into_iter()
-                        .next()
-                        .filter(|o| declares(o))
-                        .map(|o| mangle(&o, n));
-                }
-                _ => return None,
+            match self.wild_candidate(f, n, |q| self.info.value_owner(q, n, 0)) {
+                Wild::None => {}
+                Wild::One(o) => return Some(o).filter(|o| declares(o)).map(|o| mangle(&o, n)),
+                Wild::Many(_) => return None,
             }
         }
         None
@@ -1848,23 +1928,45 @@ impl Rw<'_> {
     }
 
     fn value_shadowed(&self, n: &str) -> bool {
-        self.frames.iter().any(|f| f.values.contains(n))
+        for f in self.frames.iter().rev() {
+            if f.values.contains(n) {
+                return true;
+            }
+            if f.types.contains(n) {
+                return false;
+            }
+            // §8.13: a method can use a value from its class or a base as a
+            // cast size. A nearer type declaration hides a more distant value.
+            for class in f.cls.iter().chain(&f.bases) {
+                let Some(ci) = self.info.classes.get(class) else {
+                    continue;
+                };
+                if ci.values.contains(n) {
+                    return true;
+                }
+                if ci.typedefs.contains(n)
+                    || ci.types.contains(n)
+                    || ci.params.iter().any(|p| p.name == n)
+                {
+                    return false;
+                }
+            }
+        }
+        false
     }
 
     fn is_package(&self, n: &str) -> bool {
         self.info.pkgs.contains_key(n) && !self.value_shadowed(n)
     }
 
-    fn ambiguous(&mut self, n: &str, pkgs: &[String]) {
-        let list: Vec<String> = pkgs.iter().map(|p| format!("'{}'", p)).collect();
+    fn ambiguous(&mut self, n: &str, pkgs: &[String], scope: &str) {
         self.errors.push(format!(
-            "type '{}' is declared by more than one wildcard-imported package ({}), so it \
-             is not visible here; import it explicitly or qualify it (`{}::{}`) \
-             (IEEE 1800-2017 §26.3)",
-            n,
-            list.join(", "),
+            "type '{n}' is declared by more than one wildcard-imported package ({}, all \
+             imported into {scope}), so it is not visible here (IEEE 1800-2023 §26.3); import \
+             it explicitly or qualify it (`{}::{n}`), or pass --relax-wildcard-import-conflict \
+             to use the first import",
+            quoted_list(pkgs),
             pkgs[0],
-            n
         ));
     }
 
@@ -1873,9 +1975,9 @@ impl Rw<'_> {
         match self.resolve(&id.name) {
             Res::Keep => {}
             Res::To(m) => id.name = m,
-            Res::Ambiguous(c) => {
+            Res::Ambiguous(c, scope) => {
                 let n = id.name.clone();
-                self.ambiguous(&n, &c);
+                self.ambiguous(&n, &c, &scope);
             }
         }
     }
@@ -2234,12 +2336,15 @@ impl Rw<'_> {
                             );
                             return;
                         }
-                    } else if self.in_const == 0 {
+                    } else if self.in_const == 0 || self.relaxed_member(n) {
                         // §26.3 / §6.19: an enum member of a package, named
                         // bare where that package's declaration is the one in
                         // scope. All packages' members share one flat table,
                         // where the last package registered wins, so spell
                         // the reference `pkg::NAME` — the qualified lookup.
+                        // In a constant context only for a member that the
+                        // relaxation resolves, so a constant and a run-time
+                        // reference get the same import's value.
                         if let Some(p) = self.resolve_member(n) {
                             let span = e.span;
                             let member = h.path[0].name.clone();
@@ -2291,9 +2396,18 @@ impl Rw<'_> {
             ExprKind::AssignmentPattern(items) => {
                 for it in items {
                     match it {
-                        AssignmentPatternItem::Ordered(x)
-                        | AssignmentPatternItem::Named(_, x)
-                        | AssignmentPatternItem::Default(x) => self.expr(x),
+                        AssignmentPatternItem::Ordered(x) | AssignmentPatternItem::Default(x) => {
+                            self.expr(x)
+                        }
+                        AssignmentPatternItem::Named(id, x) => {
+                            // §10.9.1/§10.9.2/§26.3: record a lexically resolved
+                            // colliding package/class typedef on `type_key` while
+                            // preserving `id.ident` for struct member matching.
+                            if let Res::To(m) = self.resolve(&id.name) {
+                                id.type_key = Some(m.into_boxed_str());
+                            }
+                            self.expr(x);
+                        }
                         AssignmentPatternItem::Typed(t, x) => {
                             self.dtype(t);
                             self.expr(x);
@@ -2306,6 +2420,19 @@ impl Rw<'_> {
                 }
             }
             ExprKind::SystemCall { name, args } => {
+                // `T'(v)`: `T` is a type, so a name that two wildcard imports
+                // make invisible is reported here, naming the packages, rather
+                // than as an undeclared identifier later (§26.3). Otherwise the
+                // walk below renames it as any expression-position type name.
+                if name == "$__xz_named_cast"
+                    && let Some(n) = args.first().and_then(plain_ident)
+                    && self.info.colliding.contains(n)
+                    && !self.value_shadowed(n)
+                    && let Res::Ambiguous(c, scope) = self.resolve(n)
+                {
+                    let n = n.to_string();
+                    self.ambiguous(&n, &c, &scope);
+                }
                 args.iter_mut().for_each(|a| self.expr(a));
                 // `payload_t'(v)` whose typedef was replaced by a type.
                 if name == "$__xz_named_cast"
@@ -2338,15 +2465,17 @@ impl Rw<'_> {
                     let tokens = Lexer::new(args_text).tokenize();
                     let mut edits = Vec::new();
                     for (i, token) in tokens.iter().enumerate() {
-                        if token.kind == TokenKind::Identifier
-                            && self.info.hiding.contains(&token.text)
-                            && !self.value_shadowed(&token.text)
-                            && !i.checked_sub(1).is_some_and(|p| {
-                                matches!(tokens[p].kind, TokenKind::Dot | TokenKind::DoubleColon)
-                            })
-                            && let Res::To(named) = self.resolve(&token.text)
-                        {
-                            edits.push((token.span, named));
+                        if token.kind == TokenKind::Identifier {
+                            let name = tokens.text(token);
+                            if self.info.hiding.contains(name.as_ref())
+                                && !self.value_shadowed(&name)
+                                && !i.checked_sub(1).is_some_and(|p| {
+                                    matches!(tokens[p].kind, TokenKind::Dot | TokenKind::DoubleColon)
+                                })
+                                && let Res::To(named) = self.resolve(&name)
+                            {
+                                edits.push((tokens.span(token), named));
+                            }
                         }
                     }
                     for (span, named) in edits.into_iter().rev() {
@@ -2500,7 +2629,9 @@ impl Rw<'_> {
                 rvalue,
             } => {
                 self.expr(lvalue);
-                self.opt(delay);
+                if let Some(delay) = delay {
+                    self.expr(delay);
+                }
                 self.expr(rvalue);
             }
             StatementKind::If {
@@ -2522,7 +2653,7 @@ impl Rw<'_> {
                     if let Some(p) = &mut it.pattern {
                         self.pattern(p);
                     }
-                    self.opt(&mut it.guard);
+                    self.opt_box(&mut it.guard);
                     self.stmt(&mut it.stmt);
                 }
             }
@@ -2714,7 +2845,7 @@ impl Rw<'_> {
     fn declarators(&mut self, ds: &mut [VarDeclarator]) {
         for d in ds {
             self.unpacked(&mut d.dimensions);
-            self.opt(&mut d.init);
+            self.opt_box(&mut d.init);
         }
     }
 
@@ -3012,7 +3143,10 @@ impl Rw<'_> {
                     | ClassMethodKind::Extern(fd) => self.function(fd),
                     ClassMethodKind::Task(td) => self.task(td),
                 },
-                ClassItem::Constraint(cc) => cc.items.iter_mut().for_each(|i| self.constraint(i)),
+                ClassItem::Constraint(cc) => std::sync::Arc::make_mut(cc)
+                    .items
+                    .iter_mut()
+                    .for_each(|i| self.constraint(i)),
                 ClassItem::Typedef(td) => {
                     // §8.3/§6.18: a class typedef whose name is declared
                     // elsewhere too is renamed to its class-qualified spelling.
@@ -3098,9 +3232,15 @@ impl Rw<'_> {
         items: &mut [ModuleItem],
     ) {
         // §23.2/§6.5: body classes are not visible in header defaults.
+        // §26.3: only module-header imports (leading ImportDeclarations before
+        // body items) are visible in parameter/port headers; body imports take
+        // effect at their declaration point.
         let mut f = Self::module_frame(params, ports, &[]);
         f.module = Some(name.to_string());
-        for it in items.iter() {
+        for it in items
+            .iter()
+            .take_while(|it| matches!(it, ModuleItem::ImportDeclaration(_)))
+        {
             if let ModuleItem::ImportDeclaration(imp) = it {
                 f.add_imports(imp);
             }
@@ -3115,6 +3255,10 @@ impl Rw<'_> {
                 self.unpacked(&mut p.dimensions);
                 self.opt(&mut p.default);
             }
+        }
+        if let Some(hdr) = self.frames.last_mut() {
+            hdr.explicit.clear();
+            hdr.wild.clear();
         }
         let mut body = Frame::default();
         // §23.2/§26.3: the header and body form one module scope.
@@ -3143,12 +3287,12 @@ impl Rw<'_> {
             }
             ModuleItem::NetDeclaration(n) => {
                 self.dtype(&mut n.data_type);
-                self.opt(&mut n.delay);
-                self.opt(&mut n.delay_fall);
-                self.opt(&mut n.delay_off);
+                self.opt_box(&mut n.delay);
+                self.opt_box(&mut n.delay_fall);
+                self.opt_box(&mut n.delay_off);
                 for d in &mut n.declarators {
                     self.unpacked(&mut d.dimensions);
-                    self.opt(&mut d.init);
+                    self.opt_box(&mut d.init);
                 }
             }
             ModuleItem::DataDeclaration(d) => {
@@ -3172,9 +3316,9 @@ impl Rw<'_> {
             ModuleItem::InitialConstruct(i) => self.body(&mut i.stmt),
             ModuleItem::FinalConstruct(f) => self.body(&mut f.stmt),
             ModuleItem::ContinuousAssign(ca) => {
-                self.opt(&mut ca.delay);
-                self.opt(&mut ca.delay_fall);
-                self.opt(&mut ca.delay_off);
+                self.opt_box(&mut ca.delay);
+                self.opt_box(&mut ca.delay_fall);
+                self.opt_box(&mut ca.delay_off);
                 for (l, r) in &mut ca.assignments {
                     self.expr(l);
                     self.expr(r);
@@ -3184,6 +3328,7 @@ impl Rw<'_> {
             ModuleItem::GateInstantiation(g) => {
                 self.opt(&mut g.delay);
                 self.opt(&mut g.delay_fall);
+                self.opt(&mut g.delay_off);
                 for i in &mut g.instances {
                     i.terminals.iter_mut().for_each(|t| self.expr(t));
                 }
@@ -3222,7 +3367,12 @@ impl Rw<'_> {
             }
             ModuleItem::FunctionDeclaration(f) => self.function(f),
             ModuleItem::TaskDeclaration(t) => self.task(t),
-            ModuleItem::ImportDeclaration(imp) => self.import_decl(imp),
+            ModuleItem::ImportDeclaration(imp) => {
+                if let Some(f) = self.frames.last_mut() {
+                    f.add_imports(imp);
+                }
+                self.import_decl(imp);
+            }
             ModuleItem::ClassDeclaration(c) => {
                 if self.info.hiding.contains(&c.name.name)
                     && let Res::To(named) = self.resolve(&c.name.name)
@@ -3245,8 +3395,8 @@ impl Rw<'_> {
             }
             ModuleItem::CovergroupDeclaration(cg) => self.covergroup(cg),
             ModuleItem::ClockingDeclaration(cd) => {
-                self.opt(&mut cd.default_input_skew);
-                self.opt(&mut cd.default_output_skew);
+                self.opt_box(&mut cd.default_input_skew);
+                self.opt_box(&mut cd.default_output_skew);
                 for s in &mut cd.signals {
                     self.opt(&mut s.skew);
                     self.opt(&mut s.bound_to);
@@ -3359,7 +3509,7 @@ impl Rw<'_> {
                 self.dtype(&mut nd.data_type);
                 for d in &mut nd.declarators {
                     self.unpacked(&mut d.dimensions);
-                    self.opt(&mut d.init);
+                    self.opt_box(&mut d.init);
                     if let Some(p) = pkg {
                         if self.info.mangled_vars.contains(&d.name.name) {
                             d.name.name = mangle(p, &d.name.name);
@@ -3536,7 +3686,7 @@ fn module_item_names(items: &[ModuleItem], f: &mut Frame) {
             ModuleItem::SequenceDeclaration(s) => {
                 f.values.insert(s.name.name.clone());
             }
-            ModuleItem::ImportDeclaration(imp) => f.add_imports(imp),
+            ModuleItem::ImportDeclaration(_) => {}
             ModuleItem::GenerateRegion(g) => module_item_names(&g.items, f),
             _ => {}
         }
@@ -3604,7 +3754,7 @@ endmodule
                     StatementKind::SeqBlock { stmts, .. } => stmts,
                     _ => panic!("expected a block"),
                 },
-                ModuleItem::FunctionDeclaration(f) => f.items.into_vec(),
+                ModuleItem::FunctionDeclaration(f) => f.items,
                 _ => continue,
             };
             assert_eq!(declared_type(&stmts[0]), "copper::word_t");

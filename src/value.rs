@@ -548,14 +548,9 @@ impl Value {
         }
     }
 
-    /// Hard ceiling on a single Value's bit width (1 Mibit ≈ 128 KiB of `Wide`
-    /// storage). No legitimate scalar/packed value is this wide; a larger width
-    /// is always an artifact of a parameter underflow — e.g. `[N-1:0]` or a
-    /// part-select/`infer_lhs_width` where N resolved to 0, so `N-1` wrapped to
-    /// ~u32::MAX. Without this cap such a width allocates multiple GB and OOMs
-    /// the run (notably black-parrot config-table extraction the const-evaluator
-    /// can't resolve). Matches `elaborate::SANE_MAX_PACKED_WIDTH`.
-    pub const MAX_WIDTH: u32 = 1 << 20;
+    /// Absolute storage limit in bits. The default declaration limit is lower
+    /// and can be raised for large packed behavioural memories.
+    pub const MAX_WIDTH: u32 = 1 << 27;
 
     /// Clamp an absurd (underflowed) width to `MAX_WIDTH`, warning once.
     ///
@@ -3048,6 +3043,12 @@ impl Value {
     /// and combined bitwise.
     #[inline]
     pub fn merge_unknown(&self, other: &Value) -> Value {
+        // §11.4.11, Table 7-1: unequal real arms yield the default real
+        // value. Equality is numeric after conversion to the result type.
+        if self.is_real || other.is_real {
+            let a = self.to_f64();
+            return Self::from_f64(if a == other.to_f64() { a } else { 0.0 });
+        }
         if let Some((a, b, w)) = self.wide_bitwise_pair(other) {
             let bits = Self::wide_bitwise_lanes(
                 a,
@@ -3694,6 +3695,9 @@ impl Value {
     /// says "either operand". A hard mismatch on a non-wildcard bit
     /// forces the result to 0; otherwise the result is 1.
     pub fn wildcard_eq(&self, other: &Value) -> Value {
+        if let Some((lhs, rhs)) = self.fill_pair(other) {
+            return lhs.wildcard_eq(&rhs);
+        }
         // SV §11.4.6: only x/z bits in the RIGHT operand (the pattern) are
         // wildcards (don't-cares). An x/z in the LEFT operand at a non-masked
         // position is NOT a wildcard — it makes the result x, unless some

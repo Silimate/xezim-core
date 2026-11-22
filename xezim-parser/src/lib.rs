@@ -131,7 +131,7 @@ pub fn census_session() -> CensusSession {
 
 /// Add one token stream to the process-wide [`ReferenceCensus`]. Called for
 /// every stream the parser is built over, so nothing parsed escapes it.
-pub fn record_reference_census(tokens: &[lexer::Token]) {
+pub fn record_reference_census(tokens: &lexer::TokenStream<'_>) {
     use lexer::token::TokenKind as K;
     let mut guard = REFERENCE_CENSUS.lock().unwrap_or_else(|e| e.into_inner());
     let census = guard.get_or_insert_with(ReferenceCensus::default);
@@ -207,7 +207,8 @@ pub fn record_reference_census(tokens: &[lexer::Token]) {
                 let unit_level =
                     regions.last() != Some(&Region::Unit) || regions.contains(&Region::Class);
                 if unit_level {
-                    let n = bare(&tok.text);
+                    let text = tokens.text(tok);
+                    let n = bare(&text);
                     if !census.unit_idents.contains(n) {
                         census.unit_idents.insert(n.to_string());
                     }
@@ -223,7 +224,8 @@ pub fn record_reference_census(tokens: &[lexer::Token]) {
                 }
                 if let Some(next) = tokens.get(i + 1) {
                     if matches!(next.kind, K::Identifier | K::EscapedIdentifier) {
-                        let n = bare(&next.text);
+                        let text = tokens.text(next);
+                        let n = bare(&text);
                         if !census.dotted.contains(n) {
                             census.dotted.insert(n.to_string());
                         }
@@ -233,19 +235,23 @@ pub fn record_reference_census(tokens: &[lexer::Token]) {
             // `\a.b ` is ONE identifier whose name holds a dot; the flat
             // namespace cannot tell it from the path `a.b`, so count every
             // component after a dot as dotted too.
-            K::EscapedIdentifier if tok.text.contains('.') => {
-                for part in bare(&tok.text).split('.').skip(1) {
-                    census.dotted.insert(part.to_string());
+            K::EscapedIdentifier => {
+                let text = tokens.text(tok);
+                if text.contains('.') {
+                    for part in bare(&text).split('.').skip(1) {
+                        census.dotted.insert(part.to_string());
+                    }
                 }
             }
             K::SystemIdentifier => {
-                if !census.system_names.contains(tok.text.as_str()) {
-                    census.system_names.insert(tok.text.clone());
+                let text = tokens.text(tok);
+                if !census.system_names.contains(text.as_ref()) {
+                    census.system_names.insert(text.into_owned());
                 }
             }
             K::KwImport | K::KwExport => {
                 if let Some(next) = tokens.get(i + 1) {
-                    if matches!(next.kind, K::StringLiteral) && next.text.contains("DPI") {
+                    if matches!(next.kind, K::StringLiteral) && tokens.text(next).contains("DPI") {
                         census.dpi = true;
                         return;
                     }
@@ -423,8 +429,25 @@ pub static RELAX_LIBRARY_PACKAGES: RelaxFlag = RelaxFlag::new(
     "compile the packages a -v library file declares, as if the file were also a source file",
 );
 
+/// §26.3: a name that two wildcard-imported packages declare resolves to
+/// the first of those imports in source order (checked when package names
+/// are resolved, before elaboration; the flag lives here with the others).
+pub static RELAX_WILDCARD_IMPORT_CONFLICT: RelaxFlag = RelaxFlag::new(
+    "wildcard-import-conflict",
+    "XEZIM_RELAX_WILDCARD_IMPORT_CONFLICT",
+    "resolve a name that two wildcard-imported packages declare to the first of those imports in source order (§26.3)",
+);
+
+/// §25.3: an instance that leaves an interface port unconnected is
+/// elaborated (checked at elaboration; the flag lives here with the others).
+pub static RELAX_UNCONNECTED_INTERFACE_PORT: RelaxFlag = RelaxFlag::new(
+    "unconnected-interface-port",
+    "XEZIM_RELAX_UNCONNECTED_INTERFACE_PORT",
+    "elaborate an instance that leaves an interface port unconnected (§25.3)",
+);
+
 /// Every parser relaxation, for command-line options and cache keys.
-pub fn relax_flags() -> [&'static RelaxFlag; 10] {
+pub fn relax_flags() -> [&'static RelaxFlag; 12] {
     [
         &RELAX_DUPLICATE_DECLS,
         &RELAX_ENUM_NO_BASE,
@@ -436,6 +459,8 @@ pub fn relax_flags() -> [&'static RelaxFlag; 10] {
         &RELAX_CROSS_HIER_ITEM,
         &RELAX_USE_BEFORE_DECL,
         &RELAX_LIBRARY_PACKAGES,
+        &RELAX_WILDCARD_IMPORT_CONFLICT,
+        &RELAX_UNCONNECTED_INTERFACE_PORT,
     ]
 }
 
@@ -582,6 +607,7 @@ fn parse_impl(
     let source_text = parser.parse_source_text();
 
     let (errors, warnings) = partition_diagnostics(parser.diagnostics());
+    drop(parser);
 
     ParseResult {
         source_text: processed,
@@ -651,10 +677,10 @@ pub fn parse_multi(sources: &[&str]) -> ParseResult {
 }
 
 /// Tokenize a SystemVerilog source string (lex only, no parsing).
-pub fn tokenize(source: &str) -> Vec<lexer::Token> {
+pub fn tokenize(source: &str) -> Vec<lexer::OwnedToken> {
     let mut pp = preprocessor::Preprocessor::new();
     let processed = pp.preprocess(source);
-    lexer::Lexer::new(&processed).tokenize()
+    lexer::Lexer::new(&processed).tokenize().to_owned_tokens()
 }
 
 /// Preprocess a SystemVerilog source string (macro expansion, include handling).
