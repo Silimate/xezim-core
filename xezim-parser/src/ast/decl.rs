@@ -569,6 +569,10 @@ pub enum DPIProperty {
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct ClockingDeclaration {
     pub name: Identifier,
+    /// §14.3, §23.9: the block's declaration in its definition's tree, from
+    /// the binder; a generate block's copies rename the block by it.
+    #[cfg_attr(feature = "serde", serde(skip))]
+    pub decl: super::binding::Bound,
     /// LRM §14.3: clock event (e.g. `@(posedge clk)`). The signal
     /// expression is captured so the simulator can snapshot input
     /// signals before each clock edge. None when the clocking block
@@ -622,6 +626,10 @@ pub struct ClockingSignal {
     /// name to a different signal. None = the clocking name IS the signal.
     #[cfg_attr(feature = "serde", serde(default))]
     pub bound_to: Option<super::expr::Expression>,
+    /// §23.9: the binding of `name` when the clockvar has no `= expression`
+    /// (the signal of that name), from the binder.
+    #[cfg_attr(feature = "serde", serde(skip))]
+    pub bound: super::binding::Bound,
     pub span: Span,
 }
 
@@ -989,9 +997,12 @@ pub struct GateInstantiation {
     /// §28.11 `#(rise, fall)` — the FALL delay (second expression), applied to
     /// 1→0 output transitions. `None` when the spec gave a single delay, in
     /// which case the rise value governs both edges. A third (turn-off) value
-    /// is still skipped.
+    /// is carried separately for primitives that allow delay3.
     #[cfg_attr(feature = "serde", serde(default))]
     pub delay_fall: Option<Expression>,
+    /// §28.11: optional turn-off delay of a delay3 primitive.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub delay_off: Option<Expression>,
     pub instances: Vec<GateInstance>,
     pub span: Span,
 }
