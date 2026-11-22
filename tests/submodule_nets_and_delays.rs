@@ -184,3 +184,29 @@ endmodule
     assert!(driver.delay_exprs.is_none());
     assert_eq!(driver.origin.as_ref().unwrap().1.as_ref(), "");
 }
+
+/// §10.3: each unpacked element is a delayed driver, including when the
+/// compiler streams an instance's assignments directly from the elaborator.
+#[test]
+fn streamed_array_assignment_keeps_variable_delays() {
+    let src = r#"
+module child;
+  int d;
+  logic src [2];
+  wire dst [2];
+  assign #(d) dst = src;
+endmodule
+module top; child u(); endmodule
+"#;
+    let (_, mut model) = xezim_core::parse_and_elaborate_multi(
+        &[src.into()], Some("top"), &[], &["top.sv".into()], &[],
+    ).expect("elaborate delayed array assignment");
+    let mut delayed = 0;
+    model.drain_pending_cont_assign_for_each(|ca| {
+        if ca.delay != 0 {
+            assert!(ca.delay_exprs.as_ref().is_some_and(|args| args[0].is_some()));
+            delayed += 1;
+        }
+    });
+    assert_eq!(delayed, 2, "each destination element needs its own driver");
+}
