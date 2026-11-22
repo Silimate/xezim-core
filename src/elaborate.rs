@@ -40595,17 +40595,26 @@ fn parent_declares_interface(
         instantiates(items, definitions, &qualified)
     });
     // `def`'s own items are not generate-expanded: only its module-level
-    // interface instances are seen there, never one inside a generate block.
-    visible
-        || def.items().iter().any(|it| match it {
+    // interface instances are seen there, including those in a
+    // `generate ... endgenerate` region, which is no scope (§27.3), never one
+    // inside a generate block.
+    fn module_level(
+        items: &[ModuleItem],
+        definitions: &HashMap<String, Definition>,
+        name: &str,
+    ) -> bool {
+        items.iter().any(|it| match it {
             ModuleItem::ModuleInstantiation(mi) => {
                 matches!(
                     definitions.get(&mi.module_name.name),
                     Some(Definition::Interface(_))
                 ) && mi.instances.iter().any(|hi| hi.name.name == name)
             }
+            ModuleItem::GenerateRegion(g) => module_level(&g.items, definitions, name),
             _ => false,
         })
+    }
+    visible || module_level(def.items(), definitions, name)
 }
 
 fn is_interface_type(dt: &DataType, definitions: &HashMap<String, Definition>) -> bool {

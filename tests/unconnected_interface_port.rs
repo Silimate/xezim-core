@@ -62,6 +62,7 @@ fn an_unconnected_interface_port_is_an_error_unless_relaxed() {
         // enclosing it, fills the `.*` port.
         "if (1) begin : g1 mem_if bus (); gen g (.*); end",
         "mem_if bus (); if (1) begin : g1 gen g (.*); end",
+        "generate mem_if bus (); endgenerate gen g (.*);",
     ] {
         elaborate(inst).unwrap_or_else(|e| panic!("{inst}: {e}"));
     }
@@ -94,6 +95,17 @@ fn an_unconnected_interface_port_is_an_error_unless_relaxed() {
     bound(true).expect("a bound interface fills the bound instance's .* port");
     let err = bound(false).expect_err("no interface named bus in the target");
     assert!(err.contains("interface port 'bus'"), "{err}");
+    // §27.3: a `generate ... endgenerate` region is no scope, so an interface
+    // the target declares in one fills a bound instance's `.*` port.
+    let src = "interface mem_if; logic rq; endinterface\n\
+               module gen (interface bus, output logic o); assign o = bus.rq; endmodule\n\
+               module tgt; logic o; generate mem_if bus (); endgenerate endmodule\n\
+               module top; tgt u (); endmodule\n\
+               bind tgt gen g (.*);\n"
+        .to_string();
+    xezim_core::parse_and_elaborate_multi(&[src], Some("top"), &[], &["top.sv".into()], &[])
+        .map(|_| ())
+        .expect("an interface in the target's generate region fills a bound .* port");
 
     xezim_core::sv_parser::RELAX_UNCONNECTED_INTERFACE_PORT.set(true);
     elaborate("dut u (.clk(clk), .q(q));").expect("elaborated with the switch");
