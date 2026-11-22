@@ -2352,15 +2352,17 @@ impl Rw<'_> {
                     let tokens = Lexer::new(args_text).tokenize();
                     let mut edits = Vec::new();
                     for (i, token) in tokens.iter().enumerate() {
-                        if token.kind == TokenKind::Identifier
-                            && self.info.hiding.contains(&token.text)
-                            && !self.value_shadowed(&token.text)
-                            && !i.checked_sub(1).is_some_and(|p| {
-                                matches!(tokens[p].kind, TokenKind::Dot | TokenKind::DoubleColon)
-                            })
-                            && let Res::To(named) = self.resolve(&token.text)
-                        {
-                            edits.push((token.span, named));
+                        if token.kind == TokenKind::Identifier {
+                            let name = tokens.text(token);
+                            if self.info.hiding.contains(name.as_ref())
+                                && !self.value_shadowed(&name)
+                                && !i.checked_sub(1).is_some_and(|p| {
+                                    matches!(tokens[p].kind, TokenKind::Dot | TokenKind::DoubleColon)
+                                })
+                                && let Res::To(named) = self.resolve(&name)
+                            {
+                                edits.push((tokens.span(token), named));
+                            }
                         }
                     }
                     for (span, named) in edits.into_iter().rev() {
@@ -3213,6 +3215,7 @@ impl Rw<'_> {
             ModuleItem::GateInstantiation(g) => {
                 self.opt(&mut g.delay);
                 self.opt(&mut g.delay_fall);
+                self.opt(&mut g.delay_off);
                 for i in &mut g.instances {
                     i.terminals.iter_mut().for_each(|t| self.expr(t));
                 }
