@@ -1928,7 +1928,31 @@ impl Rw<'_> {
     }
 
     fn value_shadowed(&self, n: &str) -> bool {
-        self.frames.iter().any(|f| f.values.contains(n))
+        for f in self.frames.iter().rev() {
+            if f.values.contains(n) {
+                return true;
+            }
+            if f.types.contains(n) {
+                return false;
+            }
+            // §8.13: a method can use a value from its class or a base as a
+            // cast size. A nearer type declaration hides a more distant value.
+            for class in f.cls.iter().chain(&f.bases) {
+                let Some(ci) = self.info.classes.get(class) else {
+                    continue;
+                };
+                if ci.values.contains(n) {
+                    return true;
+                }
+                if ci.typedefs.contains(n)
+                    || ci.types.contains(n)
+                    || ci.params.iter().any(|p| p.name == n)
+                {
+                    return false;
+                }
+            }
+        }
+        false
     }
 
     fn is_package(&self, n: &str) -> bool {
