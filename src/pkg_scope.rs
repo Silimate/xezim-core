@@ -34,8 +34,6 @@
 //! Names declared in one place only are left alone, so a design without
 //! such a collision is not touched at all.
 
-use std::collections::BTreeSet;
-
 use crate::hasher::{HashMap, HashSet};
 
 use crate::ast::Description;
@@ -746,6 +744,15 @@ fn mangle(pkg: &str, name: &str) -> String {
     format!("{}::{}", pkg, name)
 }
 
+/// `'a' and 'b'`, `'a', 'b' and 'c'`.
+fn quoted_list(names: &[String]) -> String {
+    let q: Vec<String> = names.iter().map(|n| format!("'{n}'")).collect();
+    match q.split_last() {
+        Some((last, rest)) if !rest.is_empty() => format!("{} and {last}", rest.join(", ")),
+        _ => q.join(""),
+    }
+}
+
 /// One lexical scope's names, innermost last on the walker's stack.
 #[derive(Default)]
 struct Frame {
@@ -794,7 +801,17 @@ impl Frame {
 enum Res {
     Keep,
     To(String),
-    Ambiguous(Vec<String>),
+    /// The declaring packages, and the scope that imports them.
+    Ambiguous(Vec<String>, String),
+}
+
+/// What the wildcard imports of one scope offer for a name (see
+/// `Rw::wild_candidate`).
+enum Wild {
+    None,
+    One(String),
+    /// The declaring packages, in the order of the imports.
+    Many(Vec<String>),
 }
 
 struct Rw<'a> {
@@ -807,6 +824,10 @@ struct Rw<'a> {
     in_const: u32,
     /// Nesting of `inline_type` replacements being walked (a guard).
     inline_depth: u32,
+    /// (scope, name, packages in import order) already warned about under
+    /// --relax-wildcard-import-conflict. Two scopes that share a label but
+    /// import in another order pick another package, so warn again.
+    warned: std::cell::RefCell<HashSet<(String, String, Vec<String>)>>,
 }
 
 /// A name looked up in a class and its bases.
@@ -876,6 +897,7 @@ pub fn qualify_colliding_package_types(descs: &mut [Description]) -> Result<(), 
         errors: Vec::new(),
         in_const: 0,
         inline_depth: 0,
+        warned: Default::default(),
     };
     let unit = unit_frame(descs);
     rw.frames.push(unit);
@@ -1420,6 +1442,71 @@ impl Rw<'_> {
         }
     }
 
+    /// §26.3: the packages whose declaration of `n` the wildcard imports of
+    /// `f` offer (`owner` maps an imported package to the one declaring `n`
+    /// there). One is the binding, which `bound` records; more than one
+    /// makes `n` invisible here. With --relax-wildcard-import-conflict the
+    /// first of them in the order of the imports is the binding instead,
+    /// with a warning naming them.
+    fn wild_candidate(&self, f: &Frame, n: &str, owner: impl Fn(&str) -> Option<String>) -> Wild {
+        let mut cands: Vec<String> = Vec::new();
+        for q in &f.wild {
+            if let Some(o) = owner(q.as_str())
+                && !cands.contains(&o)
+            {
+                cands.push(o);
+            }
+        }
+        if cands.len() > 1 && !crate::sv_parser::RELAX_WILDCARD_IMPORT_CONFLICT.get() {
+            return Wild::Many(cands);
+        }
+        let Some(first) = cands.first().cloned() else {
+            return Wild::None;
+        };
+        if cands.len() > 1 {
+            self.warn_conflict(f, n, &cands);
+        }
+        Self::bind_wild(f, n, |q| owner(q).is_some());
+        Wild::One(first)
+    }
+
+    /// The scope a frame belongs to, in a diagnostic: the nearest package or
+    /// module at or around it (a module's body is a frame of its own).
+    fn scope_label(&self, f: &Frame) -> String {
+        let at = self
+            .frames
+            .iter()
+            .position(|g| std::ptr::eq(g, f))
+            .unwrap_or(0);
+        for g in self.frames[..=at].iter().rev() {
+            if let Some(p) = &g.pkg {
+                return format!("package '{p}'");
+            }
+            if let Some(m) = &g.module {
+                return format!("'{m}'");
+            }
+        }
+        "the compilation unit".to_string()
+    }
+
+    fn warn_conflict(&self, f: &Frame, n: &str, pkgs: &[String]) {
+        let scope = self.scope_label(f);
+        if !self
+            .warned
+            .borrow_mut()
+            .insert((scope.clone(), n.to_string(), pkgs.to_vec()))
+        {
+            return;
+        }
+        crate::elab_diag(format!(
+            "[xezim][warning] '{n}' is declared by {}, all wildcard-imported into {scope}, \
+             so it is not visible there (IEEE 1800-2023 §26.3); using '{}::{n}', the first \
+             import, because --relax-wildcard-import-conflict is in effect",
+            quoted_list(pkgs),
+            pkgs[0],
+        ));
+    }
+
     fn resolve(&self, n: &str) -> Res {
         let pkg_col = self.info.colliding.contains(n);
         let cls_col = self.info.class_colliding.contains(n);
@@ -1467,21 +1554,39 @@ impl Rw<'_> {
                     None => Res::Keep,
                 };
             }
-            let cands: BTreeSet<String> = f
-                .wild
-                .iter()
-                .filter_map(|q| self.info.owner(q, n, 0))
-                .collect();
-            if cands.len() == 1 {
-                Self::bind_wild(f, n, |q| self.info.owner(q, n, 0).is_some());
-            }
-            match cands.len() {
-                0 => {}
-                1 => return Res::To(mangle(cands.first().unwrap(), n)),
-                _ => return Res::Ambiguous(cands.into_iter().collect()),
+            match self.wild_candidate(f, n, |q| self.info.owner(q, n, 0)) {
+                Wild::None => {}
+                Wild::One(o) => return Res::To(mangle(&o, n)),
+                Wild::Many(c) => return Res::Ambiguous(c, self.scope_label(f)),
             }
         }
         Res::Keep
+    }
+
+    /// --relax-wildcard-import-conflict, and `n` is an enum member that the
+    /// wildcard imports of the nearest scope offering it provide from more
+    /// than one package.
+    fn relaxed_member(&self, n: &str) -> bool {
+        if !crate::sv_parser::RELAX_WILDCARD_IMPORT_CONFLICT.get()
+            || !self.info.colliding_members.contains(n)
+        {
+            return false;
+        }
+        self.frames
+            .iter()
+            .rev()
+            .find_map(|f| {
+                let mut owners: Vec<String> = Vec::new();
+                for q in &f.wild {
+                    if let Some(o) = self.info.member_owner(q, n, 0)
+                        && !owners.contains(&o)
+                    {
+                        owners.push(o);
+                    }
+                }
+                (!owners.is_empty()).then_some(owners.len() > 1)
+            })
+            .unwrap_or(false)
     }
 
     /// The package whose enum member a bare `n` denotes, when that is not
@@ -1507,19 +1612,11 @@ impl Rw<'_> {
             if let Some(q) = f.explicit.get(n).or(f.bound.borrow().get(n)) {
                 return self.info.member_owner(q, n, 0);
             }
-            let cands: BTreeSet<String> = f
-                .wild
-                .iter()
-                .filter_map(|q| self.info.member_owner(q, n, 0))
-                .collect();
-            if cands.len() == 1 {
-                Self::bind_wild(f, n, |q| self.info.member_owner(q, n, 0).is_some());
-            }
-            match cands.len() {
-                0 => {}
-                1 => return cands.into_iter().next(),
+            match self.wild_candidate(f, n, |q| self.info.member_owner(q, n, 0)) {
+                Wild::None => {}
+                Wild::One(o) => return Some(o),
                 // Not visible (§26.3); left to the existing diagnostics.
-                _ => return None,
+                Wild::Many(_) => return None,
             }
         }
         None
@@ -1568,18 +1665,10 @@ impl Rw<'_> {
             if let Some(q) = f.explicit.get(n).or(f.bound.borrow().get(n)) {
                 return self.info.value_owner(q, n, 0);
             }
-            let cands: BTreeSet<String> = f
-                .wild
-                .iter()
-                .filter_map(|q| self.info.value_owner(q, n, 0))
-                .collect();
-            if cands.len() == 1 {
-                Self::bind_wild(f, n, |q| self.info.value_owner(q, n, 0).is_some());
-            }
-            match cands.len() {
-                0 => {}
-                1 => return cands.into_iter().next(),
-                _ => return None,
+            match self.wild_candidate(f, n, |q| self.info.value_owner(q, n, 0)) {
+                Wild::None => {}
+                Wild::One(o) => return Some(o),
+                Wild::Many(_) => return None,
             }
         }
         None
@@ -1617,24 +1706,10 @@ impl Rw<'_> {
                     .filter(|o| declares(o))
                     .map(|o| mangle(&o, n));
             }
-            let cands: BTreeSet<String> = f
-                .wild
-                .iter()
-                .filter_map(|q| self.info.value_owner(q, n, 0))
-                .collect();
-            if cands.len() == 1 {
-                Self::bind_wild(f, n, |q| self.info.value_owner(q, n, 0).is_some());
-            }
-            match cands.len() {
-                0 => {}
-                1 => {
-                    return cands
-                        .into_iter()
-                        .next()
-                        .filter(|o| declares(o))
-                        .map(|o| mangle(&o, n));
-                }
-                _ => return None,
+            match self.wild_candidate(f, n, |q| self.info.value_owner(q, n, 0)) {
+                Wild::None => {}
+                Wild::One(o) => return Some(o).filter(|o| declares(o)).map(|o| mangle(&o, n)),
+                Wild::Many(_) => return None,
             }
         }
         None
@@ -1860,16 +1935,14 @@ impl Rw<'_> {
         self.info.pkgs.contains_key(n) && !self.value_shadowed(n)
     }
 
-    fn ambiguous(&mut self, n: &str, pkgs: &[String]) {
-        let list: Vec<String> = pkgs.iter().map(|p| format!("'{}'", p)).collect();
+    fn ambiguous(&mut self, n: &str, pkgs: &[String], scope: &str) {
         self.errors.push(format!(
-            "type '{}' is declared by more than one wildcard-imported package ({}), so it \
-             is not visible here; import it explicitly or qualify it (`{}::{}`) \
-             (IEEE 1800-2017 §26.3)",
-            n,
-            list.join(", "),
+            "type '{n}' is declared by more than one wildcard-imported package ({}, all \
+             imported into {scope}), so it is not visible here (IEEE 1800-2023 §26.3); import \
+             it explicitly or qualify it (`{}::{n}`), or pass --relax-wildcard-import-conflict \
+             to use the first import",
+            quoted_list(pkgs),
             pkgs[0],
-            n
         ));
     }
 
@@ -1878,9 +1951,9 @@ impl Rw<'_> {
         match self.resolve(&id.name) {
             Res::Keep => {}
             Res::To(m) => id.name = m,
-            Res::Ambiguous(c) => {
+            Res::Ambiguous(c, scope) => {
                 let n = id.name.clone();
-                self.ambiguous(&n, &c);
+                self.ambiguous(&n, &c, &scope);
             }
         }
     }
@@ -2239,12 +2312,15 @@ impl Rw<'_> {
                             );
                             return;
                         }
-                    } else if self.in_const == 0 {
+                    } else if self.in_const == 0 || self.relaxed_member(n) {
                         // §26.3 / §6.19: an enum member of a package, named
                         // bare where that package's declaration is the one in
                         // scope. All packages' members share one flat table,
                         // where the last package registered wins, so spell
                         // the reference `pkg::NAME` — the qualified lookup.
+                        // In a constant context only for a member that the
+                        // relaxation resolves, so a constant and a run-time
+                        // reference get the same import's value.
                         if let Some(p) = self.resolve_member(n) {
                             let span = e.span;
                             let member = h.path[0].name.clone();
@@ -2320,6 +2396,19 @@ impl Rw<'_> {
                 }
             }
             ExprKind::SystemCall { name, args } => {
+                // `T'(v)`: `T` is a type, so a name that two wildcard imports
+                // make invisible is reported here, naming the packages, rather
+                // than as an undeclared identifier later (§26.3). Otherwise the
+                // walk below renames it as any expression-position type name.
+                if name == "$__xz_named_cast"
+                    && let Some(n) = args.first().and_then(plain_ident)
+                    && self.info.colliding.contains(n)
+                    && !self.value_shadowed(n)
+                    && let Res::Ambiguous(c, scope) = self.resolve(n)
+                {
+                    let n = n.to_string();
+                    self.ambiguous(&n, &c, &scope);
+                }
                 args.iter_mut().for_each(|a| self.expr(a));
                 // `payload_t'(v)` whose typedef was replaced by a type.
                 if name == "$__xz_named_cast"
