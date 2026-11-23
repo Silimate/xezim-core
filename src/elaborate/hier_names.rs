@@ -14,25 +14,15 @@ use super::*;
 /// A group member that is not a port is the child's own net; the group is
 /// recorded for the unification pass, which merges it with the rest of the
 /// group.
-fn net_port_actual_name(expr: &Expression) -> Option<String> {
-    if let Some(flat) = whole_net_ident_name(expr) {
-        return Some(flat);
-    }
-    if let ExprKind::Index { expr: base, index } = &expr.kind
-        && let Some(bn) = whole_net_ident_name(base)
-        && let Some(idx) = const_eval_i64_with_params(index, None)
-    {
-        return Some(format!("{bn}[{idx}]"));
-    }
-    None
-}
-
 pub(super) fn apply_child_alias_groups(
     items: &[ModuleItem],
     inst_prefix: &str,
     port_map: &mut HashMap<String, Expression>,
-    alias_groups: &mut Vec<Vec<String>>,
+    elab: &mut ElaboratedModule,
 ) {
+    // A non-ANSI header can name the same local net in separate port
+    // expressions. Track earlier whole-net actuals for a later part select.
+    let mut local_actuals: HashMap<String, Expression> = HashMap::default();
     for item in items {
         let ModuleItem::AliasDecl(terms) = item else {
             continue;
@@ -50,7 +40,8 @@ pub(super) fn apply_child_alias_groups(
         let mut actuals: Vec<String> = Vec::new();
         for n in &names {
             if let Some(a) = port_map.get(n).cloned() {
-                if let Some(flat) = net_port_actual_name(&a)
+                if let Some(flat) = whole_net_ident_name(&a)
+                    .or_else(|| fixed_net_cell(elab, &a).map(|(n, _)| n))
                     && !actuals.contains(&flat)
                 {
                     actuals.push(flat);
@@ -61,12 +52,35 @@ pub(super) fn apply_child_alias_groups(
                         // Every port of the group is the same net: the
                         // second one takes the first one's actual.
                         if !same_expr(first, &a) {
+                            if packed_port_select(elab, first) || packed_port_select(elab, &a) {
+                                elab.selected_port_connections
+                                    .push((first.clone(), a.clone()));
+                            }
                             port_map.insert(n.clone(), first.clone());
                         }
                     }
                 }
             } else {
                 group.push(cat2(inst_prefix, n));
+            }
+        }
+        // A selected actual is an lvalue, not a standalone signal name.
+        // Substitute it for the internal net so both child reads and child
+        // drivers follow the ordinary inout port connection path.
+        if let Some(a) = actual.as_ref() {
+            for n in &names {
+                if port_map.contains_key(n) {
+                    continue;
+                }
+                if packed_port_select(elab, a) {
+                    if let Some(first) = local_actuals.get(n) {
+                        elab.selected_port_connections
+                            .push((first.clone(), a.clone()));
+                    }
+                    port_map.insert(n.clone(), a.clone());
+                } else {
+                    local_actuals.entry(n.clone()).or_insert_with(|| a.clone());
+                }
             }
         }
         // When an alias joins child-local net(s) with port(s), bridge them
@@ -78,14 +92,19 @@ pub(super) fn apply_child_alias_groups(
             group.push(first_actual.clone());
         }
         if group.len() > 1 {
-            alias_groups.push(group);
+            elab.alias_groups.push(group);
         }
         // The group's actuals are one net in the parent: they join a
         // parent-scope group, so the unification pass merges them.
         if actuals.len() > 1 {
-            alias_groups.push(actuals);
+            elab.alias_groups.push(actuals);
         }
     }
+}
+
+fn packed_port_select(elab: &ElaboratedModule, expr: &Expression) -> bool {
+    matches!(expr.kind, ExprKind::RangeSelect { .. } | ExprKind::Index { .. })
+        && fixed_net_cell(elab, expr).is_none()
 }
 
 /// §10.11: the names an `alias` statement names, in the order written.

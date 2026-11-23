@@ -701,7 +701,7 @@ pub(super) fn inline_instantiation_items(
                     sub_mod.items(),
                     &inst_prefix,
                     &mut port_map,
-                    &mut elab.alias_groups,
+                    elab,
                 );
                 // Short-circuit: gated_clk_cell is a passthrough whose body is
                 // `assign clk_out = clk_in;` plus dead enable logic. Inlining

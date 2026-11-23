@@ -499,20 +499,20 @@ fn is_signal_in_scope(name: &str, scope: &str, elab: &ElaboratedModule) -> bool 
 }
 
 /// Compact index-based Disjoint-Set Union with path halving and union by size.
-struct IndexDsu {
+pub(super) struct IndexDsu {
     parent: Vec<u32>,
     size: Vec<u32>,
 }
 
 impl IndexDsu {
-    fn new(n: usize) -> Self {
+    pub(super) fn new(n: usize) -> Self {
         Self {
             parent: (0..n as u32).collect(),
             size: vec![1; n],
         }
     }
 
-    fn find(&mut self, mut x: u32) -> u32 {
+    pub(super) fn find(&mut self, mut x: u32) -> u32 {
         while self.parent[x as usize] != x {
             let p = self.parent[x as usize];
             let gp = self.parent[p as usize];
@@ -522,7 +522,7 @@ impl IndexDsu {
         x
     }
 
-    fn union(&mut self, a: u32, b: u32) -> u32 {
+    pub(super) fn union(&mut self, a: u32, b: u32) -> u32 {
         let mut ra = self.find(a);
         let mut rb = self.find(b);
         if ra == rb {
@@ -536,7 +536,7 @@ impl IndexDsu {
         ra
     }
 
-    fn push_singleton(&mut self) -> u32 {
+    pub(super) fn push_singleton(&mut self) -> u32 {
         let id = self.parent.len() as u32;
         self.parent.push(id);
         self.size.push(1);

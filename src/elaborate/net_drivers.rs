@@ -566,7 +566,7 @@ pub fn continuous_assign_delay_select(
 /// driver that leaves the other bits at z (`{'z, 1'(b), 'z}`), so the
 /// whole-net fold below resolves the shared bits and passes the rest through.
 /// Nets whose select drivers are disjoint keep their per-select assigns.
-fn widen_overlapping_select_drivers(elab: &mut ElaboratedModule) {
+fn widen_overlapping_select_drivers(elab: &mut ElaboratedModule, include: impl Fn(&str) -> bool) {
     // Compute each materialized driver's net span, and the same for LAZY
     // sub-module drivers without materializing them: a future instance whose
     // body sits in `pending_cont_assign` (bit/part selects on `n` inside a
@@ -620,7 +620,7 @@ fn widen_overlapping_select_drivers(elab: &mut ElaboratedModule) {
     let widen: HashSet<String> = by_net
         .into_iter()
         .filter(|(n, v)| {
-            v.iter().any(|s| s.2)
+            include(n) && v.iter().any(|s| s.2)
                 && (pulled(n)
                     || v.iter()
                         .enumerate()
@@ -754,7 +754,7 @@ fn widen_overlapping_select_drivers(elab: &mut ElaboratedModule) {
 /// `<net>$udp<k>`, with its instance delay, and an undelayed assignment of
 /// the stage joins the net's other drivers in the fold. A UDP that is the
 /// only driver of its net keeps writing it.
-fn stage_shared_udp_outputs(elab: &mut ElaboratedModule) {
+fn stage_shared_udp_outputs(elab: &mut ElaboratedModule, selected: &HashSet<String>) {
     if elab.udp_instances.is_empty() {
         return;
     }
@@ -764,7 +764,7 @@ fn stage_shared_udp_outputs(elab: &mut ElaboratedModule) {
             *drivers.entry(n).or_insert(0) += 1;
         }
     }
-    if drivers.is_empty() {
+    if drivers.is_empty() && selected.is_empty() {
         return;
     }
     for ca in &elab.continuous_assigns {
@@ -776,9 +776,20 @@ fn stage_shared_udp_outputs(elab: &mut ElaboratedModule) {
     }
     let mut staged: HashMap<String, usize> = HashMap::default();
     for i in 0..elab.udp_instances.len() {
-        let Some(net) = ident_flat_name(&elab.udp_instances[i].output)
-            .filter(|n| drivers.get(n).is_some_and(|&c| c > 1))
-        else {
+        let output = &elab.udp_instances[i].output;
+        let selected_span = if selected.is_empty() {
+            None
+        } else {
+            cont_assign_driver_span(output, elab).filter(|(net, _, _)| selected.contains(net))
+        };
+        let (net, width) = if let Some((net, lo, hi)) = selected_span {
+            (net, hi - lo + 1)
+        } else if let Some(net) =
+            ident_flat_name(output).filter(|n| drivers.get(n).is_some_and(|&c| c > 1))
+            && let Some(width) = elab.signals.get(&net).map(|s| s.width)
+        {
+            (net, width)
+        } else {
             continue;
         };
         let k = staged.entry(net.clone()).or_insert(0);
@@ -789,15 +800,20 @@ fn stage_shared_udp_outputs(elab: &mut ElaboratedModule) {
         };
         sig.name = stage.clone().into();
         sig.direction = None;
+        sig.width = width;
+        sig.value = sig.value.resize_for_assign(width);
         elab.signals.insert(stage.clone(), sig);
         let span = elab.udp_instances[i].output.span;
-        elab.udp_instances[i].output = Expression::new(make_ident_expr(&stage).kind, span);
+        let output = std::mem::replace(
+            &mut elab.udp_instances[i].output,
+            Expression::new(make_ident_expr(&stage).kind, span),
+        );
         elab.continuous_assigns.push(ContinuousAssignment {
             gate_delay_fall: None,
             delay_exprs: None,
             delay_select: None,
             origin: None,
-            lhs: make_ident_expr(&net),
+            lhs: output,
             rhs: make_ident_expr(&stage),
             delay: 0,
             rhs_parent_scoped: false,
@@ -836,7 +852,7 @@ fn stage_shared_udp_outputs(elab: &mut ElaboratedModule) {
 /// undelayed assignment of the stage joins the net's other drivers in the
 /// fold. A clockvar that is the net's ONLY driver keeps driving the net
 /// itself.
-fn stage_shared_clocking_outputs(elab: &mut ElaboratedModule) {
+fn stage_shared_clocking_outputs(elab: &mut ElaboratedModule, selected: &HashSet<String>) {
     if elab.clocking_blocks.is_empty() {
         return;
     }
@@ -888,7 +904,8 @@ fn stage_shared_clocking_outputs(elab: &mut ElaboratedModule) {
     }
     let mut staged: HashMap<String, usize> = HashMap::default();
     for (cb, net) in &outputs {
-        if !drivers.get(&canon_of(net)).is_some_and(|&c| c > 1) {
+        let canon = canon_of(net);
+        if !selected.contains(&canon) && !drivers.get(&canon).is_some_and(|&c| c > 1) {
             continue;
         }
         let k = staged.entry(net.clone()).or_insert(0);
@@ -902,7 +919,6 @@ fn stage_shared_clocking_outputs(elab: &mut ElaboratedModule) {
         elab.signals.insert(stage.clone(), sig);
         // §10.11: the net may be an alias member; the stage follows the
         // group's canonical net.
-        let canon = alias_canonical(&elab.alias_canon, net.clone());
         elab.clocking_output_stages
             .insert((cb.clone(), net.clone()), stage.clone());
         let span = elab.clocking_blocks[cb].span;
@@ -1055,9 +1071,22 @@ fn normalize_net_cell_drivers(elab: &mut ElaboratedModule) -> HashMap<String, u3
     resolve
 }
 
+#[path = "selected_port_drivers.rs"]
+mod selected_port_drivers;
+use selected_port_drivers::project_selected_port_drivers;
+
 pub fn resolve_multi_driver_nets(elab: &mut ElaboratedModule) {
     let resolved_cells = normalize_net_cell_drivers(elab);
-    widen_overlapping_select_drivers(elab);
+    // A selected port carries even a terminal's only driver onto the other net.
+    let selected: HashSet<String> = elab
+        .selected_port_connections
+        .iter()
+        .flat_map(|(a, b)| [a, b])
+        .filter_map(|e| cont_assign_driver_span(e, elab).map(|(net, _, _)| net))
+        .collect();
+    // Unrelated nets keep their original driver ordering. Their overlapping
+    // selects must be whole-net drivers when UDP and clocking outputs count them.
+    widen_overlapping_select_drivers(elab, |net| !selected.contains(net));
     // §10.11: the names an `alias` statement names are ONE physical net, so
     // a driver of any member of a group is a driver of the group's
     // canonical net. The map is taken out of the module so the fold below
@@ -1186,11 +1215,15 @@ pub fn resolve_multi_driver_nets(elab: &mut ElaboratedModule) {
             }
         }
     }
-    stage_shared_udp_outputs(elab);
+    stage_shared_udp_outputs(elab, &selected);
     // §14.16: a clocking output is a driver of its net, so it takes part in
     // the net's resolution. It drives a stage of its own when the net has
     // another driver.
-    stage_shared_clocking_outputs(elab);
+    stage_shared_clocking_outputs(elab, &selected);
+    if !selected.is_empty() {
+        project_selected_port_drivers(elab);
+        widen_overlapping_select_drivers(elab, |net| selected.contains(net));
+    }
     // §28.12 / §21.2.1.5: a net with ONE driver that carries a strength or
     // is a tristate primitive keeps that driver for `%v`; a net several
     // drivers resolve replaces it below.
