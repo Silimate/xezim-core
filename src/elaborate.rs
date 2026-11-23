@@ -7346,9 +7346,8 @@ pub fn register_scoped_typedef_alias(
     // Members are hoisted under their bare name only (last package wins), so
     // `f_pkg::ADD` in a constant context — a declaration initializer, a
     // localparam, the inliner's spelling of a member two packages both
-    // declare — read `a_pkg::ADD`'s value. Members wider than 64 bits are
-    // parked by the inliner's package pass (`wide_enum_value_map`).
-    if matches!(td.data_type, DataType::Enum(_)) {
+    // declare — read `a_pkg::ADD`'s value.
+    if let DataType::Enum(et) = &td.data_type {
         if let Some(members) = elab.enum_members.get(&td.name.name).cloned() {
             // §18.3 / §26.3 (#862): qualified struct member types retain
             // their own enum domain when packages share a typedef name.
@@ -7359,10 +7358,21 @@ pub fn register_scoped_typedef_alias(
                 .copied()
                 .unwrap_or(32)
                 .max(1);
-            if w <= 64 {
-                for (m, v) in members {
-                    alias_pkg_param(elab, pkg, &m, &Value::from_u64(v, w));
-                }
+            let signed = is_type_signed_resolved(&td.data_type, &elab.typedef_types);
+            let mut displaced = None;
+            for (m, ordinal) in members {
+                // §6.19: preserve the typed member, including its X/Z bits.
+                // A displaced bare name belongs to the importing scope. Get
+                // that member from the enum declaration itself.
+                let bare = elab.parameters.get(&m).filter(|_| !elab.local_decl_displaces(&m));
+                let mut value = bare.cloned().unwrap_or_else(|| {
+                    displaced
+                        .get_or_insert_with(|| wide_enum_value_map(et, w, &elab.parameters))
+                        .remove(&m)
+                        .unwrap_or_else(|| Value::from_u64(ordinal, w))
+                });
+                value.is_signed = signed;
+                alias_pkg_param(elab, pkg, &m, &value);
             }
         }
     }
@@ -38038,17 +38048,6 @@ fn inline_instantiations_inner(
                         .copied()
                         .unwrap_or(32)
                         .max(1);
-                    // §6.19 wide base: the (u64, width) table truncates past
-                    // 64 bits, so ALSO park the full Value under the
-                    // qualified spelling in `parameters` — the runtime's
-                    // qualified lookup consults it first for wide members.
-                    if w > 64 {
-                        if let DataType::Enum(et) = &td.data_type {
-                            for (m, v) in wide_enum_value_map(et, w, &elab.parameters) {
-                                elab.set_param(line!(), format!("{}::{}", name, m), v);
-                            }
-                        }
-                    }
                     let slot = elab.package_enum_members.entry(name.clone()).or_default();
                     for (m, v) in members {
                         slot.insert(m, (v, w));
