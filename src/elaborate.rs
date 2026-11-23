@@ -7263,6 +7263,20 @@ fn hoist_package_params(defs: &HashMap<String, Definition>, elab: &mut Elaborate
                     // overlay in the hoist loop below.
                     alias_pkg_param(elab, &p.name.name, &assign.name.name, &v);
                     let scoped = format!("{}.{}", p.name.name, assign.name.name);
+                    // Package references in initializers are scope-qualified.
+                    // Make this parameter's layout available to later member
+                    // selections before a module uses their values as widths.
+                    if assign.dimensions.is_empty()
+                        && !matches!(data_type, DataType::TypeReference { dimensions, .. } if !dimensions.is_empty())
+                        && let Some(fields) = flatten_struct_fields(
+                            data_type,
+                            &elab.parameters,
+                            &elab.typedefs,
+                            &elab.typedef_types,
+                        )
+                    {
+                        tls_register_struct_layout(&scoped, &fields);
+                    }
                     register_pkg_param_elem(elab, "", &scoped, data_type);
                 }
             }
