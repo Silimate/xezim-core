@@ -29,6 +29,7 @@ fn antecedent(expr: &str) -> Expression {
     *left.clone()
 }
 
+/// IEEE 1800-2017 §16.9: sequence repetition applies to the complete sampled expression.
 #[test]
 fn repeat_takes_the_complete_sampled_expression() {
     for (abbrev, marker) in [
@@ -54,4 +55,36 @@ fn repeat_takes_the_complete_sampled_expression() {
         panic!("expected repeated conditional")
     };
     assert!(matches!(args[0].kind, ExprKind::Conditional { .. }));
+}
+
+/// IEEE 1800-2017 §16.9: sequence concatenation binds below repetition.
+#[test]
+fn delay_concatenates_the_repeated_equality() {
+    let expr = antecedent("p == n [*2] ##1 sel");
+    let ExprKind::Binary {
+        op: BinaryOp::SeqAnd,
+        left,
+        right,
+    } = expr.kind
+    else {
+        panic!("expected sequence concatenation");
+    };
+    assert!(matches!(
+        right.kind,
+        ExprKind::Binary {
+            op: BinaryOp::HashHash,
+            ..
+        }
+    ));
+    let ExprKind::SystemCall { name, args } = &left.kind else {
+        panic!("expected repeated left operand");
+    };
+    assert_eq!(name, "$sva_rep_consec");
+    assert!(matches!(
+        args[0].kind,
+        ExprKind::Binary {
+            op: BinaryOp::Eq,
+            ..
+        }
+    ));
 }
