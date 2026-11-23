@@ -293,7 +293,18 @@ pub use value::Value;
 /// \x69 retains scoped runtime driver delays, shortreal metadata and full packed memory widths.
 /// \x6A records the packed shape of the top module's ANSI ports (§7.4.1, §7.2) and keeps a
 ///         shortreal input formal's own storage for a real actual (§6.12, §23.3.3.8).
-pub const XEZIM_BYTECODE_MAGIC: &[u8; 8] = b"XEZIMBC\x6A";
+/// \x6B expands whole continuous copies of fixed unpacked struct arrays into member assignments
+///         (§7.6, §10.3), evaluates case inside ranges in constant functions (§11.4.13, §13.4.3),
+///         assigns matching continuous pattern defaults whole (§10.9.2), keeps an input formal's
+///         own storage for an actual of the other signedness, element and member actuals included
+///         (§23.3.3.7, §11.8.1), and registers an inlined instance's per-element packed-struct
+///         layouts and packed-struct nets (§7.2, §7.4.2).
+/// \x6C registers a generate block's nettype nets with their declaration assignments as drivers,
+///         keeps a nettype declaration's delay (§6.6.7, §10.3.1, §10.3.3, §27.2), declares a
+///         variable for a nettype name the module's own type hides (§26.5) and lowers tolerance
+///         range bounds to `$__xz_tolerance` (§11.4.13).
+/// \x6D includes downstream enum resolution and interface-port semantics with the upstream elaborator.
+pub const XEZIM_BYTECODE_MAGIC: &[u8; 8] = b"XEZIMBC\x6D";
 
 /// Name of the synthetic root that instantiates every top of a multi-top
 /// design (§23.3.3), each instance named after its module. It is not part of
@@ -609,6 +620,118 @@ pub struct LibraryCli {
     pub lib_exts: Option<Vec<String>>,
     /// Emit detailed parse and adoption diagnostics for explicit `-v` files.
     pub primitive_verbose: bool,
+    /// Which macros a library file starts from besides the command-line
+    /// defines (`--carry-src-macros`, `--carry-lib-macros`).
+    pub macro_carry: LibraryMacroCarry,
+}
+
+/// The text macros a `-v`/`-y` library file is preprocessed with. The
+/// command-line defines (`+define+`, `-D`) reach every library file in each
+/// mode; what else does is a tool choice, since §3.12.1 leaves how library
+/// files form compilation units to the tool.
+#[derive(Default, Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum LibraryMacroCarry {
+    /// Only the command-line defines: no macro of a source file or of another
+    /// library file, as in the reference simulator (the default).
+    #[default]
+    None,
+    /// The macros the source files left defined (`--carry-src-macros`).
+    Source,
+    /// Those, then the macros each library file read before this one left
+    /// defined, in read order (`--carry-lib-macros`): `-v` files in
+    /// command-line order, `-y` files in the order their modules resolve.
+    Library,
+}
+
+/// The `LibraryMacroCarry` of the installed library configuration, for a
+/// cache key: a design elaborated under one mode must not serve another.
+pub fn library_macro_carry() -> LibraryMacroCarry {
+    library_cli_cell()
+        .lock()
+        .map(|g| g.macro_carry)
+        .unwrap_or_default()
+}
+
+/// The macros the library files are read with (`resolve_library_modules`).
+#[derive(Default)]
+struct LibraryMacros {
+    /// What the next library file starts from: the command-line defines,
+    /// or under `Source` and `Library` the macros the source files left
+    /// defined, which already hold the command-line defines a source file
+    /// did not undefine; under `Library` also the macros of the library
+    /// files read so far.
+    next: std::collections::HashMap<String, preprocessor::MacroDef>,
+    /// The macros of the source files, and of the library files read so far,
+    /// that `next` leaves out: an undefined macro use in a library file that
+    /// names one gets a note naming the switch that carries it.
+    from_sources: std::collections::HashSet<String>,
+    from_libraries: std::collections::HashSet<String>,
+}
+
+impl LibraryMacros {
+    fn new(
+        carry: LibraryMacroCarry,
+        defines: &[(String, Option<String>)],
+        source_macros: std::collections::HashMap<String, preprocessor::MacroDef>,
+    ) -> Self {
+        match carry {
+            LibraryMacroCarry::None => {
+                let next = new_design_preprocessor(&[], defines).snapshot_defines();
+                let from_sources = source_macros
+                    .into_keys()
+                    .filter(|k| !next.contains_key(k))
+                    .collect();
+                Self {
+                    next,
+                    from_sources,
+                    ..Default::default()
+                }
+            }
+            LibraryMacroCarry::Source | LibraryMacroCarry::Library => Self {
+                next: source_macros,
+                ..Default::default()
+            },
+        }
+    }
+
+    /// After a library file was read with `pp`: under `Library` it leaves
+    /// its macros to the next one; otherwise note any use of a macro it did
+    /// not see that a carry switch would have passed it, and remember the
+    /// file's own macros for the files read after it.
+    fn after_file(
+        &mut self,
+        carry: LibraryMacroCarry,
+        pp: &preprocessor::Preprocessor,
+        path: &std::path::Path,
+    ) {
+        if carry == LibraryMacroCarry::Library {
+            self.next = pp.snapshot_defines();
+            return;
+        }
+        for name in pp.undefined_macros() {
+            let (origin, switch) = if self.from_sources.contains(&name) {
+                ("a source file", "--carry-src-macros")
+            } else if self.from_libraries.contains(&name) {
+                ("a library file read before it", "--carry-lib-macros")
+            } else {
+                continue;
+            };
+            elab_diag(format!(
+                "note: library file '{}' uses macro `{}, which {} defines; a library file \
+                 sees it only with {} (§22.5.1)",
+                path.display(),
+                name,
+                origin,
+                switch
+            ));
+        }
+        let own: Vec<String> = pp
+            .snapshot_defines()
+            .into_keys()
+            .filter(|k| !self.next.contains_key(k))
+            .collect();
+        self.from_libraries.extend(own);
+    }
 }
 
 static LIBRARY_CLI: std::sync::OnceLock<std::sync::Mutex<LibraryCli>> = std::sync::OnceLock::new();
@@ -946,8 +1069,8 @@ pub fn adopted_lib_files() -> Vec<(std::path::PathBuf, Vec<String>)> {
 }
 
 /// The text each adopted library file's definitions were parsed from, as
-/// `-v`/`-y` indexing preprocessed it (§22.5.1: from the design's macros and
-/// those of the library files read before it), or `None` when that
+/// `-v`/`-y` indexing preprocessed it (§22.5.1: from the macros its
+/// `LibraryMacroCarry` mode starts it from), or `None` when that
 /// preprocessing reported errors. Only adopted files are kept, the first
 /// read of a file named twice; recorded by `resolve_library_modules` and
 /// consumed by `preprocess_adopted_lib`, so `--dump-merged-sv` can append
@@ -1501,7 +1624,7 @@ pub fn parse_and_elaborate_multi_preprocessed(
     // IEEE 1801 power intent: splice the generated UPF package and glue
     // processes into the parsed design before elaboration.
     upf::inject(&mut all_descriptions, top_module_name)?;
-    let (lib_defines, module_timescales, module_ts_own_file) = match pre {
+    let (source_macros, module_timescales, module_ts_own_file) = match pre {
         Some(p) => (p.macro_defines, p.module_timescales, p.module_ts_own_file),
         None => (
             pp.snapshot_defines(),
@@ -1509,6 +1632,8 @@ pub fn parse_and_elaborate_multi_preprocessed(
             pp.module_ts_own_file.clone(),
         ),
     };
+    let macro_carry = library_macro_carry();
+    let lib_macros = LibraryMacros::new(macro_carry, defines, source_macros);
     // A `-v` library file supplies only modules, interfaces, programs and
     // primitives, so its packages are not compiled (#937). With
     // `--relax-library-packages` they are, as if the file were also a source
@@ -1529,12 +1654,13 @@ pub fn parse_and_elaborate_multi_preprocessed(
             })
             .collect();
         // §22.5.1: the module pass (`resolve_library_modules`) reads the
-        // `-v` files in this order, each from the macros the design and the
-        // files before it left. Read them the same way here, files without
-        // packages included, so a `` `define `` in one library file picks
-        // the same `` `ifdef `` branch of a later one in both passes: the
-        // package compiled here is then the one the adopted module imports.
-        let mut lib_macros = lib_defines.clone();
+        // `-v` files in this order, each from the macros `lib_macros.next`
+        // and, under `--carry-lib-macros`, the files before it left. Read
+        // them the same way here, files without packages included, so a
+        // `` `define `` in one library file picks the same `` `ifdef ``
+        // branch of a later one in both passes: the package compiled here is
+        // then the one the adopted module imports.
+        let mut pkg_macros = lib_macros.next.clone();
         for file in lib_files {
             let path = std::path::PathBuf::from(&file);
             // An unreadable file is reported when the library is indexed.
@@ -1545,11 +1671,13 @@ pub fn parse_and_elaborate_multi_preprocessed(
             for dir in include_dirs {
                 lpp.add_include_dir(std::path::PathBuf::from(dir));
             }
-            for (name, def) in &lib_macros {
+            for (name, def) in &pkg_macros {
                 lpp.define(name.clone(), def.clone());
             }
             let preprocessed = lpp.preprocess_file(&text, Some(&path));
-            lib_macros = lpp.snapshot_defines();
+            if macro_carry == LibraryMacroCarry::Library {
+                pkg_macros = lpp.snapshot_defines();
+            }
             let line_map = lpp.take_line_map();
             let result = sv_parser::parse(&preprocessed);
             let line_map = line_map.filter(|_| result.source_text == preprocessed);
@@ -1598,7 +1726,7 @@ pub fn parse_and_elaborate_multi_preprocessed(
         all_descriptions,
         top_module_name,
         include_dirs,
-        &lib_defines,
+        lib_macros,
         &module_timescales,
         &module_ts_own_file,
     );
@@ -1913,7 +2041,7 @@ fn parse_and_elaborate(
     mut all_descriptions: Vec<ast::Description>,
     top_module_name: Option<&str>,
     include_dirs: &[String],
-    lib_defines: &std::collections::HashMap<String, preprocessor::MacroDef>,
+    lib_macros: LibraryMacros,
     module_timescales: &std::collections::HashMap<String, (f64, f64)>,
     module_ts_own_file: &std::collections::HashSet<String>,
 ) -> Result<
@@ -1954,6 +2082,31 @@ fn parse_and_elaborate(
     oom_trace::checkpoint("prepare.body_types.ready", &[]);
     pkg_scope::qualify_colliding_package_types(&mut all_descriptions)?;
     oom_trace::checkpoint("prepare.package_types.ready", &[]);
+    // §6.6.7: the compilation-unit and package nettypes, whose nets keep a
+    // delay in the type's argument list for the delay rewrite to scale.
+    {
+        let mut names = crate::hasher::HashSet::default();
+        for desc in &all_descriptions {
+            match desc {
+                ast::Description::PackageItem(ast::decl::PackageItem::Nettype(n)) => {
+                    names.insert(n.name.name.clone());
+                }
+                ast::Description::Package(p) => {
+                    for item in &p.items {
+                        if let ast::decl::PackageItem::Nettype(n) = item {
+                            // A colliding name already carries its package.
+                            if !n.name.name.contains("::") {
+                                names.insert(format!("{}::{}", p.name.name, n.name.name));
+                            }
+                            names.insert(n.name.name.clone());
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        elaborate::set_design_nettype_names(names);
+    }
     // §8.25.1: the parameterized classes whose typedefs name a member of a
     // type parameter, for `Cls#(args)::t` lookups.
     elaborate::class_scope_types::install(&all_descriptions);
@@ -3169,7 +3322,7 @@ fn parse_and_elaborate(
         resolve_library_modules(
             &mut definitions,
             include_dirs,
-            lib_defines,
+            lib_macros,
             &lib_cli,
             &top_level_binds,
         )?;
@@ -4638,7 +4791,7 @@ fn resolve_instance_binds(
     Ok(changed)
 }
 
-fn collect_instantiated_modules(
+pub(crate) fn collect_instantiated_modules(
     items: &[ast::decl::ModuleItem],
     set: &mut std::collections::HashSet<String>,
 ) {
@@ -4727,7 +4880,7 @@ fn make_multi_top_wrapper(modules: &[String]) -> ast::module::ModuleDeclaration 
 fn resolve_library_modules(
     definitions: &mut crate::hasher::HashMap<String, SourceDefinition>,
     include_dirs: &[String],
-    lib_defines: &std::collections::HashMap<String, preprocessor::MacroDef>,
+    mut lib_macros: LibraryMacros,
     lib_cli: &LibraryCli,
     unit_binds: &[ast::decl::BindDirective],
 ) -> Result<(), String> {
@@ -4815,15 +4968,12 @@ fn resolve_library_modules(
     // Per entry of `lib_sources.files`: its file, and whether it preprocessed
     // without errors (see `preprocess_adopted_lib`).
     let mut indexed: Vec<(std::path::PathBuf, bool)> = Vec::new();
-    // The macros defined so far: the design's, then each library file's as
-    // it is read (see `index_library_file`).
-    let mut lib_macros = lib_defines.clone();
     #[allow(clippy::too_many_arguments)]
     fn index_library_file(
         path: std::path::PathBuf,
         explicit_v: bool,
         include_dirs: &[String],
-        lib_defines: &mut std::collections::HashMap<String, preprocessor::MacroDef>,
+        lib_macros: &mut LibraryMacros,
         lib_cli: &LibraryCli,
         lib: &mut crate::hasher::HashMap<String, SourceDefinition>,
         lib_typedefs: &mut Vec<Rc<ast::decl::TypedefDeclaration>>,
@@ -4849,18 +4999,16 @@ fn resolve_library_modules(
         for dir in include_dirs {
             pp.add_include_dir(std::path::PathBuf::from(dir));
         }
-        for (name, def) in lib_defines.iter() {
+        for (name, def) in lib_macros.next.iter() {
             pp.define(name.clone(), def.clone());
         }
         let preprocessed = pp.preprocess_file(&source, Some(&path));
-        // §22.5.1, §3.12.1: a library file is read as part of the one
-        // compilation, so a macro it defines (or an `include` of the
-        // design's headers defines) stays defined for every library file
-        // read after it, and one it undefines is gone. Each file started
-        // from only the design's macros, so a library module that included
-        // the headers did not share them with the library modules it
-        // instantiates.
-        *lib_defines = pp.snapshot_defines();
+        // §22.5.1, §3.12.1: under `--carry-lib-macros` the library files
+        // share one compilation unit, so a macro this file defines (or an
+        // `include` of the design's headers defines) stays defined for every
+        // library file read after it, and one it undefines is gone. Otherwise
+        // each file starts from the same macros again.
+        lib_macros.after_file(lib_cli.macro_carry, &pp, &path);
         let line_map = pp.take_line_map();
         // A missing `include or illegal directive in a library file: nothing
         // else reports the preprocessor's list on this path.
@@ -5107,8 +5255,9 @@ fn resolve_library_modules(
         }
         seed.extend(names);
     }
-    // Resolved in a fixed order: library files are read, and their macros
-    // defined (§22.5.1), in the order their modules are resolved.
+    // Resolved in a fixed order: library files are read, and under
+    // `--carry-lib-macros` their macros defined (§22.5.1), in the order
+    // their modules are resolved.
     let mut work: Vec<String> = seed.into_iter().collect();
     work.sort_unstable_by(|a, b| b.cmp(a));
     let mut unresolved: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
