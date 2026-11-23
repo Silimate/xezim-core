@@ -31,12 +31,13 @@
 //! constant initializers keep its member names bare during registration.
 //! Constants reached through imports retain their package qualification.
 //!
-//! Names declared in one place only are left alone, so a design without
-//! such a collision is not touched at all.
+//! Unambiguous package and compilation-unit type references keep their
+//! spelling and carry their lexical declaration key in the AST binding.
 
 use crate::hasher::{HashMap, HashSet};
 
 use crate::ast::Description;
+use crate::ast::binding::Bound;
 use crate::ast::decl::*;
 use crate::ast::expr::{
     AssignmentPatternItem, ExprKind, Expression, HierPathSegment, HierarchicalIdentifier,
@@ -49,6 +50,13 @@ thread_local! {
     /// Enum member names this pass disambiguates (see `member_is_qualified`).
     static QUALIFIED_MEMBERS: std::cell::RefCell<HashSet<String>> =
         std::cell::RefCell::new(HashSet::default());
+    static EXTERNAL_TYPE_KEYS: std::cell::RefCell<Vec<String>> = const {
+        std::cell::RefCell::new(Vec::new())
+    };
+}
+
+pub(crate) fn external_type_key(bound: Bound) -> Option<String> {
+    EXTERNAL_TYPE_KEYS.with(|keys| keys.borrow().get(bound.external_type_index()?).cloned())
 }
 
 /// True when `name` is an enum member declared by a package and somewhere
@@ -90,6 +98,7 @@ struct PkgInfo {
 
 struct Info {
     pkgs: HashMap<String, PkgInfo>,
+    external_types: HashSet<String>,
     /// Type names declared by a package AND somewhere else.
     colliding: HashSet<String>,
     /// Enum member names declared by a package AND somewhere else.
@@ -823,6 +832,7 @@ enum Wild {
 struct Rw<'a> {
     info: &'a Info,
     frames: Vec<Frame>,
+    external_keys: HashMap<String, Bound>,
     errors: Vec<String>,
     /// Inside a constant context (a data type, a parameter, a generate
     /// condition): enum member references stay bare there, since they are
@@ -888,8 +898,10 @@ pub fn stamp_automatic_subroutines(descs: &mut [Description]) {
 
 pub fn qualify_colliding_package_types(descs: &mut [Description]) -> Result<(), String> {
     QUALIFIED_MEMBERS.with(|m| m.borrow_mut().clear());
+    EXTERNAL_TYPE_KEYS.with(|keys| keys.borrow_mut().clear());
 
-    let Some(info) = collect(descs) else {
+    let unit = unit_frame(descs);
+    let Some(info) = collect(descs, &unit) else {
         return Ok(());
     };
 
@@ -899,14 +911,13 @@ pub fn qualify_colliding_package_types(descs: &mut [Description]) -> Result<(), 
     });
     let mut rw = Rw {
         info: &info,
-        frames: Vec::new(),
+        frames: vec![unit],
+        external_keys: HashMap::default(),
         errors: Vec::new(),
         in_const: 0,
         inline_depth: 0,
         warned: Default::default(),
     };
-    let unit = unit_frame(descs);
-    rw.frames.push(unit);
     for d in descs.iter_mut() {
         rw.description(d);
     }
@@ -916,19 +927,22 @@ pub fn qualify_colliding_package_types(descs: &mut [Description]) -> Result<(), 
     }
 }
 
-/// Gather every package's type names and imports; `None` when no type name
-/// is declared by a package and anywhere else (nothing to do).
-fn collect(descs: &[Description]) -> Option<Info> {
+/// Gather lexical type declarations and imports.
+fn collect(descs: &[Description], unit: &Frame) -> Option<Info> {
     let all_classes = design_classes(descs);
     // Classes also need qualification without packages. Otherwise a design
     // with no packages cannot contribute any colliding names to this pass.
-    if all_classes.is_empty() && !descs.iter().any(|d| matches!(d, Description::Package(_))) {
+    if all_classes.is_empty()
+        && unit.types.is_empty()
+        && !descs.iter().any(|d| matches!(d, Description::Package(_)))
+    {
         return None;
     }
     let mut pkgs: HashMap<String, PkgInfo> = HashMap::default();
     let mut other: HashSet<String> = HashSet::default();
     let mut other_members: HashSet<String> = HashSet::default();
     let mut other_values: HashSet<String> = HashSet::default();
+    let mut module_values: HashSet<String> = HashSet::default();
     for d in descs {
         match d {
             Description::Package(p) => {
@@ -1007,6 +1021,7 @@ fn collect(descs: &[Description]) -> Option<Info> {
                 }
                 module_level_types(&m.items, &mut other, &mut other_members);
                 module_dpi_names(&m.items, &mut other_values);
+                module_level_values(&m.ports, &m.items, &mut module_values, &mut other_members);
             }
             Description::Interface(m) => {
                 for pd in &m.params {
@@ -1014,6 +1029,7 @@ fn collect(descs: &[Description]) -> Option<Info> {
                 }
                 module_level_types(&m.items, &mut other, &mut other_members);
                 module_dpi_names(&m.items, &mut other_values);
+                module_level_values(&m.ports, &m.items, &mut module_values, &mut other_members);
             }
             Description::Program(m) => {
                 for pd in &m.params {
@@ -1021,6 +1037,7 @@ fn collect(descs: &[Description]) -> Option<Info> {
                 }
                 module_level_types(&m.items, &mut other, &mut other_members);
                 module_dpi_names(&m.items, &mut other_values);
+                module_level_values(&m.ports, &m.items, &mut module_values, &mut other_members);
             }
             _ => {}
         }
@@ -1044,7 +1061,13 @@ fn collect(descs: &[Description]) -> Option<Info> {
     let colliding_members = clash(|pi| &pi.members, &|n| {
         other_members.contains(n) || other_values.contains(n)
     });
-    let colliding_values = clash(|pi| &pi.values, &|n| other_values.contains(n));
+    let mut colliding_values = clash(|pi| &pi.values, &|n| other_values.contains(n));
+    // §23.8.1: a module data name can collide with a flattened package
+    // value. It does not change a package subroutine's import binding.
+    for pi in pkgs.values() {
+        colliding_values.extend(pi.params.iter().chain(&pi.vars)
+            .filter(|name| module_values.contains(*name)).cloned());
+    }
     let pkg_params: HashSet<String> = pkgs
         .values()
         .flat_map(|pi| pi.params.iter().cloned())
@@ -1167,7 +1190,10 @@ fn collect(descs: &[Description]) -> Option<Info> {
             &mut class_by_bare,
         );
     }
-    if colliding.is_empty()
+    let mut external_types = unit.types.clone();
+    external_types.extend(pkgs.values().flat_map(|pkg| pkg.types.iter().cloned()));
+    if external_types.is_empty()
+        && colliding.is_empty()
         && colliding_members.is_empty()
         && colliding_values.is_empty()
         && pkg_params.is_empty()
@@ -1179,6 +1205,7 @@ fn collect(descs: &[Description]) -> Option<Info> {
     }
     Some(Info {
         pkgs,
+        external_types,
         colliding,
         colliding_members,
         colliding_values,
@@ -1226,6 +1253,49 @@ fn module_level_types(
             }
             _ => {}
         }
+    }
+}
+
+/// §23.3.2, §26.3: the parameters, ports, nets and variables a module,
+/// interface or program declares at its own level. The design is flattened
+/// into one name space whose bare names are its top-level scope's, so an
+/// instance's bare reference to a package value or enum member it imports
+/// is spelled `pkg::name` once any of them reuses that name.
+fn module_level_values(
+    ports: &PortList,
+    items: &[ModuleItem],
+    values: &mut HashSet<String>,
+    members: &mut HashSet<String>,
+) {
+    let port_names: Vec<String> = match ports {
+        PortList::Ansi(ps) => ps.iter().map(|p| p.name.name.clone()).collect(),
+        PortList::NonAnsi(ids) => ids.iter().map(|id| id.name.clone()).collect(),
+        PortList::Empty => Vec::new(),
+    };
+    members.extend(port_names.iter().cloned());
+    values.extend(port_names);
+    for it in items {
+        let mut names: HashSet<String> = HashSet::default();
+        match it {
+            ModuleItem::PortDeclaration(p) => {
+                names.extend(p.declarators.iter().map(|d| d.name.name.clone()))
+            }
+            ModuleItem::NetDeclaration(n) => {
+                names.extend(n.declarators.iter().map(|d| d.name.name.clone()))
+            }
+            ModuleItem::DataDeclaration(d) => {
+                names.extend(d.declarators.iter().map(|d| d.name.name.clone()))
+            }
+            ModuleItem::ParameterDeclaration(p) | ModuleItem::LocalparamDeclaration(p) => {
+                param_names(p, &mut HashSet::default(), &mut names)
+            }
+            ModuleItem::GenerateRegion(g) => {
+                module_level_values(&PortList::Empty, &g.items, values, members)
+            }
+            _ => {}
+        }
+        members.extend(names.iter().cloned());
+        values.extend(names);
     }
 }
 
@@ -1489,7 +1559,7 @@ impl Rw<'_> {
     /// makes `n` invisible here. With --relax-wildcard-import-conflict the
     /// first of them in the order of the imports is the binding instead,
     /// with a warning naming them.
-    fn wild_candidate(&self, f: &Frame, n: &str, owner: impl Fn(&str) -> Option<String>) -> Wild {
+    fn wild_candidate(&self, f: &Frame, n: &str, bind: bool, owner: impl Fn(&str) -> Option<String>) -> Wild {
         let mut cands: Vec<String> = Vec::new();
         for q in &f.wild {
             if let Some(o) = owner(q.as_str())
@@ -1507,7 +1577,9 @@ impl Rw<'_> {
         if cands.len() > 1 {
             self.warn_conflict(f, n, &cands);
         }
-        Self::bind_wild(f, n, |q| owner(q).is_some());
+        if bind {
+            Self::bind_wild(f, n, |q| owner(q).is_some());
+        }
         Wild::One(first)
     }
 
@@ -1549,9 +1621,13 @@ impl Rw<'_> {
     }
 
     fn resolve(&self, n: &str) -> Res {
+        self.resolve_type(n, false)
+    }
+
+    fn resolve_type(&self, n: &str, external: bool) -> Res {
         let pkg_col = self.info.colliding.contains(n);
         let cls_col = self.info.class_colliding.contains(n);
-        if !pkg_col && !cls_col && !self.info.hiding.contains(n) {
+        if !external && !pkg_col && !cls_col && !self.info.hiding.contains(n) {
             return Res::Keep;
         }
         for f in self.frames.iter().rev() {
@@ -1575,7 +1651,7 @@ impl Rw<'_> {
                     }
                 }
             }
-            if !pkg_col {
+            if !pkg_col && !external {
                 if f.types.contains(n) {
                     return Res::Keep;
                 }
@@ -1587,6 +1663,9 @@ impl Rw<'_> {
                 }
             }
             if f.types.contains(n) {
+                if external && f.pkg.is_none() && std::ptr::eq(f, &self.frames[0]) {
+                    return Res::To(mangle("$unit", n));
+                }
                 return Res::Keep;
             }
             if let Some(q) = f.explicit.get(n).or(f.bound.borrow().get(n)) {
@@ -1595,7 +1674,7 @@ impl Rw<'_> {
                     None => Res::Keep,
                 };
             }
-            match self.wild_candidate(f, n, |q| self.info.owner(q, n, 0)) {
+            match self.wild_candidate(f, n, !external, |q| self.info.owner(q, n, 0)) {
                 Wild::None => {}
                 Wild::One(o) => return Res::To(mangle(&o, n)),
                 Wild::Many(c) => return Res::Ambiguous(c, self.scope_label(f)),
@@ -1630,7 +1709,7 @@ impl Rw<'_> {
             if let Some(q) = f.explicit.get(n).or(f.bound.borrow().get(n)) {
                 return owner(q).filter(|q| is_member(q));
             }
-            match self.wild_candidate(f, n, owner) {
+            match self.wild_candidate(f, n, true, owner) {
                 Wild::None => {}
                 Wild::One(o) => return is_member(&o).then_some(o),
                 // Not visible (§26.3); left to the existing diagnostics.
@@ -1683,7 +1762,7 @@ impl Rw<'_> {
             if let Some(q) = f.explicit.get(n).or(f.bound.borrow().get(n)) {
                 return self.info.value_owner(q, n, 0);
             }
-            match self.wild_candidate(f, n, |q| self.info.value_owner(q, n, 0)) {
+            match self.wild_candidate(f, n, true, |q| self.info.value_owner(q, n, 0)) {
                 Wild::None => {}
                 Wild::One(o) => return Some(o),
                 Wild::Many(_) => return None,
@@ -1724,7 +1803,7 @@ impl Rw<'_> {
                     .filter(|o| declares(o))
                     .map(|o| mangle(&o, n));
             }
-            match self.wild_candidate(f, n, |q| self.info.value_owner(q, n, 0)) {
+            match self.wild_candidate(f, n, true, |q| self.info.value_owner(q, n, 0)) {
                 Wild::None => {}
                 Wild::One(o) => return Some(o).filter(|o| declares(o)).map(|o| mangle(&o, n)),
                 Wild::Many(_) => return None,
@@ -2008,6 +2087,7 @@ impl Rw<'_> {
         }
         if tn.scopes.is_empty() {
             self.type_ident(&mut tn.name);
+            tn.bound = self.external_type_binding(&tn.name.name);
             return;
         }
         // `C::t` (`Outer::Inner::t`, `pkg::C::t`) naming a renamed class-scoped type.
@@ -2056,6 +2136,25 @@ impl Rw<'_> {
         }
         // `C::t` / `C#(..)::t` with C itself a colliding class name.
         self.type_ident(&mut tn.scopes[0].name);
+    }
+
+    /// Save the declaration key for the consumers that need type identity.
+    /// Keep the existing storage spelling for layout and value lookup.
+    fn external_type_binding(&mut self, name: &str) -> Bound {
+        if !self.info.external_types.contains(name) {
+            return Bound::UNSET;
+        }
+        let Res::To(key) = self.resolve_type(name, true) else {
+            return Bound::UNSET;
+        };
+        *self.external_keys.entry(key.clone()).or_insert_with(|| {
+            EXTERNAL_TYPE_KEYS.with(|keys| {
+                let mut keys = keys.borrow_mut();
+                let bound = Bound::external_type(keys.len() as u32);
+                keys.push(key);
+                bound
+            })
+        })
     }
 
     fn dtype(&mut self, dt: &mut DataType) {
@@ -2432,6 +2531,16 @@ impl Rw<'_> {
                     self.ambiguous(&n, &c, &scope);
                 }
                 args.iter_mut().for_each(|a| self.expr(a));
+                if name == "$__xz_named_cast"
+                    && let Some(target) = args.first_mut()
+                    && let Some(n) = plain_ident(target)
+                    && !self.value_shadowed(n)
+                {
+                    let bound = self.external_type_binding(n);
+                    if let ExprKind::Ident(h) = &mut target.kind {
+                        h.bound = bound;
+                    }
+                }
                 // `payload_t'(v)` whose typedef was replaced by a type.
                 if name == "$__xz_named_cast"
                     && args
