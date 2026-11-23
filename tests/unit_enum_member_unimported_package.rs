@@ -29,6 +29,23 @@ endmodule
     assert_eq!(d.parameters["tb_pkg::EEW8"].to_i64(), Some(8));
 }
 
+/// §26.3: a module constant reads the imported enum member ahead of the
+/// parameter in the enclosing compilation unit.
+#[test]
+fn imported_member_in_a_constant_beats_unit_parameter() {
+    let d = elaborate(
+        r#"
+parameter RED = 0;
+package p; typedef enum int { RED = 64 } op_t; endpackage
+module t;
+  import p::*;
+  localparam int SELECTED = RED;
+endmodule
+"#,
+    );
+    assert_eq!(d.parameters["SELECTED"].to_i64(), Some(64));
+}
+
 #[test]
 fn module_member_keeps_its_bare_entry() {
     let d = elaborate(
