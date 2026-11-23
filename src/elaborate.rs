@@ -7263,11 +7263,16 @@ fn hoist_package_params(defs: &HashMap<String, Definition>, elab: &mut Elaborate
                     // overlay in the hoist loop below.
                     alias_pkg_param(elab, &p.name.name, &assign.name.name, &v);
                     let scoped = format!("{}.{}", p.name.name, assign.name.name);
-                    // Package references in initializers are scope-qualified.
-                    // Make this parameter's layout available to later member
-                    // selections before a module uses their values as widths.
-                    if assign.dimensions.is_empty()
-                        && !matches!(data_type, DataType::TypeReference { dimensions, .. } if !dimensions.is_empty())
+                    // IEEE 1800-2017 §6.20.2, §7.2.1, §26.3: a dependent
+                    // constant selects this packed member in the declaring
+                    // package, before a consumer uses the value as a width.
+                    let may_be_struct = match data_type {
+                        DataType::Struct(_) => true,
+                        DataType::TypeReference { dimensions, .. } => dimensions.is_empty(),
+                        _ => false,
+                    };
+                    if may_be_struct
+                        && assign.dimensions.is_empty()
                         && let Some(fields) = flatten_struct_fields(
                             data_type,
                             &elab.parameters,
