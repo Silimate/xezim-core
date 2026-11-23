@@ -2883,8 +2883,11 @@ impl ElaboratedModule {
                 })
             }) {
                 Some(parts) => {
-                    for e in parts {
-                        f(e);
+                    for mut part in parts {
+                        part.delay_exprs = ca.delay_exprs.clone();
+                        part.delay_fall = ca.delay_fall;
+                        part.delay_off = ca.delay_off;
+                        f(part);
                     }
                 }
                 None => f(ca),
