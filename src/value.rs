@@ -1426,6 +1426,46 @@ impl Value {
         }
     }
 
+    /// IEEE 1800-2023 §11.4.13: one bound of the tolerance range `[a +/- b]`,
+    /// or of `[a +%- b]` when `relative`. The tolerance is `b`, or
+    /// `a * b / 100.0`, converted to the type of `a` -- truncated, not
+    /// rounded, from real to integral -- and the range runs from the lower to
+    /// the higher of `a - tolerance` and `a + tolerance`.
+    pub fn tolerance_bound(a: &Value, b: &Value, relative: bool, upper: bool) -> Value {
+        if a.is_real {
+            let c = a.to_f64();
+            let t = if relative {
+                c * b.to_f64() / 100.0
+            } else {
+                b.to_f64()
+            };
+            let (lo, hi) = if t < 0.0 {
+                (c + t, c - t)
+            } else {
+                (c - t, c + t)
+            };
+            return Value::from_f64(if upper { hi } else { lo });
+        }
+        let width = a.width.max(1);
+        if a.has_xz() || (!b.is_real && b.has_xz()) {
+            let mut x = Value::all_x(width);
+            x.is_signed = a.is_signed;
+            return x;
+        }
+        let mut tolerance = if relative {
+            Value::from_real_wrapped((a.to_f64() * b.to_f64() / 100.0).trunc(), width)
+        } else if b.is_real {
+            Value::from_real_wrapped(b.to_f64().trunc(), width)
+        } else {
+            b.resize(width)
+        };
+        tolerance.is_signed = a.is_signed;
+        let minus = a.sub(&tolerance);
+        let plus = a.add(&tolerance);
+        let plus_is_lower = plus.less_than(&minus).to_u64() == Some(1);
+        if upper == plus_is_lower { minus } else { plus }
+    }
+
     /// IEEE 1800-2023 §20.5: `$rtoi(r)`, a signed 32-bit `integer` holding `r`
     /// truncated toward zero. The truncated value is taken as a 64-bit
     /// integer whose low 32 bits are the result; a value outside the 64-bit
