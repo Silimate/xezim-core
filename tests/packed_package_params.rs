@@ -47,6 +47,27 @@ endmodule
 }
 
 #[test]
+fn unqualified_wide_parameter_member_sizes_a_consuming_net() {
+    let design = elaborate(
+        r#"
+package types;
+  typedef struct packed { logic [1140:0] hi; logic [11:0] irq; logic [1140:0] lo; } config_t;
+endpackage
+package opts;
+  import types::config_t;
+  parameter config_t pt = {1141'b0, 12'd255, 1141'b0};
+  parameter int unsigned count = pt.irq - 43;
+endpackage
+module top;
+  wire [opts::count-1:0] bus;
+  localparam int bus_width = $bits(bus);
+endmodule
+"#,
+    );
+    assert_eq!(design.parameters["bus_width"].to_u64(), Some(212));
+}
+
+#[test]
 fn packed_package_parameter_index_selects_an_element() {
     let design = elaborate(
         r#"
