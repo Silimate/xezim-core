@@ -49,6 +49,9 @@ pub struct DesignNames {
     /// §23.9: module, interface, program, package, checker and primitive
     /// names, which can start a path.
     definitions: HashSet<String>,
+    /// §23.3.1: the modules, interfaces and programs nothing instantiates:
+    /// the top-level instances.
+    tops: HashSet<String>,
 }
 
 #[derive(Default)]
@@ -60,6 +63,22 @@ struct ClassNames {
 impl DesignNames {
     pub fn collect(descs: &[Description]) -> Self {
         let mut n = Self::default();
+        let mut instantiated = std::collections::HashSet::new();
+        for d in descs {
+            let (name, items) = match d {
+                Description::Module(m) => (&m.name, &m.items),
+                Description::Interface(m) => (&m.name, &m.items),
+                Description::Program(m) => (&m.name, &m.items),
+                Description::Bind(b) => {
+                    instantiated.insert(b.instantiation.module_name.name.clone());
+                    continue;
+                }
+                _ => continue,
+            };
+            crate::collect_instantiated_modules(items, &mut instantiated);
+            n.tops.insert(name.name.clone());
+        }
+        n.tops.retain(|t| !instantiated.contains(t));
         for d in descs {
             let def = match d {
                 Description::Module(m) => Some(&m.name),
@@ -614,6 +633,18 @@ impl<'a> Binder<'a> {
         outcome.bound()
     }
 
+    fn note_type_declaration_order(&self, bound: Bound, site: Span) -> Bound {
+        if let Some(id) = bound.as_decl() {
+            let decl = &self.tree.decls[id.0 as usize];
+            if matches!(decl.kind, DeclKind::Typedef | DeclKind::TypeParam)
+                && decl.span.start > site.start
+            {
+                return bound.with_late_type_declaration();
+            }
+        }
+        bound
+    }
+
     fn head(&mut self, h: &mut HierarchicalIdentifier) {
         let Some(first) = h.path.first() else { return };
         // `NO_TARGET` here is the parser's `$unit::f(...)` (§3.12.1) or a
@@ -623,7 +654,7 @@ impl<'a> Binder<'a> {
         } else {
             self.resolve(&first.name.name, h.path.len() == 1)
         };
-        h.bound = match outcome {
+        let bound = match outcome {
             Outcome::Decl(d) => {
                 let decl = &self.tree.decls[d.0 as usize];
                 match decl.kind == DeclKind::ImplicitNet && decl.scope != self.tree.root {
@@ -633,6 +664,9 @@ impl<'a> Binder<'a> {
             }
             _ => outcome.bound(),
         };
+        if h.bound.external_type_index().is_none() {
+            h.bound = self.note_type_declaration_order(bound, first.name.span);
+        }
         if self.mentions.is_some() {
             let name = first.name.name.clone();
             self.note(h.span, &name, outcome);
@@ -1406,7 +1440,10 @@ impl<'a> Binder<'a> {
                 ..
             } => {
                 if name.scopes.is_empty() {
-                    name.bound = self.ident(&name.name);
+                    let bound = self.ident(&name.name);
+                    if name.bound.external_type_index().is_none() {
+                        name.bound = self.note_type_declaration_order(bound, name.name.span);
+                    }
                 }
                 for s in &mut name.scopes {
                     s.type_args.iter_mut().for_each(|a| self.expr(a));
@@ -1476,7 +1513,7 @@ impl<'a> Binder<'a> {
             | StatementKind::RsReturn => {}
             StatementKind::Expr(e) => self.expr(e),
             StatementKind::BlockingAssign { lvalue, rvalue } => {
-                self.expr(lvalue);
+                self.procedural_target(lvalue);
                 self.expr(rvalue);
             }
             StatementKind::NonblockingAssign {
@@ -1484,7 +1521,7 @@ impl<'a> Binder<'a> {
                 delay,
                 rvalue,
             } => {
-                self.expr(lvalue);
+                self.procedural_target(lvalue);
                 if let Some(d) = delay {
                     self.expr(d);
                 }
@@ -1609,11 +1646,11 @@ impl<'a> Binder<'a> {
             StatementKind::ProceduralContinuous(pc) => match pc {
                 ProceduralContinuous::Assign { lvalue, rvalue }
                 | ProceduralContinuous::Force { lvalue, rvalue } => {
-                    self.expr(lvalue);
+                    self.procedural_target(lvalue);
                     self.expr(rvalue);
                 }
                 ProceduralContinuous::Deassign(e) | ProceduralContinuous::Release(e) => {
-                    self.expr(e)
+                    self.procedural_target(e)
                 }
             },
             // §6.5: a declaration hides from its point to the block's end.
@@ -1803,6 +1840,143 @@ impl<'a> Binder<'a> {
             ConstraintItem::Block(items) => self.constraints(items),
             ConstraintItem::Unique { exprs, .. } => exprs.iter_mut().for_each(|e| self.expr(e)),
         }
+    }
+
+    /// §23.6: a dotted path can parse as member and index expressions.
+    /// Fold only paths that start at a known top instance. Indexes below
+    /// the final member stay ordinary select expressions in `expr`.
+    fn top_member_path(&self, e: &Expression) -> Option<HierarchicalIdentifier> {
+        fn collect<'a>(
+            e: &'a Expression,
+            tail: &mut Vec<Result<&'a Identifier, &'a Expression>>,
+        ) -> Option<&'a HierarchicalIdentifier> {
+            match &e.kind {
+                ExprKind::MemberAccess { expr, member } => {
+                    tail.push(Ok(member));
+                    collect(expr, tail)
+                }
+                ExprKind::Index { expr, index } => {
+                    tail.push(Err(index));
+                    collect(expr, tail)
+                }
+                ExprKind::Ident(h) => Some(h),
+                _ => None,
+            }
+        }
+        let mut tail = Vec::new();
+        let base = collect(e, &mut tail)?;
+        let head = base.path.first()?;
+        if base.root.is_some() || !head.selects.is_empty() {
+            return None;
+        }
+        let explicit = head.name.name == "$root";
+        let top = if explicit {
+            base.path.get(1).map(|seg| &seg.name).or_else(|| match tail.last()? {
+                Ok(id) => Some(*id),
+                Err(_) => None,
+            })?
+        } else {
+            &head.name
+        };
+        if !self.names.tops.contains(top.name.as_str())
+            || (!explicit && (self.names.packages.contains_key(top.name.as_str())
+                || self.resolve(&top.name, false) != Outcome::None(Hide::Qualified)))
+        {
+            return None;
+        }
+        let mut path = base.path.clone();
+        for step in tail.into_iter().rev() {
+            match step {
+                Ok(name) => path.push(crate::ast::expr::HierPathSegment {
+                    name: name.clone(),
+                    selects: Vec::new(),
+                }),
+                Err(index) => path.last_mut()?.selects.push(index.clone()),
+            }
+        }
+        Some(HierarchicalIdentifier {
+            path,
+            root: None,
+            span: e.span,
+            cached_signal_id: crate::ast::cache::SignalCache::new(None),
+            cached_resolved_name: crate::ast::cache::NameCache::new(),
+            bound: Bound::UNSET,
+        })
+    }
+
+    /// §23.6: the procedural store paths need an absolute instance name
+    /// before lowering selects. Keep expression and declaration lookup in
+    /// their original shape. Ordinary member/index targets are unchanged.
+    fn procedural_target(&mut self, e: &mut Expression) {
+        fn normalize(this: &Binder<'_>, e: &mut Expression) {
+            match &mut e.kind {
+                ExprKind::Index { expr, .. } | ExprKind::RangeSelect { expr, .. } => {
+                    normalize(this, expr);
+                    return;
+                }
+                ExprKind::Concatenation(parts) => {
+                    for part in parts {
+                        normalize(this, part);
+                    }
+                    return;
+                }
+                ExprKind::Paren(inner) => {
+                    normalize(this, inner);
+                    return;
+                }
+                ExprKind::Ident(_) | ExprKind::MemberAccess { .. } => {}
+                _ => return,
+            }
+            let Some(mut path) = this.top_member_path(e) else { return };
+            let explicit = usize::from(path.path[0].name.name == "$root");
+            let Some(first) = path.path.get(explicit + 1) else { return };
+            let indexed_scope = path.path[explicit + 1..path.path.len() - 1]
+                .iter().any(|seg| !seg.selects.is_empty());
+            let mut own_instance = false;
+            if path.path[explicit].name.name == this.tree.def
+                && let Outcome::Decl(id) = this.resolve(&first.name.name, false)
+            {
+                let declaration = &this.tree.decls[id.0 as usize];
+                if declaration.scope != this.tree.root
+                    || !matches!(declaration.kind, DeclKind::Instance | DeclKind::Label)
+                {
+                    // A local array or aggregate already uses its own
+                    // rooted member/element resolver, including dynamic indices.
+                    return;
+                }
+                own_instance = declaration.kind == DeclKind::Instance;
+            }
+            if own_instance && !indexed_scope {
+                path.path.drain(..=explicit);
+            } else if explicit == 0 {
+                let mut root = path.path[0].clone();
+                root.name.name = "$root".to_string();
+                path.path.insert(0, root);
+            } else {
+                // The original explicitly rooted shape already identifies
+                // the absolute target when it cannot be shortened safely.
+                return;
+            }
+            // The parser can attach the first packed index to the last
+            // path segment when another select follows it (`mem[3][7:0]`).
+            // After rebasing a named instance, preserve it as a data select,
+            // separate from the indexes that enter instance scopes.
+            let selections = if own_instance && !indexed_scope {
+                std::mem::take(&mut path.path.last_mut().unwrap().selects)
+            } else {
+                Vec::new()
+            };
+            let mut target = Expression::new(ExprKind::Ident(path), e.span);
+            for index in selections {
+                target = Expression::new(ExprKind::Index {
+                    expr: Box::new(target),
+                    index: Box::new(index),
+                }, e.span);
+            }
+            *e = target;
+        }
+        normalize(self, e);
+        self.expr(e);
     }
 
     fn expr(&mut self, e: &mut Expression) {
