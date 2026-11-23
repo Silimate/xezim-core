@@ -328,6 +328,17 @@ impl<'a> Parser<'a> {
                     (d.direction, d.data_type)
                 }
             };
+            if dir == PortDirection::Inout && items.iter().any(|item| match item {
+                ModuleItem::PortDeclaration(d) => d.declarators.iter()
+                    .any(|v| v.name.name == id.name && !v.dimensions.is_empty()),
+                ModuleItem::NetDeclaration(d) => d.declarators.iter()
+                    .any(|v| v.name.name == id.name && !v.dimensions.is_empty()),
+                ModuleItem::DataDeclaration(d) => d.declarators.iter()
+                    .any(|v| v.name.name == id.name && !v.dimensions.is_empty()),
+                _ => false,
+            }) {
+                return Err("a whole unpacked array in an inout port expression".into());
+            }
             if direction.is_some_and(|d| d != dir)
                 || (dir == PortDirection::Inout && !matches!(e.kind, ExprKind::Ident(_)))
             {

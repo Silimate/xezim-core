@@ -1055,8 +1055,13 @@ fn normalize_net_cell_drivers(elab: &mut ElaboratedModule) -> HashMap<String, u3
     resolve
 }
 
+#[path = "selected_port_drivers.rs"]
+mod selected_port_drivers;
+use selected_port_drivers::project_selected_port_drivers;
+
 pub fn resolve_multi_driver_nets(elab: &mut ElaboratedModule) {
     let resolved_cells = normalize_net_cell_drivers(elab);
+    project_selected_port_drivers(elab);
     widen_overlapping_select_drivers(elab);
     // §10.11: the names an `alias` statement names are ONE physical net, so
     // a driver of any member of a group is a driver of the group's

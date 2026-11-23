@@ -2345,6 +2345,9 @@ pub struct ElaboratedModule {
     /// the elaborated net tables.
     #[serde(default)]
     pub alias_groups: Vec<Vec<String>>,
+    /// Packed port connections whose native drivers share individual bits.
+    #[serde(skip)]
+    pub(crate) selected_port_connections: Vec<(Expression, Expression)>,
     /// §10.11: the canonical name of the group every alias member belongs
     /// to — the member names ONE physical net with the canonical's, so a
     /// driver of a member counts for the canonical (the driver count and
@@ -2692,6 +2695,7 @@ impl ElaboratedModule {
             elided_port_leaves: HashSet::default(),
             alias_pairs: Vec::new(),
             alias_groups: Vec::new(),
+            selected_port_connections: Vec::new(),
             alias_canon: HashMap::default(),
             net_port_merges: HashMap::default(),
             source_texts: Vec::new(),

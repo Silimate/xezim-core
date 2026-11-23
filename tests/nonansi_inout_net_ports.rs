@@ -28,3 +28,23 @@ endmodule"#;
     assert_eq!(canonical("a"), canonical("b"));
     assert_eq!(m.signals[&canonical("a")].width, 16);
 }
+
+/// A whole unpacked inout cannot be lowered to a packed-net alias. Its
+/// unpacked dimension may be in the port declaration or its completion.
+#[test]
+fn whole_unpacked_inout_reports_the_unsupported_shape() {
+    for declaration in ["inout w [3:0];", "inout w; wire w [3:0];"] {
+        let source = format!("module bridge(.p(w)); {declaration} endmodule");
+        let result = parse_and_elaborate_multi(
+            &[source],
+            Some("bridge"),
+            &[],
+            &["bridge.sv".to_owned()],
+            &[],
+        );
+        let err = result
+            .err()
+            .expect("whole unpacked net accepted as a packed alias");
+        assert!(err.contains("unpacked array"), "{err}");
+    }
+}
