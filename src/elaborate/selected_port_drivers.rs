@@ -258,6 +258,55 @@ endmodule"#
         }
     }
 
+    #[test]
+    fn unrelated_overlapping_drivers_keep_their_udp_or_clockvar_stage() {
+        for source_driver in [
+            "gate1 g(v, d);",
+            "clocking cb @(posedge clk); output v; endclocking",
+        ] {
+            let source = format!(
+                r#"
+primitive gate1(o, i); output o; input i; table 0 : 0; 1 : 1; endtable endprimitive
+module bridge(.p(w), .q(w)); inout w; endmodule
+module top(input d, clk, a, b);
+  wire x;
+  wire [1:0] y;
+  bridge unused_connection(x,y[0]);
+  wire [0:0] v;
+  assign v[0] = a;
+  assign v[0] = b;
+  {source_driver}
+endmodule"#
+            );
+            let (_, m) = crate::parse_and_elaborate_multi(
+                &[source],
+                Some("top"),
+                &[],
+                &["top.sv".to_owned()],
+                &[],
+            )
+            .unwrap();
+            let stage = if let Some(udp) = m.udp_instances.first() {
+                let net = ident_flat_name(&udp.output).unwrap();
+                assert_ne!(net, "v", "UDP must join the resolution of v");
+                net
+            } else {
+                m.clocking_output_stages
+                    .values()
+                    .next()
+                    .expect("clockvar must join the resolution of v")
+                    .clone()
+            };
+            let mut sources = Vec::new();
+            for ca in &m.continuous_assigns {
+                if ident_flat_name(&ca.lhs).as_deref() == Some("v") {
+                    driver_reads(&ca.rhs, &mut sources);
+                }
+            }
+            assert!(sources.contains(&stage), "{stage} absent from {sources:?}");
+        }
+    }
+
     /// §23.3.3.6: each bit of two inout actuals is driven from either side.
     #[test]
     fn part_selects_carry_the_original_drivers_both_ways() {

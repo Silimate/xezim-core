@@ -566,7 +566,7 @@ pub fn continuous_assign_delay_select(
 /// driver that leaves the other bits at z (`{'z, 1'(b), 'z}`), so the
 /// whole-net fold below resolves the shared bits and passes the rest through.
 /// Nets whose select drivers are disjoint keep their per-select assigns.
-fn widen_overlapping_select_drivers(elab: &mut ElaboratedModule) {
+fn widen_overlapping_select_drivers(elab: &mut ElaboratedModule, include: impl Fn(&str) -> bool) {
     // Compute each materialized driver's net span, and the same for LAZY
     // sub-module drivers without materializing them: a future instance whose
     // body sits in `pending_cont_assign` (bit/part selects on `n` inside a
@@ -620,7 +620,7 @@ fn widen_overlapping_select_drivers(elab: &mut ElaboratedModule) {
     let widen: HashSet<String> = by_net
         .into_iter()
         .filter(|(n, v)| {
-            v.iter().any(|s| s.2)
+            include(n) && v.iter().any(|s| s.2)
                 && (pulled(n)
                     || v.iter()
                         .enumerate()
@@ -1077,10 +1077,16 @@ use selected_port_drivers::project_selected_port_drivers;
 
 pub fn resolve_multi_driver_nets(elab: &mut ElaboratedModule) {
     let resolved_cells = normalize_net_cell_drivers(elab);
-    let has_selected_ports = !elab.selected_port_connections.is_empty();
-    if !has_selected_ports {
-        widen_overlapping_select_drivers(elab);
-    }
+    // A selected port carries even a terminal's only driver onto the other net.
+    let selected: HashSet<String> = elab
+        .selected_port_connections
+        .iter()
+        .flat_map(|(a, b)| [a, b])
+        .filter_map(|e| cont_assign_driver_span(e, elab).map(|(net, _, _)| net))
+        .collect();
+    // Unrelated nets keep their original driver ordering. Their overlapping
+    // selects must be whole-net drivers when UDP and clocking outputs count them.
+    widen_overlapping_select_drivers(elab, |net| !selected.contains(net));
     // §10.11: the names an `alias` statement names are ONE physical net, so
     // a driver of any member of a group is a driver of the group's
     // canonical net. The map is taken out of the module so the fold below
@@ -1209,21 +1215,14 @@ pub fn resolve_multi_driver_nets(elab: &mut ElaboratedModule) {
             }
         }
     }
-    // A selected port carries even a terminal's only driver onto the other net.
-    let selected: HashSet<String> = elab
-        .selected_port_connections
-        .iter()
-        .flat_map(|(a, b)| [a, b])
-        .filter_map(|e| cont_assign_driver_span(e, elab).map(|(net, _, _)| net))
-        .collect();
     stage_shared_udp_outputs(elab, &selected);
     // §14.16: a clocking output is a driver of its net, so it takes part in
     // the net's resolution. It drives a stage of its own when the net has
     // another driver.
     stage_shared_clocking_outputs(elab, &selected);
-    if has_selected_ports {
+    if !selected.is_empty() {
         project_selected_port_drivers(elab);
-        widen_overlapping_select_drivers(elab);
+        widen_overlapping_select_drivers(elab, |net| selected.contains(net));
     }
     // §28.12 / §21.2.1.5: a net with ONE driver that carries a strength or
     // is a tristate primitive keeps that driver for `%v`; a net several
