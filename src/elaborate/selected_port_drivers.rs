@@ -202,12 +202,14 @@ mod tests {
         }
     }
 
+    /// §23.3.3.6, §29.3 and §14.16: both terminals see UDP and clocking drives.
     #[test]
     fn selected_ports_carry_udp_and_clocking_output_drivers() {
         for (declaration, on_b) in [
             ("gate1 g(a, d);", false),
             ("gate1 g(b[0], d);", true),
             ("clocking cb @(posedge clk); output a; endclocking", false),
+            ("clocking cb @(posedge clk); output b; endclocking", true),
         ] {
             let source = format!(
                 r#"
@@ -258,6 +260,7 @@ endmodule"#
         }
     }
 
+    /// §6.6.1: overlapping writes and other sources resolve on each unrelated wire.
     #[test]
     fn unrelated_overlapping_drivers_keep_their_udp_or_clockvar_stage() {
         for source_driver in [

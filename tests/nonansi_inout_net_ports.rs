@@ -1,6 +1,7 @@
 //! IEEE 1800 §23.2.2.1: two explicit inout port expressions can name the same net.
 use xezim_core::parse_and_elaborate_multi;
 
+/// §23.2.2.1, §23.3.3.6: both explicit inout expressions denote one net.
 #[test]
 fn renamed_inout_ports_join_their_parent_nets() {
     let src = r#"module bridge(.plus(w), .minus(w));
@@ -29,7 +30,7 @@ endmodule"#;
     assert_eq!(m.signals[&canonical("a")].width, 16);
 }
 
-/// A whole unpacked inout cannot be lowered to a packed-net alias. Its
+/// §7.4.2, §23.2.2.1: a whole unpacked inout cannot be lowered to a packed-net alias. Its
 /// unpacked dimension may be in the port declaration or its completion.
 #[test]
 fn whole_unpacked_inout_reports_the_unsupported_shape() {
