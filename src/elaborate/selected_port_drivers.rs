@@ -1,3 +1,6 @@
+//! Packed inout connections share the original drivers of equivalent bits.
+//! Copying resolved terminal values would feed a released drive back onto the bus.
+
 use super::*;
 
 /// Copy original drivers onto each connected packed bit. Feeding the resolved
@@ -196,6 +199,62 @@ mod tests {
                 }
             }
             _ => collect_ident_names(e, out),
+        }
+    }
+
+    #[test]
+    fn selected_ports_carry_udp_and_clocking_output_drivers() {
+        for (declaration, on_b) in [
+            ("gate1 g(a, d);", false),
+            ("gate1 g(b[0], d);", true),
+            ("clocking cb @(posedge clk); output a; endclocking", false),
+        ] {
+            let source = format!(
+                r#"
+primitive gate1(o, i); output o; input i; table 0 : 0; 1 : 1; endtable endprimitive
+module bridge(.p(w), .q(w)); inout w; endmodule
+module top(input d, clk);
+  wire a;
+  wire [1:0] b;
+  bridge u(a, b[0]);
+  {declaration}
+endmodule"#
+            );
+            let (_, m) = crate::parse_and_elaborate_multi(
+                &[source],
+                Some("top"),
+                &[],
+                &["top.sv".to_owned()],
+                &[],
+            )
+            .unwrap();
+            let stage = if let Some(udp) = m.udp_instances.first() {
+                ident_flat_name(&udp.output).expect("UDP drives its own stage")
+            } else {
+                m.clocking_output_stages
+                    .values()
+                    .next()
+                    .expect("clockvar drives its own stage")
+                    .clone()
+            };
+            let mut pending = vec![alias_canonical(
+                &m.alias_canon,
+                if on_b { "a" } else { "b" }.to_owned(),
+            )];
+            let mut seen = HashSet::default();
+            while let Some(net) = pending.pop() {
+                if seen.insert(net.clone()) {
+                    for ca in &m.continuous_assigns {
+                        if cont_assign_driver_span(&ca.lhs, &m).is_some_and(|(n, _, _)| n == net) {
+                            driver_reads(&ca.rhs, &mut pending);
+                        }
+                    }
+                }
+            }
+            assert!(
+                seen.contains(&stage),
+                "{declaration}: missing {stage} in {seen:?}"
+            );
         }
     }
 
