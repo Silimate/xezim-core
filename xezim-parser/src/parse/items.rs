@@ -1736,8 +1736,10 @@ impl<'a> Parser<'a> {
                     (d.direction, d.data_type)
                 }
             };
-            if dir == PortDirection::Inout || direction.is_some_and(|d| d != dir) {
-                return Err("an inout or mixed-direction port expression".into());
+            if direction.is_some_and(|d| d != dir)
+                || (dir == PortDirection::Inout && !matches!(e.kind, ExprKind::Ident(_)))
+            {
+                return Err("an inout select, inout concatenation, or mixed-direction port expression".into());
             }
             direction = Some(dir);
             let w = if *bit {
@@ -1797,7 +1799,9 @@ impl<'a> Parser<'a> {
             if completed {
                 continue;
             }
-            let is_var = net_type.is_none() && !matches!(data_type, DataType::Implicit { .. });
+            let is_var = direction != PortDirection::Inout
+                && net_type.is_none()
+                && !matches!(data_type, DataType::Implicit { .. });
             // In the port declaration's place, so later items see it.
             items.insert(
                 at + 1,
@@ -1881,6 +1885,12 @@ impl<'a> Parser<'a> {
                 span,
             }),
         );
+        // §23.2.2.1: a whole-net inout port and its internal net share drivers.
+        // Net aliasing also joins distinct external names bound to the same net.
+        if direction == PortDirection::Inout {
+            items.push(ModuleItem::AliasDecl(vec![port_ref, e.clone()]));
+            return Ok(());
+        }
         let (lhs, rhs) = match direction {
             PortDirection::Input => (e.clone(), port_ref),
             _ => (port_ref, e.clone()),
