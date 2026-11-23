@@ -1,3 +1,5 @@
+//! Parsing nets, gate instantiations, and net delays.
+
 use super::*;
 
 impl<'a> Parser<'a> {

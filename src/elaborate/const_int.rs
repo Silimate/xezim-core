@@ -1,3 +1,5 @@
+//! Evaluating integral constants, array bounds, and indexed parameter references.
+
 use super::*;
 
 /// The first UNPACKED dimension of a declarator as inclusive `(lo, hi)` bounds,

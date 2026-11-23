@@ -1,3 +1,5 @@
+//! Mapping defparam overrides to instance and generate scopes.
+
 use super::*;
 
 /// §23.10.1: a `defparam` whose path starts at a top-level module

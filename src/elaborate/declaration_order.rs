@@ -1,3 +1,5 @@
+//! Declaration-order checks across module and class scopes.
+
 use super::*;
 
 impl DeclaredModuleNames {

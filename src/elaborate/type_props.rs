@@ -1,3 +1,5 @@
+//! Parameter lookup, type properties, and nettype resolver validation.
+
 use super::*;
 
 /// A name→`Value` environment a constant-expression evaluator can resolve

@@ -1,3 +1,5 @@
+//! Scope and name checks for statements in inlined bodies.
+
 use super::*;
 
 /// An identifier or call in an inlined sub-instance body that NOTHING in the

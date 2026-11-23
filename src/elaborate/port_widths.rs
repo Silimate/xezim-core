@@ -1,3 +1,5 @@
+//! Sizing port connections and diagnosing width mismatches.
+
 use super::*;
 
 /// Best-effort self-determined width of a port-connection actual, reading

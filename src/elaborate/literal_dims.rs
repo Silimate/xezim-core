@@ -1,3 +1,5 @@
+//! Resolving statement declaration dimensions against the enclosing scope.
+
 use super::*;
 
 /// §6.20.2/§23.10: fold this instance's parameters into the dimensions of

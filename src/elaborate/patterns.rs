@@ -1,3 +1,5 @@
+//! Unpacked dimensions and assignment pattern expansion.
+
 use super::*;
 
 /// assigned LSB-first by walking members in reverse. Returns None if `dt`

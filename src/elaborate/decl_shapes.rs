@@ -1,3 +1,5 @@
+//! Compact representations of declaration types and unpacked dimensions.
+
 use super::*;
 
 /// IEEE 1800-2023 §20.6.2 / §20.7: the DECLARED shape of one variable, net or

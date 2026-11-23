@@ -1,3 +1,5 @@
+//! Recognizing constant expressions, type operands, and casts.
+
 use super::*;
 
 pub(super) fn expr_has_call(expr: &Expression) -> bool {

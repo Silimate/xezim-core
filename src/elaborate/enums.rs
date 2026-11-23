@@ -1,3 +1,5 @@
+//! Enum member expansion and integral value assignment.
+
 use super::*;
 
 /// Register members of an anonymous enum attached to a variable declaration

@@ -1,3 +1,5 @@
+//! Canonical names for parameterized class specializations.
+
 use super::*;
 
 /// Stringify one `extends Base #(arg)` positional argument for

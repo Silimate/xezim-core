@@ -1,3 +1,5 @@
+//! Scoped typedef registration and lookup.
+
 use super::*;
 
 /// §26.3: mirror a package typedef under its qualified `pkg::name` key so a

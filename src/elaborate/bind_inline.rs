@@ -1,3 +1,5 @@
+//! Interface bindings, modport expressions, and imports in inlined instances.
+
 use super::*;
 
 thread_local! {

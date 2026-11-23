@@ -1,3 +1,5 @@
+//! Resolution of enclosing statement and instance scopes.
+
 use super::*;
 
 thread_local! {

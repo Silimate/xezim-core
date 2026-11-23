@@ -1,3 +1,5 @@
+//! Genvar substitution and name rewriting in generated items.
+
 use super::*;
 
 /// Construct an unsized integer-literal `Expression` for a genvar value.

@@ -1,3 +1,5 @@
+//! Parsing ANSI and non-ANSI port lists and lowering port expressions.
+
 use super::*;
 
 impl<'a> Parser<'a> {

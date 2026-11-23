@@ -1,3 +1,5 @@
+//! Instance arrays, effective instance items, and interface lookup.
+
 use super::*;
 
 pub(super) fn collect_effective_items(

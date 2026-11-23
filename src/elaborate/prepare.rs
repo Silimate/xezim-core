@@ -1,3 +1,5 @@
+//! Collecting driven names and preparing callable bodies for elaboration.
+
 use super::*;
 
 /// Pre-built `Rc`-shared sources for the deferred-rewrite kinds (#7).

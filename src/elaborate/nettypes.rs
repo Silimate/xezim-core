@@ -1,3 +1,5 @@
+//! Nettype driver resolution and lowering assignments to unpacked structures.
+
 use super::*;
 
 /// §7.6: one side of a continuous copy between fixed arrays of an unpacked

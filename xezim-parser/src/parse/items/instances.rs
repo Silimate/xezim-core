@@ -1,3 +1,5 @@
+//! Parsing module instantiations, parameter overrides, and port connections.
+
 use super::*;
 
 impl<'a> Parser<'a> {

@@ -1,3 +1,5 @@
+//! Parsing classes, interface classes, and their members.
+
 use super::*;
 
 impl<'a> Parser<'a> {

@@ -1,3 +1,5 @@
+//! Parsing constraint items, solve lists, and distribution expressions.
+
 use super::*;
 
 impl<'a> Parser<'a> {

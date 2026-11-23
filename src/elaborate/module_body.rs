@@ -1,3 +1,5 @@
+//! Elaboration of a module body and its declaration environment.
+
 use super::*;
 
 pub fn elaborate_module_with_defs(

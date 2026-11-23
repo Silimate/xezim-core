@@ -1,3 +1,5 @@
+//! Overlaying and restoring package bindings during constant evaluation.
+
 use super::*;
 
 /// Evaluate every package's parameters to a fixpoint, registering each under

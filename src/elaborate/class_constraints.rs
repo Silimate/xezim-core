@@ -1,3 +1,5 @@
+//! Name resolution and validation in class constraints.
+
 use super::*;
 
 pub(super) fn resolve_interface_modport_view(

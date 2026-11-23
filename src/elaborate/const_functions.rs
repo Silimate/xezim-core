@@ -1,3 +1,5 @@
+//! Binding arguments and evaluating functions in constant expressions.
+
 use super::*;
 
 /// IEEE 1800-2017 §28.8. A bidirectional switch is not a one-directional

@@ -1,3 +1,5 @@
+//! Class method overrides, constructors, and assignment checks.
+
 use super::*;
 
 pub(super) fn method_is_final(m: &crate::ast::decl::ClassMethod) -> bool {

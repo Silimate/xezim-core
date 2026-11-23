@@ -1,3 +1,5 @@
+//! Traversal of expressions and write targets in procedural statements.
+
 use super::*;
 
 /// Visit every expression reachable from a statement, in evaluation-agnostic

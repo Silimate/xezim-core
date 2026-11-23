@@ -1,3 +1,5 @@
+//! Scoped substitution and rewriting of expression trees.
+
 use super::*;
 
 pub(super) fn rewrite_expr_impl(

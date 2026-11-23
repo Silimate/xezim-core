@@ -1,3 +1,5 @@
+//! Parsing generate branches, case arms, and their items.
+
 use super::*;
 
 impl<'a> Parser<'a> {

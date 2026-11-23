@@ -1,3 +1,5 @@
+//! Hierarchical names, port aliases, and expressions for inlined connections.
+
 use super::*;
 
 /// §10.11: the child's own `alias` statements, applied to the instance's

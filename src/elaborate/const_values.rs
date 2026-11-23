@@ -1,3 +1,5 @@
+//! Constant values for initializers, literals, and real-valued expressions.
+
 use super::*;
 
 // §11.8.2: a real destination converts the completed integral RHS;

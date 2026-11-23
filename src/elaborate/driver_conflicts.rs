@@ -1,3 +1,5 @@
+//! Detecting conflicts between procedural and continuous drivers.
+
 use super::*;
 
 pub(super) fn simple_lhs_name(expr: &Expression) -> Option<String> {

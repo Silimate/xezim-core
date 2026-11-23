@@ -1,3 +1,5 @@
+//! Lowering gate primitives and rewriting their connections.
+
 use super::*;
 
 /// Build a high-impedance (`'z`) literal expression for tristate gate models.

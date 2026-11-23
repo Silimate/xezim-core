@@ -1,3 +1,5 @@
+//! Elaboration of conditional, case, and loop generate constructs.
+
 use super::*;
 
 /// §27.4: a generate-for genvar's start value. The initializer is a constant

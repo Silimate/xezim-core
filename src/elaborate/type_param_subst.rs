@@ -1,3 +1,5 @@
+//! Substitution of bound type parameters in expressions and declarations.
+
 use super::*;
 
 pub(super) fn set_type_bind_tls(ctx: &RewriteCtx) {

@@ -1,3 +1,5 @@
+//! Identifying local references and creating implicit nets.
+
 use super::*;
 
 /// Scan pending_cont_assign for implicit-net candidates after sub-module

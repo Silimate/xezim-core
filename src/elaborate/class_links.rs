@@ -1,3 +1,5 @@
+//! Class handle initialization, nested classes, and external method definitions.
+
 use super::*;
 
 /// LRM §6.20.3 / §8.4: any signal whose declared `type_name` resolves to a

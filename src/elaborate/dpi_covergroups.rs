@@ -1,3 +1,5 @@
+//! Registration of DPI declarations and covergroups.
+
 use super::*;
 
 pub(super) fn get_type_name(dt: &DataType) -> Option<String> {

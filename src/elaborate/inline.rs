@@ -1,3 +1,5 @@
+//! Recursive instance inlining and bind processing.
+
 use super::*;
 
 type BindResolveStep<'a> = dyn FnMut(

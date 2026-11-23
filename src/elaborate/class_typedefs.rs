@@ -1,3 +1,5 @@
+//! Registration and lookup of typedefs declared in class scopes.
+
 use super::*;
 
 /// §8.3/§8.23: the typedefs of nested classes that `pkg_scope` gave their

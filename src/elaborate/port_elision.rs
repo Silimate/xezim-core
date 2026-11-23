@@ -1,3 +1,5 @@
+//! Selecting internal ports eligible for elision during elaboration.
+
 use super::*;
 
 /// Unobserved-port elision. Inlining substitutes an input port's actual for

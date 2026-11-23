@@ -1,3 +1,5 @@
+//! Unpacked aggregate layouts, element names, and struct member expansion.
+
 use super::*;
 
 impl ArraySlot<'_> {

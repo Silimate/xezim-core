@@ -1,3 +1,5 @@
+//! Elaboration of timing checks and module path delays.
+
 use super::*;
 
 /// §31: argument positions holding time limits. They count the module's

@@ -1,3 +1,5 @@
+//! Parsing covergroup bins, transitions, and cross selections.
+
 use super::*;
 
 impl<'a> Parser<'a> {

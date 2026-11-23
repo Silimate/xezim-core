@@ -1,3 +1,5 @@
+//! Elaborating declarations and checking function and fork bodies.
+
 use super::*;
 
 /// Helper: process a slice of module items into the elaborated module.

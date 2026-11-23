@@ -1,3 +1,5 @@
+//! Registration of nested classes, enclosing parameters, and assertion formals.
+
 use super::*;
 
 /// Inline module instantiations: replace instances with their continuous assigns and always blocks.

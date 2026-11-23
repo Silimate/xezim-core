@@ -1,3 +1,5 @@
+//! Values, aliases, and array elements of visible parameters.
+
 use super::*;
 
 pub(super) fn is_string_data_type(dt: &DataType) -> bool {

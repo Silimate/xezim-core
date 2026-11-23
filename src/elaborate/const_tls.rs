@@ -1,3 +1,5 @@
+//! Thread-local function, typedef, and parameter environments for constant evaluation.
+
 use super::*;
 
 // §13.4.3 — thread-local FUNCTION table consulted by

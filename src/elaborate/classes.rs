@@ -1,3 +1,5 @@
+//! Class elaboration, inherited constants, and constraint definitions.
+
 use super::*;
 
 /// Run `f` with the current thread-local typedef table, if one has been

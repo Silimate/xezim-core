@@ -1,3 +1,5 @@
+//! Widths, casts, and other queries on SystemVerilog types.
+
 use super::*;
 
 /// IEEE 1800-2017 §20.7 — what a TYPE operand exposes to the array query

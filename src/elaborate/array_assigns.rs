@@ -1,3 +1,5 @@
+//! Elementwise lowering of unpacked array assignments and slices.
+
 use super::*;
 
 /// §10.6.2: a WHOLE-ARRAY continuous assignment between two UNPACKED arrays

@@ -1,3 +1,5 @@
+//! Parsing specify blocks, path delays, and timing check arguments.
+
 use super::*;
 
 impl<'a> Parser<'a> {

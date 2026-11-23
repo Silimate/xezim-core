@@ -1,3 +1,5 @@
+//! Statement rewrites for package references and shadowed local declarations.
+
 use super::*;
 
 thread_local! {

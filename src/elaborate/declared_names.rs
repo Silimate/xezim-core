@@ -1,3 +1,5 @@
+//! Collecting names introduced by declarations and enum members.
+
 use super::*;
 
 /// Every name DECLARED anywhere in the design: ports, nets, variables,

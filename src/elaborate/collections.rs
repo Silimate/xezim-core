@@ -1,3 +1,5 @@
+//! Element types, dimensions, and key types of unpacked collections.
+
 use super::*;
 
 /// Fully resolve a `DataType` through a chain of typedef aliases

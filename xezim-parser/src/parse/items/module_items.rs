@@ -1,3 +1,5 @@
+//! Dispatching SystemVerilog module item parsing.
+
 use super::*;
 
 impl<'a> Parser<'a> {

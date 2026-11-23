@@ -1,3 +1,5 @@
+//! Time units, rounding, and scaling of elaborated delays.
+
 use super::*;
 
 pub(super) fn default_timeunit_exp() -> i32 {

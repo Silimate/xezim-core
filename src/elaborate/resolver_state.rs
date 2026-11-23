@@ -8,7 +8,7 @@
 
 use super::ElaboratedModule;
 use crate::ast::decl::FunctionDeclaration;
-use crate::ast::expr::{AssignmentPatternItem, ExprKind, Expression};
+use crate::ast::expr::{AssignmentPatternItem, BinaryOp, ExprKind, Expression};
 use crate::ast::stmt::{ForInit, Statement, StatementKind};
 use crate::ast::types::{DataType, Lifetime, StructUnionKind};
 use crate::hasher::{HashMap, HashSet};
@@ -440,9 +440,18 @@ impl Walk<'_> {
                 }
             }
             ExprKind::Unary { operand, .. } => self.read(operand, set),
-            ExprKind::Binary { left, right, .. } => {
+            ExprKind::Binary { op, left, right } => {
                 self.read(left, set);
-                self.read(right, set);
+                if matches!(
+                    op,
+                    BinaryOp::LogAnd | BinaryOp::LogOr | BinaryOp::LogImplies
+                ) {
+                    // The right operand may be skipped. Check its reads without
+                    // crediting its writes on the path that bypasses it.
+                    self.read(right, &mut set.clone());
+                } else {
+                    self.read(right, set);
+                }
             }
             ExprKind::Conditional {
                 condition,

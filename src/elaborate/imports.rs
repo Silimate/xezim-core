@@ -1,3 +1,5 @@
+//! Discovering package imports and names shadowed by local declarations.
+
 use super::*;
 
 thread_local! {

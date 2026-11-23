@@ -1,3 +1,5 @@
+//! Parsing assertion declarations and inferring procedural assertion clocks.
+
 use super::*;
 
 impl<'a> Parser<'a> {

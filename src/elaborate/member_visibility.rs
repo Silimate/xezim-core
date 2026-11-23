@@ -1,3 +1,5 @@
+//! Checking access to class members across inheritance boundaries.
+
 use super::*;
 
 /// Resolve the DECLARED (static) class type name of an expression, if it can

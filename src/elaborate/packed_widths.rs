@@ -1,3 +1,5 @@
+//! Packed-width evaluation and limits on large declarations.
+
 use super::*;
 
 /// Default implementation limit for a single packed declaration, in bits.

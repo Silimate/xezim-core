@@ -1,3 +1,5 @@
+//! Identifier binding and declaration checks for statements and nets.
+
 use super::*;
 
 /// Names bound by a §12.6 pattern's `.v` sub-patterns.

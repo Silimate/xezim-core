@@ -1,3 +1,5 @@
+//! Source location mapping and diagnostics for library and design inputs.
+
 use super::*;
 
 /// §6.6.2/§6.6.3 net kinds that need something other than plain wire

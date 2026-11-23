@@ -1,3 +1,5 @@
+//! Static initializer and enum assignment validation.
+
 use super::*;
 
 /// §6.21 escape hatch: accept implicitly-static initializers (warn instead of

@@ -1,3 +1,5 @@
+//! Elaboration of instance items and their parameter environments.
+
 use super::*;
 
 #[allow(clippy::too_many_arguments)]
