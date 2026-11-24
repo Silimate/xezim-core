@@ -610,7 +610,7 @@ impl<'a> Parser<'a> {
 
             // Ternary: ? :
             if self.at(TokenKind::Question) {
-                let (l_bp, _) = ternary_bp();
+                let l_bp = if self.in_sva_seq { 9 } else { ternary_bp().0 };
                 if l_bp < min_bp {
                     break;
                 }
@@ -824,6 +824,17 @@ impl<'a> Parser<'a> {
 
             // Index/range select: [expr] or [expr:expr] or [expr+:expr] or new[size]
             if self.at(TokenKind::LBracket) {
+                // §16.9: repetition takes a complete expression_or_dist.
+                // Ordinary selects still bind directly to their primary.
+                if self.in_sva_seq
+                    && min_bp > 8
+                    && matches!(
+                        self.peek_kind(),
+                        TokenKind::Star | TokenKind::Assign | TokenKind::Arrow
+                    )
+                {
+                    break;
+                }
                 self.bump();
                 // IEEE 1800-2017 §16.9 SVA sequence repetition immediately
                 // after a sequence operand: `[*n:m]` (consecutive), `[=n:m]`
@@ -3508,6 +3519,12 @@ impl<'a> Parser<'a> {
             // Logical implication / equivalence (IEEE 1800-2017 Table
             // 11-2): lowest-precedence binary ops, below `||`, above the
             // ternary. `->` is right-associative.
+            // In a sequence, expression operators bind above repetition (8)
+            // and ternary (9), and below logical OR (13).
+            TokenKind::Arrow if self.in_sva_seq && !no_arrow => {
+                Some((BinaryOp::LogImplies, 11, 10))
+            }
+            TokenKind::LogEquiv if self.in_sva_seq => Some((BinaryOp::LogEquiv, 10, 11)),
             TokenKind::Arrow if !no_arrow => Some((BinaryOp::LogImplies, 2, 1)),
             TokenKind::LogEquiv => Some((BinaryOp::LogEquiv, 1, 2)),
             TokenKind::LogOr => Some((BinaryOp::LogOr, 13, 14)),
