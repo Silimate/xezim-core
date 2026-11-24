@@ -74,6 +74,9 @@ mod gates;
 mod gen_renames;
 mod generate;
 mod hier_names;
+mod legacy_initializers;
+pub use legacy_initializers::{set_verilog_2005_initializers, verilog_2005_initializers};
+pub(crate) use legacy_initializers::lower_verilog_2005_initializers;
 mod ident_checks;
 mod implicit_nets;
 mod imports;
@@ -98,6 +101,7 @@ mod semantic_checks;
 mod spans;
 mod specify;
 mod stmt_rewrite;
+mod streaming_serde;
 mod type_param_subst;
 mod type_props;
 mod type_queries;
@@ -599,7 +603,7 @@ pub struct Signal {
     pub direction: Option<PortDirection>,
     pub value: Value,
     /// Name of the data type (e.g. class name).
-    pub type_name: Option<String>,
+    pub type_name: Option<SharedName>,
 }
 
 /// §28.12: one driver of a net whose drivers carry drive strengths, kept so
@@ -620,13 +624,11 @@ pub struct StrengthDriver {
 /// Expressions in global ticks for the rise, fall, and turn-off delays.
 pub type DelayExpressions = Box<[Option<Expression>; 3]>;
 
-/// A continuous assignment: assign lhs = rhs.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct ContinuousAssignment {
-    pub lhs: Expression,
-    pub rhs: Expression,
-    /// Delay in ticks (rise delay of the `#(rise, fall[, turnoff])` form).
-    pub delay: u64,
+/// Rarely populated delay metadata for a [`ContinuousAssignment`], boxed out
+/// of the inline struct so undelayed and single-delay assignments pay nothing
+/// for it (aionhw/xezim#721).
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct ContinuousAssignDelays {
     /// §10.3.3 fall delay (transition to 0) when it differs in form from
     /// `delay`; `None` for the single-delay form.
     pub delay_fall: Option<u64>,
@@ -642,13 +644,26 @@ pub struct ContinuousAssignment {
     /// §10.3.3 / §28.16: physical (low bit, width, vector shape) before
     /// driver widening. A bit-select is scalar; a width-one part is vector.
     pub delay_select: Option<(u32, u32, bool)>,
-    /// §23.3.3: this assign is an instance PORT CONNECTION emitted at
-    /// inline time — its RHS names live in the PARENT scope by
-    /// construction. The simulator must not apply the child scope hint to
-    /// them: an actual like `.d(d ^ 1)` whose operand shares the FORMAL's
-    /// name otherwise resolved to the child's own port net (`u1.d = u1.d
-    /// ^ 1`, a self-loop that read x forever).
-    pub rhs_parent_scoped: bool,
+}
+
+impl ContinuousAssignDelays {
+    fn is_empty(&self) -> bool {
+        self.delay_fall.is_none()
+            && self.delay_off.is_none()
+            && self.gate_delay_fall.is_none()
+            && self.delay_exprs.is_none()
+            && self.delay_select.is_none()
+    }
+}
+
+/// Optional source-origin and rare delay metadata for a [`ContinuousAssignment`].
+///
+/// Synthesized assignments (port connections, gate primitives, delayed nets)
+/// have neither an origin nor rare delays and leave `extras` as `None`. Source
+/// `assign` statements without rare delays allocate only this 40-byte record
+/// rather than the full delay table (aionhw/xezim#721).
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct ContinuousAssignExtras {
     /// A continuous assignment the source spells out (an `assign`, or a net
     /// declaration assignment): the span of that statement and the instance
     /// scope it was elaborated in (`""` for the top). `None` for the ones
@@ -657,6 +672,229 @@ pub struct ContinuousAssignment {
     /// instance hold one scope string between them (aionhw/xezim#721).
     #[serde(default)]
     pub origin: Option<(crate::ast::Span, std::sync::Arc<str>)>,
+    #[serde(default)]
+    pub delays: Option<Box<ContinuousAssignDelays>>,
+}
+
+impl ContinuousAssignExtras {
+    fn is_empty(&self) -> bool {
+        self.origin.is_none() && self.delays.is_none()
+    }
+}
+
+/// A continuous assignment: assign lhs = rhs.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ContinuousAssignment {
+    pub lhs: Expression,
+    pub rhs: Expression,
+    /// Delay in ticks (rise delay of the `#(rise, fall[, turnoff])` form).
+    pub delay: u64,
+    /// §23.3.3: this assign is an instance PORT CONNECTION emitted at
+    /// inline time — its RHS names live in the PARENT scope by
+    /// construction. The simulator must not apply the child scope hint to
+    /// them: an actual like `.d(d ^ 1)` whose operand shares the FORMAL's
+    /// name otherwise resolved to the child's own port net (`u1.d = u1.d
+    /// ^ 1`, a self-loop that read x forever).
+    pub rhs_parent_scoped: bool,
+    #[serde(default)]
+    pub extras: Option<Box<ContinuousAssignExtras>>,
+}
+
+impl ContinuousAssignment {
+    pub fn plain(lhs: Expression, rhs: Expression) -> Self {
+        Self {
+            lhs,
+            rhs,
+            delay: 0,
+            rhs_parent_scoped: false,
+            extras: None,
+        }
+    }
+
+    pub fn with_delay(lhs: Expression, rhs: Expression, delay: u64) -> Self {
+        Self {
+            lhs,
+            rhs,
+            delay,
+            rhs_parent_scoped: false,
+            extras: None,
+        }
+    }
+
+    pub fn with_extras(
+        lhs: Expression,
+        rhs: Expression,
+        delay: u64,
+        rhs_parent_scoped: bool,
+        delay_fall: Option<u64>,
+        delay_off: Option<u64>,
+        gate_delay_fall: Option<u64>,
+        delay_exprs: Option<DelayExpressions>,
+        delay_select: Option<(u32, u32, bool)>,
+        origin: Option<(crate::ast::Span, std::sync::Arc<str>)>,
+    ) -> Self {
+        let delays = if delay_fall.is_some()
+            || delay_off.is_some()
+            || gate_delay_fall.is_some()
+            || delay_exprs.is_some()
+            || delay_select.is_some()
+        {
+            Some(Box::new(ContinuousAssignDelays {
+                delay_fall,
+                delay_off,
+                gate_delay_fall,
+                delay_exprs,
+                delay_select,
+            }))
+        } else {
+            None
+        };
+        let extras = if origin.is_some() || delays.is_some() {
+            Some(Box::new(ContinuousAssignExtras { origin, delays }))
+        } else {
+            None
+        };
+        Self {
+            lhs,
+            rhs,
+            delay,
+            rhs_parent_scoped,
+            extras,
+        }
+    }
+
+    fn delays(&self) -> Option<&ContinuousAssignDelays> {
+        self.extras.as_deref().and_then(|e| e.delays.as_deref())
+    }
+
+    fn delays_mut(&mut self) -> &mut ContinuousAssignDelays {
+        self.extras
+            .get_or_insert_with(|| Box::new(ContinuousAssignExtras::default()))
+            .delays
+            .get_or_insert_with(|| Box::new(ContinuousAssignDelays::default()))
+    }
+
+    fn prune_extras(&mut self) {
+        if let Some(extras) = self.extras.as_deref_mut() {
+            if extras.delays.as_deref().is_some_and(ContinuousAssignDelays::is_empty) {
+                extras.delays = None;
+            }
+            if extras.is_empty() {
+                self.extras = None;
+            }
+        }
+    }
+
+    pub fn delay_fall(&self) -> Option<u64> {
+        self.delays().and_then(|d| d.delay_fall)
+    }
+
+    pub fn delay_off(&self) -> Option<u64> {
+        self.delays().and_then(|d| d.delay_off)
+    }
+
+    pub fn gate_delay_fall(&self) -> Option<u64> {
+        self.delays().and_then(|d| d.gate_delay_fall)
+    }
+
+    pub fn delay_exprs(&self) -> Option<&DelayExpressions> {
+        self.delays().and_then(|d| d.delay_exprs.as_ref())
+    }
+
+    pub fn delay_select(&self) -> Option<(u32, u32, bool)> {
+        self.delays().and_then(|d| d.delay_select)
+    }
+
+    pub fn origin(&self) -> Option<&(crate::ast::Span, std::sync::Arc<str>)> {
+        self.extras.as_deref().and_then(|e| e.origin.as_ref())
+    }
+
+    pub fn set_delay_fall(&mut self, value: Option<u64>) {
+        if value.is_some() {
+            self.delays_mut().delay_fall = value;
+        } else if let Some(d) = self.extras.as_deref_mut().and_then(|e| e.delays.as_deref_mut()) {
+            d.delay_fall = None;
+            self.prune_extras();
+        }
+    }
+
+    pub fn set_delay_off(&mut self, value: Option<u64>) {
+        if value.is_some() {
+            self.delays_mut().delay_off = value;
+        } else if let Some(d) = self.extras.as_deref_mut().and_then(|e| e.delays.as_deref_mut()) {
+            d.delay_off = None;
+            self.prune_extras();
+        }
+    }
+
+    pub fn set_gate_delay_fall(&mut self, value: Option<u64>) {
+        if value.is_some() {
+            self.delays_mut().gate_delay_fall = value;
+        } else if let Some(d) = self.extras.as_deref_mut().and_then(|e| e.delays.as_deref_mut()) {
+            d.gate_delay_fall = None;
+            self.prune_extras();
+        }
+    }
+
+    pub fn set_delay_exprs(&mut self, value: Option<DelayExpressions>) {
+        if value.is_some() {
+            self.delays_mut().delay_exprs = value;
+        } else if let Some(d) = self.extras.as_deref_mut().and_then(|e| e.delays.as_deref_mut()) {
+            d.delay_exprs = None;
+            self.prune_extras();
+        }
+    }
+
+    pub fn take_delay_exprs(&mut self) -> Option<DelayExpressions> {
+        let taken = self
+            .extras
+            .as_deref_mut()
+            .and_then(|e| e.delays.as_deref_mut())
+            .and_then(|d| d.delay_exprs.take());
+        if taken.is_some() {
+            self.prune_extras();
+        }
+        taken
+    }
+
+    pub fn set_delay_select(&mut self, value: Option<(u32, u32, bool)>) {
+        if value.is_some() {
+            self.delays_mut().delay_select = value;
+        } else if let Some(d) = self.extras.as_deref_mut().and_then(|e| e.delays.as_deref_mut()) {
+            d.delay_select = None;
+            self.prune_extras();
+        }
+    }
+
+    pub fn set_origin(&mut self, value: Option<(crate::ast::Span, std::sync::Arc<str>)>) {
+        if value.is_some() {
+            self.extras
+                .get_or_insert_with(|| Box::new(ContinuousAssignExtras::default()))
+                .origin = value;
+        } else if let Some(extras) = self.extras.as_deref_mut() {
+            extras.origin = None;
+            self.prune_extras();
+        }
+    }
+
+    pub fn take_origin(&mut self) -> Option<(crate::ast::Span, std::sync::Arc<str>)> {
+        let taken = self.extras.as_deref_mut().and_then(|e| e.origin.take());
+        if taken.is_some() {
+            self.prune_extras();
+        }
+        taken
+    }
+}
+
+impl ContinuousAssignment {
+    /// Keep the original driver context on each unpacked array element.
+    pub fn inherit_driver_metadata(&mut self, driver: &Self) {
+        self.set_delay_fall(driver.delay_fall());
+        self.set_delay_off(driver.delay_off());
+        self.set_delay_exprs(driver.delay_exprs().cloned());
+        self.set_origin(driver.origin().cloned());
+        self.rhs_parent_scoped = driver.rhs_parent_scoped;
+    }
 }
 
 /// The `ContinuousAssignment::origin` scope of the top module, one string
@@ -1164,6 +1402,11 @@ pub struct PendingContAssign {
 impl PendingAlways {
     /// Run the rewrite once and produce the owned AlwaysBlock. Drops self.
     pub fn materialize(self) -> AlwaysBlock {
+        self.materialize_ref()
+    }
+
+    /// Borrowed materializer used by streaming artifact serialization (#721).
+    pub fn materialize_ref(&self) -> AlwaysBlock {
         if pend_dbg_enabled() {
             eprintln!(
                 "[PEND-MAT] prefix={:?} keys={:?}",
@@ -1247,6 +1490,11 @@ impl PendingInitial {
     }
 
     pub fn materialize(self) -> InitialBlock {
+        self.materialize_ref()
+    }
+
+    /// Borrowed materializer used by streaming artifact serialization (#721).
+    pub fn materialize_ref(&self) -> InitialBlock {
         set_type_bind_tls(&self.ctx);
         let stmt = rewrite_stmt(
             &self.source,
@@ -1285,13 +1533,18 @@ impl PendingContAssign {
     }
 
     pub fn materialize(self, params: &HashMap<String, Value>) -> ContinuousAssignment {
+        self.materialize_ref(params)
+    }
+
+    /// Borrowed materializer used by streaming artifact serialization (#721).
+    pub fn materialize_ref(&self, params: &HashMap<String, Value>) -> ContinuousAssignment {
         set_type_bind_tls(&self.ctx);
         let out = self.materialize_inner(params);
         clear_type_bind_tls();
         out
     }
 
-    fn materialize_inner(self, params: &HashMap<String, Value>) -> ContinuousAssignment {
+    fn materialize_inner(&self, params: &HashMap<String, Value>) -> ContinuousAssignment {
         let lhs = self.materialize_lhs();
         let rhs = rewrite_expr(
             &self.rhs_source,
@@ -1320,27 +1573,39 @@ impl PendingContAssign {
         root_mark_hier_ca_rhs(&self.lhs_source, &mut rhs, &|_| false, &|n| {
             self.ctx.upward.borrow().packages.contains(n)
         });
-        let operands = [self.delay_source, self.delay_fall_source, self.delay_off_source].map(|src| {
-            src.map(|d| rewrite_expr(&d, &self.ctx.prefix, &self.ctx.port_map,
-                &self.ctx.local_names, &self.ctx.interface_map))
+        let operands = [
+            &self.delay_source,
+            &self.delay_fall_source,
+            &self.delay_off_source,
+        ]
+        .map(|src| {
+            src.as_deref().map(|d| {
+                rewrite_expr(
+                    d,
+                    &self.ctx.prefix,
+                    &self.ctx.port_map,
+                    &self.ctx.local_names,
+                    &self.ctx.interface_map,
+                )
+            })
         });
         let (delay, delay_fall, delay_off, delay_exprs) =
             cont_assign_delays(operands.each_ref().map(Option::as_ref), params);
         let origin = self
             .origin_span
             .map(|sp| (sp, std::sync::Arc::clone(&self.ctx.origin_scope)));
-        ContinuousAssignment {
-            gate_delay_fall: None,
-            delay_exprs,
-            delay_select: None,
-            origin,
+        ContinuousAssignment::with_extras(
             lhs,
             rhs,
             delay,
-            rhs_parent_scoped: false,
+            false,
             delay_fall,
             delay_off,
-        }
+            None,
+            delay_exprs,
+            None,
+            origin,
+        )
     }
 }
 
@@ -1719,11 +1984,11 @@ struct InstanceParent {
 pub struct ElabInstance {
     /// Dotted path below the top module, e.g. `u_sub_block` or `a.b`.
     /// Never carries the top module's own name.
-    pub path: String,
+    pub path: SharedName,
     /// The module (or interface) definition this instantiates.
-    pub def_name: String,
+    pub def_name: SharedName,
     /// Dotted path of the containing scope; empty for a child of the top.
-    pub parent: String,
+    pub parent: SharedName,
     /// Source offset of the instantiation among the parent's items, for the
     /// simulator's time-0 process order. A bound instance (appended to its
     /// host's items by `bind`) sorts after every item that precedes it.
@@ -1732,7 +1997,12 @@ pub struct ElabInstance {
 }
 
 /// Elaborated module ready for simulation.
-#[derive(Debug, serde::Serialize, serde::Deserialize)]
+///
+/// `serde::Serialize` is implemented in [`streaming_serde`] so deferred
+/// `pending_*` blocks, continuous assignments, and callable bodies stream
+/// directly into `.xez` artifacts one element at a time without requiring
+/// bulk `materialize_pending()` in memory (aionhw/xezim#721).
+#[derive(Debug, serde::Deserialize)]
 pub struct ElaboratedModule {
     pub name: String,
     /// Global simulation tick in seconds — the finest `timescale` precision
@@ -1953,7 +2223,7 @@ pub struct ElaboratedModule {
     /// (§20.7 array queries must report declared order — `[3:1]` has
     /// $left=3/$right=1 and $increment=1; the arrays* tables normalize to
     /// (lo, hi) and lose it).
-    pub unpacked_decl_dims: HashMap<String, Vec<(i64, i64)>>,
+    pub unpacked_decl_dims: crate::shared_names::SharedSliceMap<(i64, i64)>,
     /// Packed vectors declared with an ASCENDING range (`logic [0:7]`), mapped
     /// to their width. Bit/part selects index these from the MSB end (label 0 =
     /// MSB), so the interpreter remaps `sig[i]` → internal bit `(W-1)-i`
@@ -1998,11 +2268,14 @@ pub struct ElaboratedModule {
     /// definition: (package, explicitly imported item or `None` for `*`).
     #[serde(default)]
     pub def_pkg_imports: HashMap<String, Vec<(String, Option<String>)>>,
-    /// Names of declared sequences and properties (so `@name` event control resolves).
-    pub sequences: HashSet<String>,
-    /// Packed struct bit-field layout: container_name -> Vec<(member_name, lsb_offset, width)>.
+    /// Names of bodyless sequences, properties, and checkers (so `@name` event
+    /// control resolves). Declarations with bodies live in `property_decls`
+    /// alone (#721); query both via [`Self::has_named_sva`].
+    pub sequences: crate::shared_names::SharedNameSet,
+    /// Packed struct bit-field layout: container_name -> shared slice of
+    /// `(member_name, lsb_offset, width)`.
     /// Members are stored by bit offset so MemberAccess can slice the container.
-    pub packed_struct_fields: HashMap<String, Vec<(String, u32, u32)>>,
+    pub packed_struct_fields: crate::shared_names::SharedSliceMap<(String, u32, u32)>,
     /// For the port width-mismatch diagnostic: typedef name -> (field name ->
     /// identifiers its range expression reads), captured from the ORIGINAL
     /// (pre-fold) struct declaration. The stored `typedef_types` folds these
@@ -2027,12 +2300,12 @@ pub struct ElaboratedModule {
     /// neither preserves source order. Used by `%p` (LRM §21.2.1.7), which must
     /// print `'{member:value, ...}` in declaration order.
     #[serde(default)]
-    pub struct_members: HashMap<String, Vec<String>>,
+    pub struct_members: crate::shared_names::SharedSliceMap<String>,
     /// Packed multi-dimensional signal element width: signal_name -> element_width.
     /// For `logic [3:0][7:0] words;` stores `"words" -> 8` so that `words[i]`
     /// resolves to an 8-bit slice rather than a 1-bit select. Also keyed for
     /// struct fields under `"struct_var.field"` form.
-    pub packed_signal_elem_widths: HashMap<String, u32>,
+    pub packed_signal_elem_widths: crate::shared_names::SharedNameMap<u32>,
     /// Full packed dimension list (outermost first) for multi-dimensional
     /// packed vectors: `reg [1:0][15:0][7:0] a;` stores
     /// `"a" -> [(1,0),(15,0),(7,0)]`. Each entry is the declared
@@ -2040,7 +2313,7 @@ pub struct ElaboratedModule {
     /// the correct flat bit slice with index normalization for ascending /
     /// non-zero-based ranges (LRM §7.4.1).
     #[serde(default)]
-    pub packed_full_dims: HashMap<String, Vec<(i64, i64)>>,
+    pub packed_full_dims: crate::shared_names::SharedSliceMap<(i64, i64)>,
     /// §6.9.1 / §10.3.3: declared vector net shape, including equal bounds.
     /// Keyed by final flat net name; independent of array query/select tables.
     pub vector_nets: crate::shared_names::SharedNameSet,
@@ -2088,10 +2361,11 @@ pub struct ElaboratedModule {
     /// expression (the common `@(clk) <expr>` shape — see the property
     /// parser). Used by `assert property (p_name)` to inline the body.
     #[serde(default)]
-    pub property_decls: HashMap<String, Rc<Expression>>,
-    /// §16.6: formal port NAMES of each named property/sequence, keyed like
-    /// `property_decls`. Empty vec for portless declarations.
-    pub property_params: HashMap<String, Vec<String>>,
+    pub property_decls: crate::shared_names::SharedNameMap<Rc<Expression>>,
+    /// §16.6: formal port NAMES of each parameterized named property/sequence,
+    /// keyed like `property_decls`. Portless declarations are omitted (#721).
+    #[serde(default)]
+    pub property_params: crate::shared_names::SharedSliceMap<String>,
     /// §16.8, §16.12: the default actual argument of each formal, keyed like
     /// `property_decls` and parallel to `property_params`; absent when no
     /// formal of the declaration has one. A declaration of an inlined
@@ -2222,7 +2496,7 @@ pub struct ElaboratedModule {
     /// shortint, int, longint). Assignments to these coerce X/Z
     /// source bits to 0.
     #[serde(default)]
-    pub two_state_signals: HashSet<String>,
+    pub two_state_signals: crate::shared_names::SharedNameSet,
     /// Names of unpacked arrays whose synthesized element storage initializes
     /// to Z rather than X. This is for arrays of nets and unconnected
     /// input/inout ports; ordinary 4-state variable arrays still default to X.
@@ -2290,7 +2564,7 @@ pub struct ElaboratedModule {
     /// multiple levels (a port bound to a port), so consumers must resolve to a
     /// root.
     #[serde(default)]
-    pub port_aliases: HashMap<String, String>,
+    pub port_aliases: crate::shared_names::SharedNameMap<SharedName>,
     /// §23.3.3.7: `(net, bit)` of every bit a tri0 or tri1 port bound to a
     /// select has given its pull, so a second such port on the same bit adds
     /// none (the first connection decides, as on a whole net). Elaboration
@@ -2616,7 +2890,7 @@ impl ElaboratedModule {
             strength_drivers: HashMap::default(),
             supply_nets: HashSet::default(),
             descending_arrays: HashSet::default(),
-            unpacked_decl_dims: HashMap::default(),
+            unpacked_decl_dims: Default::default(),
             ascending_packed: HashMap::default(),
             typedef_unpacked_dims: HashMap::default(),
             queue_max_sizes: HashMap::default(),
@@ -2627,15 +2901,15 @@ impl ElaboratedModule {
             pkg_var_decls: HashMap::default(),
             pkg_var_init_blocks: Vec::new(),
             def_pkg_imports: HashMap::default(),
-            sequences: HashSet::default(),
-            packed_struct_fields: HashMap::default(),
+            sequences: Default::default(),
+            packed_struct_fields: Default::default(),
             struct_field_range_idents: HashMap::default(),
             var_decl_types: Default::default(),
             param_decl_types: Default::default(),
-            struct_members: HashMap::default(),
-            packed_signal_elem_widths: HashMap::default(),
+            struct_members: Default::default(),
+            packed_signal_elem_widths: Default::default(),
             typedef_elem_widths: HashMap::default(),
-            packed_full_dims: HashMap::default(),
+            packed_full_dims: Default::default(),
             vector_nets: Default::default(),
             string_signals: HashSet::default(),
             modport_member_dirs: HashMap::default(),
@@ -2643,8 +2917,8 @@ impl ElaboratedModule {
             interfaces: HashSet::default(),
             interface_param_defaults: HashMap::default(),
             checker_decls: HashMap::default(),
-            property_decls: HashMap::default(),
-            property_params: HashMap::default(),
+            property_decls: Default::default(),
+            property_params: Default::default(),
             property_param_defaults: HashMap::default(),
             array_elem_class: HashMap::default(),
             assoc_key_type_names: HashMap::default(),
@@ -2671,7 +2945,7 @@ impl ElaboratedModule {
             foreign_package_names: HashSet::default(),
             foreign_displaced: HashSet::default(),
             unit_member_slots: Vec::new(),
-            two_state_signals: HashSet::default(),
+            two_state_signals: Default::default(),
             z_init_signals: HashSet::default(),
             pending_always: Vec::new(),
             pending_initial: Vec::new(),
@@ -2683,7 +2957,7 @@ impl ElaboratedModule {
             const_decl_inits: HashSet::default(),
             forward_typedef_names: HashSet::default(),
             events: HashSet::default(),
-            port_aliases: HashMap::default(),
+            port_aliases: Default::default(),
             interface_port_aliases: HashMap::default(),
             input_port_actuals: Vec::new(),
             sampled_input_ports: HashSet::default(),
@@ -2787,6 +3061,12 @@ impl ElaboratedModule {
         true
     }
 
+    /// Whether `name` is a declared sequence, property, or checker — either
+    /// with a body in `property_decls` or bodyless in `sequences` (#721).
+    pub fn has_named_sva(&self, name: &str) -> bool {
+        self.property_decls.contains_key(name) || self.sequences.contains(name)
+    }
+
     /// Materialize every deferred instance-scoped function and task body in
     /// place (`self.functions` / `self.tasks`) with scope caches disabled.
     pub fn materialize_pending_callables(&mut self) {
@@ -2846,7 +3126,7 @@ impl ElaboratedModule {
             // needs the same per-element expansion — otherwise an array OUTPUT
             // PORT driven that way never propagates and the parent's array
             // stays x for the whole run.
-            if !expand_whole_array_assign(&ca.lhs, &ca.rhs, ca.delay, &ca.delay_exprs, self) {
+            if !expand_whole_array_assign(&ca, self) {
                 self.continuous_assigns.push(ca);
             }
         }
@@ -2897,11 +3177,9 @@ impl ElaboratedModule {
                 })
             }) {
                 Some(parts) => {
-                    for mut part in parts {
-                        part.delay_exprs = ca.delay_exprs.clone();
-                        part.delay_fall = ca.delay_fall;
-                        part.delay_off = ca.delay_off;
-                        f(part);
+                    for mut e in parts {
+                        e.inherit_driver_metadata(&ca);
+                        f(e);
                     }
                 }
                 None => f(ca),
@@ -3286,6 +3564,8 @@ struct PreparedModuleItems {
 /// instance.
 #[derive(Default)]
 struct InlineCache {
+    /// Portless compilation-unit binds keyed by target definition (§23.11).
+    unit_module_binds: HashMap<String, Vec<crate::ast::decl::BindDirective>>,
     /// Prepared bodies (`prepare_module_items`).
     prepared: prepared_bodies::PreparedBodies,
     /// Whether preparation leaves value-parameter references symbolic.

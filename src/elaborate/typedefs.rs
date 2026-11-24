@@ -37,7 +37,10 @@ pub fn register_scoped_typedef_alias(
                 // §6.19: preserve the typed member, including its X/Z bits.
                 // A displaced bare name belongs to the importing scope. Get
                 // that member from the enum declaration itself.
-                let bare = elab.parameters.get(&m).filter(|_| !elab.local_decl_displaces(&m));
+                let bare = elab
+                    .parameters
+                    .get(&m)
+                    .filter(|_| !elab.local_decl_displaces(&m));
                 let mut value = bare.cloned().unwrap_or_else(|| {
                     displaced
                         .get_or_insert_with(|| wide_enum_value_map(et, w, &elab.parameters))
@@ -518,7 +521,10 @@ pub fn reassert_unit_enum_members(elab: &mut ElaboratedModule) {
 
 /// The names one enum member declaration declares (`A[2]` declares `A0`,
 /// `A1`; §6.19).
-pub(super) fn enum_member_names(member: &EnumMember, params: &HashMap<String, Value>) -> Vec<String> {
+pub(super) fn enum_member_names(
+    member: &EnumMember,
+    params: &HashMap<String, Value>,
+) -> Vec<String> {
     expand_enum_member(member, 0, params)
         .0
         .into_iter()
@@ -645,7 +651,7 @@ pub fn process_typedef(td: &TypedefDeclaration, elab: &mut ElaboratedModule) {
                         is_real: false,
                         direction: None,
                         value: v,
-                        type_name: Some(td.name.name.clone()),
+                        type_name: Some(td.name.name.as_str().into()),
                     },
                 );
                 members_ordered.push((nm.clone(), val));

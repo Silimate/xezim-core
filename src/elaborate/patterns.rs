@@ -241,7 +241,7 @@ pub(super) fn register_member_leaf(elab: &mut ElaboratedModule, name: &str, dt: 
                     Value::new(w)
                 },
                 type_name: if shortreal {
-                    Some("shortreal".to_string())
+                    Some("shortreal".into())
                 } else {
                     None
                 },
@@ -531,16 +531,11 @@ pub(super) fn emit_struct_member_assigns(
     // Bounded against a malformed self-referential typedef.
     if depth > 16 {
         out.push(ContinuousAssignment {
-            gate_delay_fall: None,
-            delay_exprs: ca.delay_exprs.clone(),
-            delay_select: ca.delay_select,
-            origin: ca.origin.clone(),
             lhs: lhs_base.clone(),
             rhs: rhs.clone(),
             delay: ca.delay,
             rhs_parent_scoped: ca.rhs_parent_scoped,
-            delay_fall: ca.delay_fall,
-            delay_off: ca.delay_off,
+            extras: ca.extras.clone(),
         });
         return;
     }
@@ -568,7 +563,7 @@ pub(super) fn emit_struct_member_assigns(
                 &flat,
                 typedef_types,
                 params,
-                ca.origin.as_ref().map_or("", |(_, scope)| scope),
+                ca.origin().map_or("", |(_, scope)| scope),
                 default_types,
                 rhs.span,
             ),
@@ -659,16 +654,11 @@ pub(super) fn emit_member_elem_assigns(
                 );
             }
             _ => out.push(ContinuousAssignment {
-                gate_delay_fall: None,
-                delay_exprs: ca.delay_exprs.clone(),
-                delay_select: ca.delay_select,
-                origin: ca.origin.clone(),
                 lhs,
                 rhs,
                 delay: ca.delay,
                 rhs_parent_scoped: ca.rhs_parent_scoped,
-                delay_fall: ca.delay_fall,
-                delay_off: ca.delay_off,
+                extras: ca.extras.clone(),
             }),
         }
     };
@@ -691,7 +681,7 @@ pub(super) fn emit_member_elem_assigns(
             elem_dt: mdt,
             typedef_types,
             params,
-            scope: ca.origin.as_ref().map_or("", |(_, scope)| scope),
+            scope: ca.origin().map_or("", |(_, scope)| scope),
             default_types,
         };
         if elem
@@ -1293,7 +1283,7 @@ fn continuous_default_match_in(
             {
                 return None;
             }
-            (ty, shape.map_or(no_dims, Vec::as_slice))
+            (ty, shape.map_or(no_dims, |s| s.as_slice()))
         }
         _ => return None,
     };

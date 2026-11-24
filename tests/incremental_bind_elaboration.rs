@@ -20,14 +20,14 @@ fn instances_of(m: &xezim_core::ElaboratedModule, def: &str) -> Vec<String> {
         .instances
         .iter()
         .filter(|i| i.def_name == def)
-        .map(|i| i.path.clone())
+        .map(|i| i.path.to_string())
         .collect();
     paths.sort();
     paths
 }
 
 fn all_instance_paths(m: &xezim_core::ElaboratedModule) -> Vec<String> {
-    let mut paths: Vec<String> = m.instances.iter().map(|i| i.path.clone()).collect();
+    let mut paths: Vec<String> = m.instances.iter().map(|i| i.path.to_string()).collect();
     paths.sort();
     paths
 }
@@ -70,6 +70,24 @@ fn four_level_nested_bind_matches_direct_hierarchy() {
     assert_eq!(all_instance_paths(&staged), all_instance_paths(&direct));
     assert!(staged.signals.contains_key("g[0].u.w.w.w.w.flag"));
     assert!(staged.signals.contains_key("g[127].u.w.w.w.w.flag"));
+}
+
+#[test]
+fn portless_unit_bind_prefers_a_same_named_instance() {
+    let model = elaborate(
+        r#"
+module watched; endmodule
+module different; endmodule
+module observer; wire flag = 1; endmodule
+module top;
+  watched actual();
+  different watched();
+endmodule
+bind watched observer o();
+"#,
+    );
+    assert!(model.signals.contains_key("watched.o.flag"));
+    assert!(!model.signals.contains_key("actual.o.flag"));
 }
 
 #[test]
@@ -218,17 +236,17 @@ bind mid obs u_obs (.in_s(a_in), .out_s(a_out), .imp_net(undeclared_wire));
         model
             .port_aliases
             .get("u.u_obs.imp_net")
-            .map(String::as_str),
+            .map(|s| s.as_str()),
         Some("u.undeclared_wire")
     );
     // Input port `a_in` on `u` forwards parent net `src`.
     assert_eq!(
-        model.port_aliases.get("u.u_obs.in_s").map(String::as_str),
+        model.port_aliases.get("u.u_obs.in_s").map(|s| s.as_str()),
         Some("src")
     );
     // Output port `a_out` on `u` maps to `u.a_out`.
     assert_eq!(
-        model.port_aliases.get("u.u_obs.out_s").map(String::as_str),
+        model.port_aliases.get("u.u_obs.out_s").map(|s| s.as_str()),
         Some("u.a_out")
     );
 }

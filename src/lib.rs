@@ -303,8 +303,18 @@ pub use value::Value;
 ///         keeps a nettype declaration's delay (§6.6.7, §10.3.1, §10.3.3, §27.2), declares a
 ///         variable for a nettype name the module's own type hides (§26.5) and lowers tolerance
 ///         range bounds to `$__xz_tolerance` (§11.4.13).
-/// \x6D includes downstream enum resolution and interface-port semantics with the upstream elaborator.
-pub const XEZIM_BYTECODE_MAGIC: &[u8; 8] = b"XEZIMBC\x6D";
+/// \x6D preserves driver transitions for unpacked arrays, unit constant precedence, and
+///         the widths and visibility of scoped package constants (§10.3.3, §26.3).
+/// \x6E stores sparse SVA metadata (#721): `sequences` holds only bodyless sequence/property and
+///         checker names (declarations with bodies live in `property_decls`), and
+///         `property_params` omits portless declarations.
+/// \x6F boxes rare `ContinuousAssignment` origin and multi-delay metadata (#721) and encodes
+///         `HierarchicalIdentifier::root` as `HierRoot`.
+/// \x70 compact `Span` (`u32`, `u32`), compact AST caches, and streaming pending-body
+///         serialization merged with upstream driver-transition and scope fixes (#721).
+/// \x71 keeps downstream wildcard-import relaxation with the upstream enum, driver, and
+///         compact-cache elaboration (§26.3).
+pub const XEZIM_BYTECODE_MAGIC: &[u8; 8] = b"XEZIMBC\x71";
 
 /// Name of the synthetic root that instantiates every top of a multi-top
 /// design (§23.3.3), each instance named after its module. It is not part of
@@ -402,82 +412,91 @@ fn artifact_version_error(file_magic: &[u8; 8]) -> Option<String> {
 /// If compression statistics are enabled via `set_compression_stats(true)`,
 /// prints the compression ratio after writing.
 pub fn write_compiled(elab: &elaborate::ElaboratedModule, path: &str) -> Result<(), String> {
+    let _oom_trace = oom_trace::session();
+    let _oom_write = oom_trace::scope("write compiled artifact", path, "", "");
+    oom_trace::model("write.artifact.begin", elab, None);
     use std::io::Write;
 
-    if artifact_uncompressed() {
+    let result = if artifact_uncompressed() {
         let f = std::fs::File::create(path).map_err(|e| format!("create '{}': {}", path, e))?;
         let mut w = std::io::BufWriter::with_capacity(1 << 20, f);
         w.write_all(XEZIM_BYTECODE_MAGIC)
             .map_err(|e| format!("write '{}': {}", path, e))?;
         bincode::serde::encode_into_std_write(elab, &mut w, xez_bincode_config())
             .map_err(|e| format!("serialize: {}", e))?;
-        return w.flush().map_err(|e| format!("flush '{}': {}", path, e));
-    }
-
-    let level = get_zstd_level();
-    let stats_enabled = compression_stats_enabled();
-
-    let f = std::fs::File::create(path).map_err(|e| format!("create '{}': {}", path, e))?;
-    let mut w = std::io::BufWriter::with_capacity(1 << 20, f);
-    w.write_all(XEZIM_BYTECODE_MAGIC)
-        .map_err(|e| format!("write '{}': {}", path, e))?;
-
-    // Create a wrapper to count bytes written
-    let enc = zstd::stream::Encoder::new(w, level).map_err(|e| format!("zstd init: {}", e))?;
-
-    // We need to measure uncompressed size for statistics
-    // Unfortunately zstd::Encoder doesn't expose this directly, so we'll
-    // serialize to a separate buffer first to measure, then compress
-    if stats_enabled {
-        // First, serialize to measure uncompressed size
-        let mut uncompressed = Vec::new();
-        bincode::serde::encode_into_std_write(elab, &mut uncompressed, xez_bincode_config())
-            .map_err(|e| format!("serialize: {}", e))?;
-        let uncompressed_size = uncompressed.len();
-
-        // Now compress and write
-        let f2 = std::fs::File::create(path).map_err(|e| format!("create '{}': {}", path, e))?;
-        let mut w2 = std::io::BufWriter::with_capacity(1 << 20, f2);
-        w2.write_all(XEZIM_BYTECODE_MAGIC)
-            .map_err(|e| format!("write '{}': {}", path, e))?;
-        let mut enc2 =
-            zstd::stream::Encoder::new(w2, level).map_err(|e| format!("zstd init: {}", e))?;
-        enc2.write_all(&uncompressed)
-            .map_err(|e| format!("zstd write: {}", e))?;
-        let mut w2 = enc2.finish().map_err(|e| format!("zstd finish: {}", e))?;
-        w2.flush().map_err(|e| format!("flush '{}': {}", path, e))?;
-
-        // Get compressed size
-        let compressed_size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
-
-        let ratio = if uncompressed_size > 0 {
-            compressed_size as f64 / uncompressed_size as f64
-        } else {
-            1.0
-        };
-
-        eprintln!(
-            "[CACHE][COMPRESS] {}: {} bytes -> {} bytes ({:.2}× ratio, level {})",
-            path,
-            uncompressed_size,
-            compressed_size,
-            1.0 / ratio,
-            level
-        );
-
-        Ok(())
-    } else {
-        // Standard path without statistics. bincode writes field by field;
-        // batch those writes before they reach the compressor.
-        let mut buffered = std::io::BufWriter::with_capacity(1 << 20, enc);
-        bincode::serde::encode_into_std_write(elab, &mut buffered, xez_bincode_config())
-            .map_err(|e| format!("serialize: {}", e))?;
-        let enc = buffered
-            .into_inner()
-            .map_err(|e| format!("flush '{}': {}", path, e))?;
-        let mut w = enc.finish().map_err(|e| format!("zstd finish: {}", e))?;
         w.flush().map_err(|e| format!("flush '{}': {}", path, e))
+    } else {
+        let level = get_zstd_level();
+        let stats_enabled = compression_stats_enabled();
+
+        let f = std::fs::File::create(path).map_err(|e| format!("create '{}': {}", path, e))?;
+        let mut w = std::io::BufWriter::with_capacity(1 << 20, f);
+        w.write_all(XEZIM_BYTECODE_MAGIC)
+            .map_err(|e| format!("write '{}': {}", path, e))?;
+
+        // Create a wrapper to count bytes written
+        let enc = zstd::stream::Encoder::new(w, level).map_err(|e| format!("zstd init: {}", e))?;
+
+        // We need to measure uncompressed size for statistics
+        // Unfortunately zstd::Encoder doesn't expose this directly, so we'll
+        // serialize to a separate buffer first to measure, then compress
+        if stats_enabled {
+            // First, serialize to measure uncompressed size
+            let mut uncompressed = Vec::new();
+            bincode::serde::encode_into_std_write(elab, &mut uncompressed, xez_bincode_config())
+                .map_err(|e| format!("serialize: {}", e))?;
+            let uncompressed_size = uncompressed.len();
+
+            // Now compress and write
+            let f2 =
+                std::fs::File::create(path).map_err(|e| format!("create '{}': {}", path, e))?;
+            let mut w2 = std::io::BufWriter::with_capacity(1 << 20, f2);
+            w2.write_all(XEZIM_BYTECODE_MAGIC)
+                .map_err(|e| format!("write '{}': {}", path, e))?;
+            let mut enc2 =
+                zstd::stream::Encoder::new(w2, level).map_err(|e| format!("zstd init: {}", e))?;
+            enc2.write_all(&uncompressed)
+                .map_err(|e| format!("zstd write: {}", e))?;
+            let mut w2 = enc2.finish().map_err(|e| format!("zstd finish: {}", e))?;
+            w2.flush().map_err(|e| format!("flush '{}': {}", path, e))?;
+
+            // Get compressed size
+            let compressed_size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+
+            let ratio = if uncompressed_size > 0 {
+                compressed_size as f64 / uncompressed_size as f64
+            } else {
+                1.0
+            };
+
+            eprintln!(
+                "[CACHE][COMPRESS] {}: {} bytes -> {} bytes ({:.2}× ratio, level {})",
+                path,
+                uncompressed_size,
+                compressed_size,
+                1.0 / ratio,
+                level
+            );
+
+            Ok(())
+        } else {
+            // Standard path without statistics. bincode writes field by field;
+            // batch those writes before they reach the compressor.
+            let mut buffered = std::io::BufWriter::with_capacity(1 << 20, enc);
+            bincode::serde::encode_into_std_write(elab, &mut buffered, xez_bincode_config())
+                .map_err(|e| format!("serialize: {}", e))?;
+            let enc = buffered
+                .into_inner()
+                .map_err(|e| format!("flush '{}': {}", path, e))?;
+            let mut w = enc.finish().map_err(|e| format!("zstd finish: {}", e))?;
+            w.flush().map_err(|e| format!("flush '{}': {}", path, e))
+        }
+    };
+    if result.is_ok() && oom_trace::enabled() {
+        let artifact_bytes = std::fs::metadata(path).map(|m| m.len() as usize).unwrap_or(0);
+        oom_trace::checkpoint("write.artifact.done", &[("artifact_bytes", artifact_bytes)]);
     }
+    result
 }
 
 /// Read a compiled artifact from a file. Returns Ok(Some(elab)) if the file is
@@ -1225,8 +1244,7 @@ pub fn render_parse_diagnostics(
     file: &str,
 ) -> Vec<String> {
     const SHOWN: usize = 20;
-    let mut seen: std::collections::HashSet<(usize, usize, &str)> =
-        std::collections::HashSet::new();
+    let mut seen: std::collections::HashSet<(u32, u32, &str)> = std::collections::HashSet::new();
     let unique: Vec<&diagnostics::Diagnostic> = diags
         .iter()
         .filter(|d| d.severity == severity)
@@ -1498,7 +1516,7 @@ pub fn parse_and_elaborate_multi_preprocessed(
             ],
         );
         let mut parser = sv_parser::parse::Parser::new(tokens);
-        let source_ast = parser.parse_source_text();
+        let mut source_ast = parser.parse_source_text();
         let diags = parser.diagnostics().to_vec();
         drop(parser);
 
@@ -1616,6 +1634,7 @@ pub fn parse_and_elaborate_multi_preprocessed(
                 ("preprocessed_bytes", preprocessed.len()),
             ],
         );
+        elaborate::lower_verilog_2005_initializers(source_path.as_deref(), &mut source_ast.descriptions);
         all_descriptions.extend(source_ast.descriptions);
         preprocessed_texts.push(preprocessed);
         line_maps.push(line_map);
@@ -3452,12 +3471,33 @@ fn parse_and_elaborate(
                 static PKG_SCOPE: std::cell::RefCell<Option<(String, crate::hasher::HashSet<String>)>> =
                     const { std::cell::RefCell::new(None) };
             }
+            // A package-qualified name can still be unavailable in this partial
+            // table. Defer the expression to typed elaboration (§6.18, §26.3)
+            // before an unknown operand becomes a literal typedef bound.
+            fn early_integer(expr: &ast::expr::Expression, table: &PTable) -> Option<i64> {
+                use ast::expr::ExprKind;
+                let mut bound = true;
+                elaborate::for_each_sub_expr(expr, &mut |node| match &node.kind {
+                    ExprKind::Ident(h) => {
+                        bound &= h.root.is_none()
+                            && matches!(h.path.as_slice(), [seg]
+                                if seg.selects.is_empty() && table.contains_key(&seg.name.name));
+                    }
+                    ExprKind::MemberAccess { .. } => bound = false,
+                    _ => {}
+                });
+                if bound {
+                    elaborate::const_eval_i64_with_params(expr, Some(table))
+                } else {
+                    None
+                }
+            }
             fn fold_expr(e: &mut ast::expr::Expression, table: &PTable) {
                 if matches!(e.kind, ast::expr::ExprKind::Number(_)) {
                     return;
                 }
                 if !table.is_empty()
-                    && let Some(v) = elaborate::const_eval_i64_with_params(e, Some(table))
+                    && let Some(v) = early_integer(e, table)
                     && v >= 0
                 {
                     *e = ast::expr::Expression::new(
@@ -3627,7 +3667,7 @@ fn parse_and_elaborate(
                         table.remove(&a.name.name);
                         if let Some(init) = &a.init {
                             if let Some(v) =
-                                elaborate::const_eval_i64_with_params(init, Some(table))
+                                early_integer(init, table)
                                 && holds_unchanged(data_type, v, table)
                             {
                                 let mut val = Value::from_u64(v as u64, 32);
@@ -4135,6 +4175,7 @@ fn parse_and_elaborate(
     elaborate::stage_vpi_net_drivers(&mut elab);
     elaborate::resolve_user_nettype_drivers(&mut elab)?;
     elab_phase("switches and nettype drivers", &mut phase_t);
+    oom_trace::model("switches and nettype drivers.model", &elab, None);
     // §7.2.2: a whole-struct continuous assign that arrived through inlining
     // still needs splitting into per-member assigns.
     elaborate::expand_unpacked_struct_assigns(&mut elab);
@@ -4150,6 +4191,7 @@ fn parse_and_elaborate(
     // §6.6.1: a net with several continuous drivers resolves them all.
     elaborate::resolve_multi_driver_nets(&mut elab);
     elab_phase("net delays and multi-driver nets", &mut phase_t);
+    oom_trace::model("net delays and multi-driver nets.model", &elab, None);
     // Link `function ClassName::m(); ...` out-of-class bodies into their
     // classes — must run after inline_instantiations repopulates classes.
     elaborate::link_extern_methods(&mut elab, &def_refs);
@@ -4502,12 +4544,12 @@ impl<'a> IncrementalBindResolver<'a> {
             list.push(String::new());
         }
         for inst in &elab.instances[self.indexed_instances..] {
-            self.host_paths.insert(inst.path.clone());
-            let list = self.hosts_of.entry(inst.def_name.clone()).or_default();
+            self.host_paths.insert(inst.path.to_string());
+            let list = self.hosts_of.entry(inst.def_name.to_string()).or_default();
             new_hosts_start
                 .entry(inst.def_name.as_str())
                 .or_insert(list.len());
-            list.push(inst.path.clone());
+            list.push(inst.path.to_string());
         }
         self.indexed_instances = elab.instances.len();
 
@@ -4705,7 +4747,7 @@ fn resolve_instance_binds(
     host_paths.insert(String::new());
     hosts_of.entry(elab.name.as_str()).or_default().push("");
     for i in &elab.instances {
-        host_paths.insert(i.path.clone());
+        host_paths.insert(i.path.to_string());
         hosts_of
             .entry(i.def_name.as_str())
             .or_default()
@@ -5016,7 +5058,7 @@ fn resolve_library_modules(
             eprintln!("{}", e);
         }
         let preprocessed_cleanly = pp.errors().is_empty();
-        let result = sv_parser::parse(&preprocessed);
+        let mut result = sv_parser::parse(&preprocessed);
         // Spans index the re-parsed text; it is the preprocessed text again
         // (nothing is left to expand), so the map applies to it.
         let line_map = line_map.filter(|_| result.source_text == preprocessed);
@@ -5121,6 +5163,7 @@ fn resolve_library_modules(
                 _ => None,
             })
             .collect();
+        elaborate::lower_verilog_2005_initializers(Some(&path), &mut result.source.descriptions);
         let file_index = lib_sources.files.len() as u32;
         let mut defined: Vec<String> = Vec::new();
         for desc in result.source.descriptions {

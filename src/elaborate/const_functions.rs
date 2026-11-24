@@ -188,16 +188,14 @@ pub(super) fn inline_instance_typedefs(dt: &DataType) -> Option<DataType> {
     CONST_FN_LOCAL_TYPES.with(|c| inline_body_typedefs(dt, c.borrow().as_ref()?))
 }
 
-/// Packed-struct layouts bound into `STRUCT_FIELDS_TLS` for one constant
-/// function call (see `eval_const_user_function`). Dropping it restores each
-/// name's previous layout, so a caller's — or an outer recursion level's —
-/// same-named struct keeps its own.
+/// Bare packed-struct names visible while folding one package or constant
+/// function call. Restore their previous layouts on leaving that scope.
 #[derive(Default)]
-struct ConstFnStructLayouts {
+pub(super) struct ScopedStructLayouts {
     saved: Vec<(String, Option<Vec<(String, u32, u32)>>)>,
 }
 
-impl ConstFnStructLayouts {
+impl ScopedStructLayouts {
     pub(super) fn bind(
         &mut self,
         name: &str,
@@ -211,12 +209,16 @@ impl ConstFnStructLayouts {
         else {
             return;
         };
+        self.bind_fields(name, fields);
+    }
+
+    pub(super) fn bind_fields(&mut self, name: &str, fields: Vec<(String, u32, u32)>) {
         let prev = STRUCT_FIELDS_TLS.with(|c| c.borrow_mut().insert(name.to_string(), fields));
         self.saved.push((name.to_string(), prev));
     }
 }
 
-impl Drop for ConstFnStructLayouts {
+impl Drop for ScopedStructLayouts {
     fn drop(&mut self) {
         STRUCT_FIELDS_TLS.with(|c| {
             let mut c = c.borrow_mut();
@@ -408,7 +410,7 @@ pub(super) fn eval_const_user_function<P: ParamLookup>(
     // layout for the call's duration; the guard restores the caller's on every
     // exit. Without this the whole call bailed and a struct localparam built
     // by a configuration function (CVA6's `build_config`) elaborated as 0.
-    let mut layouts = ConstFnStructLayouts::default();
+    let mut layouts = ScopedStructLayouts::default();
     let mut packed_elems = ConstFnPackedElems::default();
     for port in &fd.ports {
         layouts.bind(&port.name.name, &port.data_type, &geom, elab);
@@ -417,7 +419,7 @@ pub(super) fn eval_const_user_function<P: ParamLookup>(
     layouts.bind(&fname, &fd.return_type, &geom, elab);
     fn bind_decls(
         stmts: &[Statement],
-        layouts: &mut ConstFnStructLayouts,
+        layouts: &mut ScopedStructLayouts,
         packed_elems: &mut ConstFnPackedElems,
         geom: ParamEnv,
         elab: &ElaboratedModule,
@@ -1308,7 +1310,7 @@ thread_local! {
     /// (name, span start, span end) of each `$unit` function. They are
     /// injected into every module's items, where they look like the
     /// module's own; see `set_unit_function_sites`.
-    pub(super) static UNIT_FUNCTION_SITES: std::cell::RefCell<HashSet<(String, usize, usize)>> =
+    pub(super) static UNIT_FUNCTION_SITES: std::cell::RefCell<HashSet<(String, u32, u32)>> =
         std::cell::RefCell::new(HashSet::default());
     /// The `$unit` typedefs' declared types, taken once they are all
     /// registered. The shared typedef table is overwritten by an instance's
@@ -1388,7 +1390,7 @@ fn const_fn_local_typedef(name: &str, elab: &ElaboratedModule) -> Option<DataTyp
 /// Record the `$unit` functions of the design being elaborated (name and
 /// declaration span), so an injected copy in a module is not taken for a
 /// function the module declares itself.
-pub(crate) fn set_unit_function_sites(sites: HashSet<(String, usize, usize)>) {
+pub(crate) fn set_unit_function_sites(sites: HashSet<(String, u32, u32)>) {
     UNIT_FUNCTION_SITES.with(|c| *c.borrow_mut() = sites);
 }
 
