@@ -699,17 +699,12 @@ impl Info {
     /// The package whose declaration `Q::name` denotes: Q itself when it
     /// declares `name`, else the package it re-exports `name` from (§26.6).
     fn owner(&self, q: &str, name: &str, depth: u32) -> Option<String> {
-        self.owner_in(q, name, depth, |pi| &pi.types)
-    }
-
-    /// `owner` for an enum member name.
-    fn member_owner(&self, q: &str, name: &str, depth: u32) -> Option<String> {
-        self.owner_in(q, name, depth, |pi| &pi.members)
+        self.owner_in(q, name, depth, |pi, n| pi.types.contains(n))
     }
 
     /// `owner` for a value name (subroutine, parameter, variable, `let`).
     fn value_owner(&self, q: &str, name: &str, depth: u32) -> Option<String> {
-        self.owner_in(q, name, depth, |pi| &pi.values)
+        self.owner_in(q, name, depth, |pi, n| pi.values.contains(n))
     }
 
     fn owner_in(
@@ -717,13 +712,13 @@ impl Info {
         q: &str,
         name: &str,
         depth: u32,
-        decls: fn(&PkgInfo) -> &HashSet<String>,
+        declares: fn(&PkgInfo, &str) -> bool,
     ) -> Option<String> {
         if depth > 8 {
             return None;
         }
         let pi = self.pkgs.get(q)?;
-        if decls(pi).contains(name) {
+        if declares(pi, name) {
             return Some(q.to_string());
         }
         for (ep, en) in &pi.exports {
@@ -732,21 +727,21 @@ impl Info {
             }
             for (ip, iname) in &pi.explicit {
                 if iname == name && (ep == "*" || ep == ip) {
-                    if let Some(o) = self.owner_in(ip, name, depth + 1, decls) {
+                    if let Some(o) = self.owner_in(ip, name, depth + 1, declares) {
                         return Some(o);
                     }
                 }
             }
             for ip in &pi.wild {
                 if ep == "*" || ep == ip {
-                    if let Some(o) = self.owner_in(ip, name, depth + 1, decls) {
+                    if let Some(o) = self.owner_in(ip, name, depth + 1, declares) {
                         return Some(o);
                     }
                 }
             }
             // `export Q::name;` also imports it (§26.6).
             if ep != "*" && en.is_some() {
-                if let Some(o) = self.owner_in(ep, name, depth + 1, decls) {
+                if let Some(o) = self.owner_in(ep, name, depth + 1, declares) {
                     return Some(o);
                 }
             }
@@ -1058,8 +1053,12 @@ fn collect(descs: &[Description], unit: &Frame) -> Option<Info> {
     let colliding = clash(|pi| &pi.types, &|n| other.contains(n));
     // §6.19, §26.3: an imported enum member can hide a compilation-unit
     // parameter of the same name. Both are values in the enclosing scope.
+    let package_values: HashSet<&str> = pkgs
+        .values()
+        .flat_map(|pi| pi.values.iter().map(String::as_str))
+        .collect();
     let colliding_members = clash(|pi| &pi.members, &|n| {
-        other_members.contains(n) || other_values.contains(n)
+        other_members.contains(n) || other_values.contains(n) || package_values.contains(n)
     });
     let mut colliding_values = clash(|pi| &pi.values, &|n| other_values.contains(n));
     // §23.8.1: a module data name can collide with a flattened package
@@ -1683,54 +1682,38 @@ impl Rw<'_> {
         Res::Keep
     }
 
-    /// The package whose enum member a bare `n` denotes, when that is not
-    /// the one the flat namespace would pick on its own (see `resolve`).
-    fn resolve_member(&self, n: &str) -> Option<String> {
-        if !self.info.colliding_members.contains(n) {
-            return None;
-        }
-        let is_member = |q: &str| self.info.pkgs.get(q).is_some_and(|pi| pi.members.contains(n));
-        let owner = |q: &str| {
-            self.info.member_owner(q, n, 0).or_else(|| self.info.value_owner(q, n, 0))
-        };
-        for f in self.frames.iter().rev() {
-            if let Some(p) = &f.pkg {
-                if is_member(p) {
-                    // A package evaluates its own constant initializers while
-                    // registering its members under their bare names (§6.19).
-                    return (self.in_const == 0).then(|| p.clone());
-                }
-            }
-            if f.values.contains(n) || f.cls.iter().chain(&f.bases).any(|c| {
-                self.info.classes.get(c).is_some_and(|ci| ci.values.contains(n))
-            }) {
-                return None;
-            }
-            if let Some(q) = f.explicit.get(n).or(f.bound.borrow().get(n)) {
-                return owner(q).filter(|q| is_member(q));
-            }
-            match self.wild_candidate(f, n, true, owner) {
-                Wild::None => {}
-                Wild::One(o) => return is_member(&o).then_some(o),
-                // Not visible (§26.3); left to the existing diagnostics.
-                Wild::Many(_) => return None,
-            }
-        }
-        None
-    }
-
     /// The package whose subroutine, parameter, variable or `let` a bare `n`
     /// denotes, by the §26.3 rules, when two packages (or a package and
     /// `$unit`) declare it. All of them share one flat table keyed by the
     /// bare name, where the last package registered wins, so the reference
     /// is spelled `pkg::n`, the qualified lookup.
     fn resolve_value(&self, n: &str) -> Option<String> {
-        let colliding = self.info.colliding_values.contains(n);
+        let member = self.info.colliding_members.contains(n);
+        let colliding = member || self.info.colliding_values.contains(n);
         if !colliding && (self.in_const == 0 || !self.info.pkg_params.contains(n)) {
             return None;
         }
+        // §26.3: enum members and other values compete at the same lexical scope.
+        let owner = |q: &str| {
+            if member {
+                self.info.owner_in(q, n, 0, |pi, n| {
+                    pi.values.contains(n) || pi.members.contains(n)
+                })
+            } else {
+                self.info.value_owner(q, n, 0)
+            }
+        };
         for (depth, f) in self.frames.iter().rev().enumerate() {
             if let Some(p) = &f.pkg {
+                if member
+                    && self
+                        .info
+                        .pkgs
+                        .get(p)
+                        .is_some_and(|pi| pi.members.contains(n))
+                {
+                    return (self.in_const == 0).then(|| p.clone());
+                }
                 if self
                     .info
                     .pkgs
@@ -1760,9 +1743,9 @@ impl Rw<'_> {
                 continue;
             }
             if let Some(q) = f.explicit.get(n).or(f.bound.borrow().get(n)) {
-                return self.info.value_owner(q, n, 0);
+                return owner(q);
             }
-            match self.wild_candidate(f, n, true, |q| self.info.value_owner(q, n, 0)) {
+            match self.wild_candidate(f, n, true, owner) {
                 Wild::None => {}
                 Wild::One(o) => return Some(o),
                 Wild::Many(_) => return None,
@@ -2438,12 +2421,7 @@ impl Rw<'_> {
                         if let Res::To(m) = self.resolve(n) {
                             h.path[0].name.name = m;
                         }
-                    } else if let Some(p) = self
-                        .resolve_member(n)
-                        .or_else(|| self.resolve_value(n))
-                    {
-                        // §26.3: qualify the declaration visible here, even
-                        // when other packages use its name for another kind of value.
+                    } else if let Some(p) = self.resolve_value(n) {
                         let span = e.span;
                         let member = h.path[0].name.clone();
                         *e = Expression::new(
@@ -2586,7 +2564,7 @@ impl Rw<'_> {
                         }
                     }
                     for (span, named) in edits.into_iter().rev() {
-                        args_text.replace_range(span.start..span.end, &named);
+                        args_text.replace_range(span.start as usize..span.end as usize, &named);
                     }
                 }
             }

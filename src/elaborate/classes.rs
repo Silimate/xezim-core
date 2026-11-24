@@ -1739,7 +1739,7 @@ fn elaborate_class_in_scope(
                             is_real,
                             direction: None,
                             value: v,
-                            type_name: get_type_name(&p.data_type),
+                            type_name: get_type_name(&p.data_type).map(SharedName::from),
                         },
                     );
                     if is_rand {
@@ -1797,7 +1797,7 @@ fn elaborate_class_in_scope(
                             is_real: false,
                             direction: None,
                             value: Value::new(32),
-                            type_name: Some(cg_name.clone()),
+                            type_name: Some(cg_name.as_str().into()),
                         },
                     );
                     property_order.push(cg_name);
@@ -1940,7 +1940,7 @@ fn elaborate_class_in_scope(
                                     is_real: false,
                                     direction: None,
                                     value: Value::zero(ew),
-                                    type_name: get_type_name(data_type),
+                                    type_name: get_type_name(data_type).map(SharedName::from),
                                 },
                             );
                             continue;
@@ -2001,7 +2001,7 @@ fn elaborate_class_in_scope(
                             is_real: false,
                             direction: None,
                             value: v,
-                            type_name: get_type_name(data_type),
+                            type_name: get_type_name(data_type).map(SharedName::from),
                         },
                     );
                 }

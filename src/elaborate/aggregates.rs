@@ -279,7 +279,7 @@ pub(super) fn expand_struct_driver(
         out,
         0,
     );
-    if ca.delay == 0 || out.len() - start < 2 || ca.delay_fall.is_some() || ca.delay_off.is_some() {
+    if ca.delay == 0 || out.len() - start < 2 || ca.delay_fall().is_some() || ca.delay_off().is_some() {
         return;
     }
     fn leaf_name(e: &Expression, elab: &ElaboratedModule) -> Option<String> {
@@ -380,9 +380,9 @@ pub(super) fn expand_struct_driver(
             span,
         ));
         leaf.delay = 0;
-        leaf.delay_exprs = None;
-        leaf.origin = None;
-        leaf.delay_select = None;
+        leaf.set_delay_exprs(None);
+        leaf.set_origin(None);
+        leaf.set_delay_select(None);
     }
     let mut delayed = ca.clone();
     delayed.lhs = make_ident_expr(&stage);
@@ -410,12 +410,12 @@ pub fn expand_whole_struct_continuous_assigns(elab: &mut ElaboratedModule) {
                 // and takes the ordinary path.
                 if elab
                     .nettype_resolvers
-                    .get(&tn)
+                    .get(tn.as_str())
                     .is_some_and(|r| !r.is_empty())
                 {
                     return None;
                 }
-                let dt = elab.typedef_types.get(&tn)?;
+                let dt = elab.typedef_types.get(tn.as_str())?;
                 match resolve_typedef_chain(dt, &elab.typedef_types) {
                     // PACKED structs keep a contiguous bit layout that a
                     // whole-value write already fills correctly; only
@@ -521,9 +521,12 @@ pub(super) fn register_unpacked_aggregate(elab: &mut ElaboratedModule, base: &st
     }
     // §23.6: aggregate member paths retain their owning declaration;
     // they must not fall back to a namesake in another generate scope.
-    elab.struct_members.entry(base.to_string()).or_insert_with(|| {
-        su.members.iter().flat_map(|m| m.declarators.iter())
-            .map(|d| d.name.name.clone()).collect()
+    elab.struct_members.insert_if_absent(base, || {
+        su.members
+            .iter()
+            .flat_map(|m| m.declarators.iter())
+            .map(|d| d.name.name.clone())
+            .collect::<Vec<_>>()
     });
     // IEEE 1800-2017 §7.3: a union is ONE piece of storage accessed through any
     // of its member names — writing `u.a` must be readable as `u.b`. So an

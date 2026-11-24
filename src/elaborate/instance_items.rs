@@ -28,10 +28,10 @@ pub(super) fn inline_instantiation_items(
     for item in items {
         let item_floor = *items_end;
         *items_end = (*items_end).max(match item {
-            ModuleItem::InitialConstruct(ic) => ic.span.end,
-            ModuleItem::AlwaysConstruct(ac) => ac.span.end,
-            ModuleItem::AssertionItem(a) => a.span.end,
-            ModuleItem::ModuleInstantiation(mi) => mi.span.end,
+            ModuleItem::InitialConstruct(ic) => ic.span.end as usize,
+            ModuleItem::AlwaysConstruct(ac) => ac.span.end as usize,
+            ModuleItem::AssertionItem(a) => a.span.end as usize,
+            ModuleItem::ModuleInstantiation(mi) => mi.span.end as usize,
             _ => 0,
         });
         if let ModuleItem::ModuleInstantiation(inst) = item {
@@ -104,7 +104,7 @@ pub(super) fn inline_instantiation_items(
                                         Value::new(width)
                                     },
                                     is_real,
-                                    type_name: Some(sub_mod_name.clone()),
+                                    type_name: Some(sub_mod_name.as_str().into()),
                                 },
                             );
                         }
@@ -133,7 +133,7 @@ pub(super) fn inline_instantiation_items(
                                     direction: None,
                                     value: Value::zero(1),
                                     is_real: false,
-                                    type_name: Some(sub_mod_name.clone()),
+                                    type_name: Some(sub_mod_name.as_str().into()),
                                 },
                             );
                             if has_ports {
@@ -724,18 +724,10 @@ pub(super) fn inline_instantiation_items(
                         port_map.get("clk_out").cloned(),
                         port_map.get("clk_in").cloned(),
                     ) {
-                        elab.continuous_assigns.push(ContinuousAssignment {
-                            gate_delay_fall: None,
-                            delay_exprs: None,
-                            delay_select: None,
-                            origin: None,
-                            lhs: clk_out_expr,
-                            rhs: clk_in_expr,
-                            delay: 0,
-                            rhs_parent_scoped: false,
-                            delay_fall: None,
-                            delay_off: None,
-                        });
+                        elab.continuous_assigns.push(ContinuousAssignment::plain(
+                            clk_out_expr,
+                            clk_in_expr,
+                        ));
                         continue;
                     }
                 }
@@ -800,7 +792,7 @@ pub(super) fn inline_instantiation_items(
                             if let Some(r) = &hier.root {
                                 scopes.push(crate::ast::types::TypeScope {
                                     name: Identifier {
-                                        name: r.clone(),
+                                        name: r.as_str().to_string(),
                                         span: v.span,
                                     },
                                     type_args: Vec::new(),
@@ -3063,7 +3055,11 @@ pub(super) fn inline_instantiation_items(
                                                 ansi_port_net_type(port),
                                             )
                                         }),
-                                        type_name: port.data_type.as_ref().and_then(get_type_name),
+                                        type_name: port
+                                            .data_type
+                                            .as_ref()
+                                            .and_then(get_type_name)
+                                            .map(SharedName::from),
                                     },
                                 );
                             } else {
@@ -3537,7 +3533,8 @@ pub(super) fn inline_instantiation_items(
                                         },
                                     )
                                 {
-                                    elab.packed_full_dims.entry(sig_name.clone()).or_insert(fd);
+                                    elab.packed_full_dims
+                                        .insert_if_absent(sig_name.clone(), || fd);
                                 }
                                 if let Some(fields) = packed_struct_field_layout(
                                     &pd.data_type,
@@ -5259,31 +5256,18 @@ pub(super) fn inline_instantiation_items(
                             match prepared_sub.port_directions.get(port_name) {
                                 Some(PortDirection::Input) | Some(PortDirection::Inout) => {
                                     elab.continuous_assigns.push(ContinuousAssignment {
-                                        gate_delay_fall: None,
-                                        delay_exprs: None,
-                                        delay_select: None,
-                                        origin: None,
                                         lhs: sub_expr,
                                         rhs: parent_elem,
                                         delay: 0,
                                         rhs_parent_scoped: true,
-                                        delay_fall: None,
-                                        delay_off: None,
+                                        extras: None,
                                     });
                                 }
                                 Some(PortDirection::Output) => {
-                                    elab.continuous_assigns.push(ContinuousAssignment {
-                                        gate_delay_fall: None,
-                                        delay_exprs: None,
-                                        delay_select: None,
-                                        origin: None,
-                                        lhs: parent_elem,
-                                        rhs: sub_expr,
-                                        delay: 0,
-                                        rhs_parent_scoped: false,
-                                        delay_fall: None,
-                                        delay_off: None,
-                                    });
+                                    elab.continuous_assigns.push(ContinuousAssignment::plain(
+                                        parent_elem,
+                                        sub_expr,
+                                    ));
                                 }
                                 _ => {}
                             }
@@ -5317,7 +5301,7 @@ pub(super) fn inline_instantiation_items(
                         let actual_is_net = is_net_name(elab, &actual);
                         if formal_is_net || !actual_is_net {
                             elab.port_aliases
-                                .insert(sub_sig_name.clone(), actual.clone());
+                                .insert(sub_sig_name.clone(), actual.as_str().into());
                             // §23.3.3.3: an INOUT port and the net it is
                             // connected to are ONE physical net. An input
                             // port copies the actual into the formal and an
@@ -5460,44 +5444,26 @@ pub(super) fn inline_instantiation_items(
                                     .push((port_name.clone(), elab.continuous_assigns.len()));
                             }
                             elab.continuous_assigns.push(ContinuousAssignment {
-                                gate_delay_fall: None,
-                                delay_exprs: None,
-                                delay_select: None,
-                                origin: None,
                                 lhs: sub_expr,
                                 rhs,
                                 delay: 0,
                                 rhs_parent_scoped: true,
-                                delay_fall: None,
-                                delay_off: None,
+                                extras: None,
                             });
                         }
                         Some(PortDirection::Output) => {
-                            elab.continuous_assigns.push(ContinuousAssignment {
-                                gate_delay_fall: None,
-                                delay_exprs: None,
-                                delay_select: None,
-                                origin: None,
-                                lhs: parent_expr.clone(),
-                                rhs: sub_expr,
-                                delay: 0,
-                                rhs_parent_scoped: false,
-                                delay_fall: None,
-                                delay_off: None,
-                            });
+                            elab.continuous_assigns.push(ContinuousAssignment::plain(
+                                parent_expr.clone(),
+                                sub_expr,
+                            ));
                         }
                         _ => {
                             elab.continuous_assigns.push(ContinuousAssignment {
-                                gate_delay_fall: None,
-                                delay_exprs: None,
-                                delay_select: None,
-                                origin: None,
                                 lhs: sub_expr,
                                 rhs: parent_expr.clone(),
                                 delay: 0,
                                 rhs_parent_scoped: true,
-                                delay_fall: None,
-                                delay_off: None,
+                                extras: None,
                             });
                         }
                     }
@@ -6005,8 +5971,8 @@ pub(super) fn inline_instantiation_items(
                                     )
                                     && elab.continuous_assigns.get(*idx).is_some_and(|ca| {
                                         ca.delay == 0
-                                            && ca.delay_fall.is_none()
-                                            && ca.delay_off.is_none()
+                                            && ca.delay_fall().is_none()
+                                            && ca.delay_off().is_none()
                                             && ident_flat_name(&ca.lhs).as_deref()
                                                 == Some(formal.as_str())
                                     });
@@ -6457,7 +6423,6 @@ pub(super) fn inline_instantiation_items(
                     };
                     if let Some((name, ports, body, defaults)) = named_sva {
                         let key = cat2(&inst_prefix, &name);
-                        elab.sequences.insert(key.clone());
                         if let Some(body) = body {
                             let formals: Vec<&str> =
                                 ports.iter().map(|p| p.name.as_str()).collect();
@@ -6492,8 +6457,13 @@ pub(super) fn inline_instantiation_items(
                                     }
                                 },
                             );
-                            elab.property_params
-                                .insert(key, ports.iter().map(|p| p.name.clone()).collect());
+                            if !ports.is_empty() {
+                                let names: Vec<String> =
+                                    ports.iter().map(|p| p.name.clone()).collect();
+                                elab.property_params.insert(key, names);
+                            }
+                        } else {
+                            elab.sequences.insert(key);
                         }
                     }
                     // §35.4: a DPI import declared inside a CHILD module was
@@ -6861,18 +6831,8 @@ pub(super) fn inline_instantiation_items(
                                 &prepared_sub.local_names,
                                 &sub_interface_map,
                             );
-                            elab.continuous_assigns.push(ContinuousAssignment {
-                                gate_delay_fall: None,
-                                delay_exprs: None,
-                                delay_select: None,
-                                origin: None,
-                                lhs,
-                                rhs,
-                                delay: 0,
-                                rhs_parent_scoped: false,
-                                delay_fall: None,
-                                delay_off: None,
-                            });
+                            elab.continuous_assigns
+                                .push(ContinuousAssignment::plain(lhs, rhs));
                         }
                         if !sb.timing_checks.is_empty() {
                             let scope = inst_prefix.strip_suffix('.').unwrap_or(&inst_prefix);
@@ -6990,10 +6950,10 @@ pub(super) fn inline_instantiation_items(
                 // dissolve this module into the parent, so this is the only
                 // place the (path, definition) pair still exists.
                 elab.instances.push(ElabInstance {
-                    path: inst_prefix.trim_end_matches('.').to_string(),
-                    def_name: sub_mod_name.clone(),
-                    parent: prefix.trim_end_matches('.').to_string(),
-                    src_pos: hi.span.start.max(item_floor),
+                    path: inst_prefix.trim_end_matches('.').into(),
+                    def_name: sub_mod_name.as_str().into(),
+                    parent: prefix.trim_end_matches('.').into(),
+                    src_pos: (hi.span.start as usize).max(item_floor),
                 });
                 elab.upward_scopes.borrow_mut().add_instance(
                     prefix.trim_end_matches('.'),
@@ -7002,7 +6962,7 @@ pub(super) fn inline_instantiation_items(
                 );
                 // Keep later items strictly after this one: bound
                 // instantiations carry spans from elsewhere.
-                *items_end = (*items_end).max(hi.span.start.max(item_floor) + 1);
+                *items_end = (*items_end).max((hi.span.start as usize).max(item_floor) + 1);
 
                 // Recurse into sub-module instantiations
                 iprof_since("subitem_loop", __td);

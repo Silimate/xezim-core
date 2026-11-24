@@ -679,7 +679,7 @@ pub(super) fn register_port_packed_shape(
     if let Some(fd) = packed_full_dims_of(data_type, &elab.parameters).or_else(|| {
         packed_full_dims_chained(data_type, &elab.parameters, &elab.typedef_types)
     }) {
-        elab.packed_full_dims.entry(name.to_string()).or_insert(fd);
+        elab.packed_full_dims.insert_if_absent(name, || fd);
     }
     if let Some(fields) = packed_struct_field_layout(
         data_type,
@@ -692,12 +692,10 @@ pub(super) fn register_port_packed_shape(
         // dims, the struct the innermost.
         let struct_w = fields.iter().map(|(_, o, w)| o + w).max().unwrap_or(0);
         if let Some(fd) = packed_typedef_array_dims(data_type, struct_w, &elab.parameters) {
-            elab.packed_full_dims.entry(name.to_string()).or_insert(fd);
+            elab.packed_full_dims.insert_if_absent(name, || fd);
         }
         tls_register_struct_layout(name, &fields);
-        elab.packed_struct_fields
-            .entry(name.to_string())
-            .or_insert(fields);
+        elab.packed_struct_fields.insert_if_absent(name, || fields);
         // §7.2, §7.4.1: and its members' packed shapes. Unrecorded,
         // `arg.vec[1]` of a `logic [3:0][7:0] vec` member was a one-bit select.
         register_member_packed_meta(elab, name, data_type, None);
@@ -710,12 +708,16 @@ pub(super) fn signal_is_shortreal(elab: &ElaboratedModule, name: &str) -> bool {
     let Some(sig) = elab.signals.get(name).filter(|s| s.is_real) else {
         return false;
     };
-    if sig.type_name.as_deref() == Some("shortreal") {
+    if sig.type_name.as_deref().map(String::as_str) == Some("shortreal") {
         return true;
     }
     elab.var_decl_types
         .get(name)
-        .or_else(|| sig.type_name.as_ref().and_then(|ty| elab.typedef_types.get(ty)))
+        .or_else(|| {
+            sig.type_name
+                .as_ref()
+                .and_then(|ty| elab.typedef_types.get(ty.as_str()))
+        })
         .is_some_and(|dt| {
             matches!(
                 resolve_typedef_chain(dt, &elab.typedef_types),
@@ -1093,7 +1095,7 @@ pub(super) fn prebind_bits_of_signals(
     prefix: &str,
     typedefs: &HashMap<String, u32>,
     typedef_types: &HashMap<String, DataType>,
-    struct_fields: &HashMap<String, Vec<(String, u32, u32)>>,
+    struct_fields: &crate::shared_names::SharedSliceMap<(String, u32, u32)>,
     arrays: &HashMap<String, (i64, i64, u32)>,
 ) -> Expression {
     let mut out = e.clone();
@@ -1194,7 +1196,7 @@ fn bits_of_signal_expr(
     prefix: &str,
     typedefs: &HashMap<String, u32>,
     typedef_types: &HashMap<String, DataType>,
-    struct_fields: &HashMap<String, Vec<(String, u32, u32)>>,
+    struct_fields: &crate::shared_names::SharedSliceMap<(String, u32, u32)>,
     arrays: &HashMap<String, (i64, i64, u32)>,
 ) -> Option<u32> {
     // `$signed`/`$unsigned` are width-preserving wrappers.

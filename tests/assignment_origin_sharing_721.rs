@@ -53,7 +53,7 @@ endmodule
 fn by_scope(m: &ElaboratedModule) -> BTreeMap<String, Vec<(xezim_core::ast::Span, Arc<str>)>> {
     let mut out: BTreeMap<String, Vec<_>> = BTreeMap::new();
     for ca in &m.continuous_assigns {
-        if let Some((span, scope)) = &ca.origin {
+        if let Some((span, scope)) = ca.origin() {
             out.entry(scope.to_string())
                 .or_default()
                 .push((*span, Arc::clone(scope)));
@@ -104,7 +104,10 @@ fn each_assignment_keeps_the_span_of_its_statement() {
     distinct.dedup();
     assert_eq!(distinct.len(), 4);
     // A net declaration assignment records its initializer.
-    let texts: Vec<&str> = distinct.iter().map(|(s, e)| &SRC[*s..*e]).collect();
+    let texts: Vec<&str> = distinct
+        .iter()
+        .map(|(s, e)| &SRC[*s as usize..*e as usize])
+        .collect();
     assert!(texts.contains(&"~pulse"), "{texts:?}");
     for text in texts.iter().filter(|t| **t != "~pulse") {
         assert!(text.starts_with("assign ") && text.contains('='), "{text}");
@@ -125,11 +128,9 @@ fn origins_survive_serialization() {
     assert_eq!(back.len(), m.continuous_assigns.len());
     for (a, b) in m.continuous_assigns.iter().zip(&back) {
         assert_eq!(
-            a.origin
-                .as_ref()
+            a.origin()
                 .map(|(s, scope)| (s.start, s.end, &**scope)),
-            b.origin
-                .as_ref()
+            b.origin()
                 .map(|(s, scope)| (s.start, s.end, &**scope))
         );
     }

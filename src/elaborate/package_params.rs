@@ -460,25 +460,28 @@ pub(super) fn hoist_package_params(
                 _ => continue,
             };
             let qualified = format!("{}::{}", p.name.name, name);
-            elab.sequences.insert(name.clone());
-            elab.sequences.insert(qualified.clone());
             if let Some(body) = body {
-                let params: Vec<String> = ports.iter().map(|p| p.name.clone()).collect();
+                let shared_body = Rc::new(body.clone());
                 elab.property_decls
                     .entry(name.clone())
-                    .or_insert_with(|| Rc::new(body.clone()));
-                elab.property_params
-                    .entry(name.clone())
-                    .or_insert_with(|| params.clone());
-                elab.property_decls.insert(qualified.clone(), Rc::new(body.clone()));
+                    .or_insert_with(|| Rc::clone(&shared_body));
+                elab.property_decls.insert(qualified.clone(), shared_body);
+                if !ports.is_empty() {
+                    let params: Vec<String> = ports.iter().map(|p| p.name.clone()).collect();
+                    elab.property_params
+                        .insert_if_absent(name.clone(), || params.clone());
+                    elab.property_params.insert(qualified.clone(), params);
+                }
                 if defaults.iter().any(|d| d.is_some()) {
                     elab.property_param_defaults
                         .entry(name.clone())
                         .or_insert_with(|| defaults.clone());
                     elab.property_param_defaults
-                        .insert(qualified.clone(), defaults.clone());
+                        .insert(qualified, defaults.clone());
                 }
-                elab.property_params.insert(qualified, params);
+            } else {
+                elab.sequences.insert(name.clone());
+                elab.sequences.insert(qualified);
             }
         }
     }
@@ -552,6 +555,7 @@ pub(super) fn hoist_package_params(
             // its inits are evaluated (`LOG2(SZ)` — the formal binds the bare
             // name), restored after the package so nothing leaks unimported.
             let mut pkg_overlay: Vec<(String, Option<Value>)> = Vec::new();
+            let mut pkg_layouts = ScopedStructLayouts::default();
             for item in &p.items {
                 let crate::ast::decl::PackageItem::Parameter(pd) = item else {
                     continue;
@@ -670,6 +674,26 @@ pub(super) fn hoist_package_params(
                     // overlay in the hoist loop below.
                     alias_pkg_param(elab, &p.name.name, &assign.name.name, &v);
                     let scoped = format!("{}.{}", p.name.name, assign.name.name);
+                    // IEEE 1800-2017 §6.20.2, §7.2.1, §26.3: a dependent
+                    // constant selects this packed member in the declaring
+                    // package, before a consumer uses the value as a width.
+                    let may_be_struct = match data_type {
+                        DataType::Struct(_) => true,
+                        DataType::TypeReference { dimensions, .. } => dimensions.is_empty(),
+                        _ => false,
+                    };
+                    if may_be_struct
+                        && assign.dimensions.is_empty()
+                        && let Some(fields) = flatten_struct_fields(
+                            data_type,
+                            &elab.parameters,
+                            &elab.typedefs,
+                            &elab.typedef_types,
+                        )
+                    {
+                        tls_register_struct_layout(&scoped, &fields);
+                        pkg_layouts.bind_fields(&assign.name.name, fields);
+                    }
                     register_pkg_param_elem(elab, "", &scoped, data_type);
                 }
             }

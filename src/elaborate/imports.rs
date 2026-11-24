@@ -757,7 +757,7 @@ pub(super) fn process_import(
                                                 is_real,
                                                 direction: None,
                                                 value: v,
-                                                type_name: get_type_name(data_type),
+                                                type_name: get_type_name(data_type).map(SharedName::from),
                                             },
                                         );
                                         register_bare_struct_param(
@@ -851,7 +851,7 @@ pub(super) fn process_import(
                                                     is_real: false,
                                                     direction: None,
                                                     value: v,
-                                                    type_name: Some(td.name.name.clone()),
+                                                    type_name: Some(td.name.name.as_str().into()),
                                                 },
                                             );
                                             found = true;
@@ -931,14 +931,16 @@ pub(super) fn process_import(
                             body,
                             ..
                         }) if &name.name == sym_name => {
-                            elab.sequences.insert(name.name.clone());
                             if let Some(body) = body {
                                 elab.property_decls.insert(name.name.clone(), Rc::new(body.clone()));
-                                elab.property_params.insert(
-                                    name.name.clone(),
-                                    ports.iter().map(|p| p.name.clone()).collect(),
-                                );
+                                if !ports.is_empty() {
+                                    let names: Vec<String> =
+                                        ports.iter().map(|p| p.name.clone()).collect();
+                                    elab.property_params.insert(name.name.clone(), names);
+                                }
                                 register_sva_port_defaults(elab, &name.name, port_defaults);
+                            } else {
+                                elab.sequences.insert(name.name.clone());
                             }
                             found = true;
                         }
@@ -1032,7 +1034,7 @@ pub(super) fn process_import(
                                             is_real,
                                             direction: None,
                                             value: v,
-                                            type_name: get_type_name(&dd.data_type),
+                                            type_name: get_type_name(&dd.data_type).map(SharedName::from),
                                         },
                                     );
                                     if matches!(
@@ -1265,7 +1267,7 @@ pub(super) fn process_import(
                                                 is_real,
                                                 direction: None,
                                                 value: v,
-                                                type_name: get_type_name(data_type),
+                                                type_name: get_type_name(data_type).map(SharedName::from),
                                             },
                                         );
                                         // §7.2.1: STRUCT-typed package param —
@@ -1489,7 +1491,7 @@ pub(super) fn process_import(
                                         is_real,
                                         direction: None,
                                         value: v,
-                                        type_name: tn,
+                                        type_name: tn.map(SharedName::from),
                                     },
                                 );
                                 if let Some(fields) = &struct_fields {
