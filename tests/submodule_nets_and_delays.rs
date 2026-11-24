@@ -204,7 +204,7 @@ module top; child u(); endmodule
     let mut delayed = 0;
     model.drain_pending_cont_assign_for_each(|ca| {
         if ca.delay != 0 {
-            assert!(ca.delay_exprs.as_ref().is_some_and(|args| args[0].is_some()));
+            assert!(ca.delay_exprs().is_some_and(|args| args[0].is_some()));
             delayed += 1;
         }
     });
