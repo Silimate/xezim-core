@@ -1058,13 +1058,20 @@ fn collect(descs: &[Description], unit: &Frame) -> Option<Info> {
     let colliding = clash(|pi| &pi.types, &|n| other.contains(n));
     // §6.19, §26.3: an imported enum member can hide a compilation-unit
     // parameter of the same name. Both are values in the enclosing scope.
-    let colliding_members = clash(|pi| &pi.members, &|n| {
+    let mut colliding_members = clash(|pi| &pi.members, &|n| {
         other_members.contains(n) || other_values.contains(n)
     });
     let mut colliding_values = clash(|pi| &pi.values, &|n| other_values.contains(n));
-    // §23.8.1: a module data name can collide with a flattened package
-    // value. It does not change a package subroutine's import binding.
     for pi in pkgs.values() {
+        // §6.19, §26.3: an imported parameter can share the name of an
+        // enclosing enum literal. Qualify its uses in the importing scope
+        // and retain the enum value for references in sibling instances.
+        for name in pi.params.intersection(&other_members) {
+            colliding_members.insert(name.clone());
+            colliding_values.insert(name.clone());
+        }
+        // §23.8.1: a module data name can collide with a flattened package
+        // value. It does not change a package subroutine's import binding.
         colliding_values.extend(pi.params.iter().chain(&pi.vars)
             .filter(|name| module_values.contains(*name)).cloned());
     }
@@ -3828,6 +3835,39 @@ mod tests {
             panic!("expected a named-type variable declaration: {stmt:?}");
         };
         &name.name.name
+    }
+
+    /// §6.19, §26.3: a wildcard import in a sibling cannot change a $unit enumerator.
+    #[test]
+    fn sibling_package_parameter_does_not_replace_unit_enum_value() {
+        let source = r#"
+typedef enum logic [3:0] {GROUP1=0, GROUP8=3} group_e;
+package model_pkg; parameter real GROUP8=8.0; endpackage
+module env;
+  import model_pkg::*;
+  class model;
+    function real group_value(); return GROUP8; endfunction
+  endclass
+endmodule
+module decode(input group_e group_size, output logic [4:0] lim);
+  always_comb case (group_size)
+    GROUP8: lim=24;
+    default: lim=0;
+  endcase
+endmodule
+module top(input group_e group_size, output logic [4:0] lim);
+  env tb(); decode dut(group_size,lim);
+endmodule"#;
+        let (_, design) = crate::parse_and_elaborate_multi(
+            &[source.to_owned()],
+            Some("top"),
+            &[],
+            &["groups.sv".to_owned()],
+            &[],
+        )
+        .unwrap();
+        assert_eq!(design.parameters["GROUP8"].to_u64(), Some(3));
+        assert_eq!(design.parameters["model_pkg::GROUP8"].to_f64(), 8.0);
     }
 
     /// §26.3: the enum member imported into the module is nearer than a
