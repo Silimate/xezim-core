@@ -299,12 +299,21 @@ pub fn elaborate_module_with_defs(
     // §26.3: names a wildcard import brings in that are ALSO declared locally
     // — the local declaration shadows the imported one (no duplicate error).
     if let Some(defs) = all_defs {
-        elab.wildcard_shadowed = compute_wildcard_shadowed(module.items(), module.params(), defs)
-            .into_iter()
-            .collect();
-        elab.foreign_package_names = compute_foreign_package_names(module.items(), defs)
-            .into_iter()
-            .collect();
+        // The collectors return `std` sets, whose iteration order changes
+        // every allocation. Insert in sorted order so the deterministic sets
+        // that the artifact serializes keep one layout.
+        let mut shadowed: Vec<String> =
+            compute_wildcard_shadowed(module.items(), module.params(), defs)
+                .into_iter()
+                .collect();
+        shadowed.sort();
+        elab.wildcard_shadowed = shadowed.into_iter().collect();
+        let mut foreign: Vec<String> =
+            compute_foreign_package_names(module.items(), defs)
+                .into_iter()
+                .collect();
+        foreign.sort();
+        elab.foreign_package_names = foreign.into_iter().collect();
     }
     // §26.3: an explicit import conflicts with a header declaration;
     // unlike a wildcard import, it cannot be displaced by that declaration.
